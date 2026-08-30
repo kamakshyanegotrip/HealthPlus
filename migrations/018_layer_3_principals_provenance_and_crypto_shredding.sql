@@ -335,9 +335,21 @@ $$;
 -- ============================================================================
 -- MIGRATION 018c — role separation for §3.8.2 and §2.3.4g
 -- ============================================================================
-CREATE ROLE reasoner_role        NOLOGIN;   -- Clinical Reasoning + Recommendation Synthesis
-CREATE ROLE confirmation_ui_role NOLOGIN;
-CREATE ROLE erasure_role         NOLOGIN;   -- runs the DPDP/Art.17 workflow, nothing else
+-- Roles are cluster-wide, not per-database, and CREATE ROLE has no
+-- IF NOT EXISTS -- guarded the same way as hp_owner/hp_app/hp_reader
+-- (migration 003a) and dqe_role (migration 023) so this migration is safe
+-- to apply into a cluster that already has one of these names.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'reasoner_role') THEN
+    CREATE ROLE reasoner_role NOLOGIN;        -- Clinical Reasoning + Recommendation Synthesis
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'confirmation_ui_role') THEN
+    CREATE ROLE confirmation_ui_role NOLOGIN;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'erasure_role') THEN
+    CREATE ROLE erasure_role NOLOGIN;         -- runs the DPDP/Art.17 workflow, nothing else
+  END IF;
+END $$;
 
 GRANT USAGE ON SCHEMA principal, evidence, domain, app TO reasoner_role;
 GRANT USAGE ON SCHEMA principal, app TO confirmation_ui_role;

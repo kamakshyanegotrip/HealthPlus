@@ -67,6 +67,50 @@ Run in filename-sorted order (`001_003_...` → `003a_...` → `004_...` →
 run before the first migration that creates a user (HP-RB-001), and
 `004`–`026e` each assume everything before them is already applied.
 
+## Running these against a real database
+
+`run_migrations.mjs` applies every `.sql` file in this directory in that
+exact order, using the `pg` package already in this repo's
+`package.json` — no new dependency needed. It never reads, logs, or sends
+the connection string anywhere except to the `pg` client itself; it comes
+only from the `DATABASE_URL` environment variable you set in your own shell.
+
+```powershell
+# PowerShell — get the Direct connection string from Supabase: Project
+# Settings > Database > Connection string > Direct connection (not the
+# pooler — see the top-level README for why Direct is correct for a
+# long-running worker).
+$env:DATABASE_URL = "postgresql://postgres:<password>@<host>:5432/postgres"
+node migrations/run_migrations.mjs
+```
+
+```bash
+# bash
+export DATABASE_URL="postgresql://postgres:<password>@<host>:5432/postgres"
+node migrations/run_migrations.mjs
+```
+
+Add `--dry-run` to just list the files it would run, in order, without
+connecting to anything. On failure it stops immediately and reports which
+file failed — earlier files in that run have already committed (each file
+is applied as a whole, but there is no cross-file transaction wrapping the
+full run), so re-running after a fix will hit "already exists" errors on
+whatever the failed file's own DDL created before it errored; fix the file
+and re-run only from that point on if that happens, rather than re-running
+the whole set. It applies only the files directly in this directory —
+`ops/dqe_cron_schedule.sql` is deliberately excluded (see "What this does
+not include" below) and must be run separately once `pg_cron` is enabled.
+
+**Role-creation idempotency.** `CREATE ROLE` has no `IF NOT EXISTS` in
+PostgreSQL, and roles are cluster-wide, not per-database — so the seven
+roles this schema creates (`hp_owner`, `hp_app`, `hp_reader` in `003a`;
+`dqe_role` in `023`; `reasoner_role`, `confirmation_ui_role`, `erasure_role`
+in `018`) are all wrapped in existence checks. This was found and fixed
+during this session's own verification runs, where a second test database
+in the same local cluster hit "role already exists" on a literal re-run of
+the source docs' DDL — worth knowing if you ever see that error from a
+migration file elsewhere in this project that wasn't fixed the same way.
+
 ## Verified this session
 
 Every file above was applied in order against a real **PostgreSQL 16.13 +

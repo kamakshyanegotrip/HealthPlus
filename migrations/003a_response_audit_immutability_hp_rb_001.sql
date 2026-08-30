@@ -31,9 +31,23 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- digest()
 -- §2 — role separation. The application must NEVER connect as owner/superuser;
 -- every control below is decorative if it does.
 -- ---------------------------------------------------------------------------
-CREATE ROLE hp_owner   NOLOGIN;                  -- owns schema; used only for migrations
-CREATE ROLE hp_app     LOGIN PASSWORD '...';     -- the application — set a real password out of band
-CREATE ROLE hp_reader  LOGIN PASSWORD '...';     -- verification job, analytics; read-only
+-- CREATE ROLE has no IF NOT EXISTS in PostgreSQL, and roles are cluster-wide
+-- (not per-database) -- a re-run of this migration, or a second database in
+-- the same cluster, would otherwise fail on "role already exists". Wrapped
+-- in existence checks so this migration is safe to re-apply.
+-- IMPORTANT: replace the placeholder passwords below with real secrets before
+-- running against a real database -- set them out of band, never commit them.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hp_owner') THEN
+    CREATE ROLE hp_owner NOLOGIN;                 -- owns schema; used only for migrations
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hp_app') THEN
+    CREATE ROLE hp_app LOGIN PASSWORD '...';      -- the application — set a real password out of band
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hp_reader') THEN
+    CREATE ROLE hp_reader LOGIN PASSWORD '...';   -- verification job, analytics; read-only
+  END IF;
+END $$;
 
 -- ---------------------------------------------------------------------------
 -- §3 — the append-only event log
