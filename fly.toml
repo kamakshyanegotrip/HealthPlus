@@ -1,0 +1,27 @@
+# HealthPlus pg-boss worker — Fly.io app config (HP-OIR-003 build item 8).
+#
+# `app` is a placeholder — `fly launch` will prompt to confirm or rename it;
+# whatever name you pick there is authoritative, not this file. Region 'bom'
+# (Mumbai) matches the Supabase project's ap-south-1, keeping the worker and
+# the database in the same metro rather than paying cross-region latency on
+# every query — see ADR-003 §2.1's Mumbai reasoning, which applies here too.
+app = "healthplus-worker"
+primary_region = "bom"
+
+[build]
+
+[processes]
+  worker = "npm run start"
+
+# This is a background worker with no inbound HTTP traffic — it holds a
+# long-lived connection to Postgres and to pg-boss's polling loop, not a web
+# server. No [http_service] block: exposing an HTTP port here would be
+# incorrect for this process and would just sit unused.
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# Secrets (DATABASE_URL, ANTHROPIC_API_KEY) are NOT set here — never commit
+# them to this file or to git. Set them with `fly secrets set` from your own
+# terminal after `fly launch` creates the app; see DEPLOY.md.

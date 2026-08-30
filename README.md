@@ -30,6 +30,9 @@ for the full numbered logic and the Charter clauses each step enforces.
 migrations/                         — HP-OIR-003 build item 1: consolidated,
                                        numbered, verified migration files
                                        (see migrations/README.md)
+Dockerfile, fly.toml, DEPLOY.md     — HP-OIR-003 build item 8: deploy config
+                                       for the pg-boss worker (see DEPLOY.md)
+src/worker.ts                       — the worker process entrypoint Fly.io runs
 src/
   safety/systemPromptFragments.ts   — single source of truth for Charter Annex B
                                        system-prompt blocks (PHASE_3_1_SAFETY_FRAGMENT)
@@ -72,6 +75,18 @@ Two assumptions flagged in code comments, worth confirming before this goes
 further: `principal.provider_org`'s jurisdiction column name (assumed
 `country`), and the exact Anthropic model identifier for the Opus tier
 (`ANTHROPIC_MODEL_CLAIM_EXTRACTION`, env-overridable).
+
+## Deploying the worker
+
+See `DEPLOY.md` for the full HP-OIR-003 build item 8 walkthrough. Short
+version: `src/worker.ts`, `Dockerfile` and `fly.toml` are written, and the
+worker's startup path (pg-boss start, job registration, graceful `SIGTERM`
+shutdown) is verified this session against a real local Postgres instance.
+The Docker image itself was not build-tested (this sandbox's network
+blocked Docker Hub), but the two things that could break it — `npm ci
+--omit=dev` installing cleanly, and the worker booting from
+production-only `node_modules` — were both verified directly. Account
+creation and the actual `fly launch`/`fly deploy` are the user's to run.
 
 ## Migrations
 
