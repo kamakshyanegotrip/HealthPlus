@@ -1,0 +1,14 @@
+{
+  "name": "healthplus-side-effect-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Consumer for the side_effect_job queue (see side-effect-worker.mjs's header comment). Deliberately separate from the main app's package.json — this process needs only `pg`, not Next.js/React/the Anthropic SDK/etc.",
+  "type": "module",
+  "scripts": {
+    "start": "node side-effect-worker.mjs",
+    "drain-once": "node side-effect-worker.mjs --once"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}

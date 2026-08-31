@@ -1,0 +1,122 @@
+name: Chat Pipeline CI
+
+# GAP RESOLVED: "No CI wiring — tests exist but aren't hooked into any
+# continuous-integration pipeline." This wires every check the chat-pipeline
+# job already has (typecheck, unit tests, the §6.4 eval gate, the DB-level
+# smoke test, and the full orchestration integration test) into GitHub
+# Actions, gated on a real Postgres 16 + pgvector service container — not a
+# mock. No live Anthropic call is made anywhere in this workflow (see
+# chat-pipeline/README.md's honest note on why); every DB-touching step runs
+# against the stub schema in chat-pipeline/db/, same as local dev.
+#
+# This file lives at the repo root (.github/workflows/) rather than nested
+# under chat-pipeline/ — GitHub Actions only discovers workflows there.
+# Because this repo holds more than one HealthPlus job (see HP-OIR-002's
+# files at the repo root), every step below runs with its working directory
+# pinned to chat-pipeline/, and both triggers are scoped to
+# chat-pipeline/** so a change to a different job's files doesn't run this
+# workflow pointlessly.
+#
+# HONEST NOTE, carried over from when this file was first drafted (before it
+# had a real repo to live in): it's been checked with actionlint (v1.7.12,
+# zero findings) and every command it runs — npm ci, typecheck, unit tests,
+# the eval gate, all five db/*.sql migrations in order, the smoke test, and
+# the integration test — has actually been executed successfully against a
+# real Postgres 16 + pgvector instance, provisioned the same way this
+# workflow provisions its service container (fresh database, fresh
+# hp_app/hp_reader roles via db/001_roles.sql, no pre-existing state). Treat
+# the first real run on an actual push/PR here as the first true
+# end-to-end test of the runner environment itself (network egress, image
+# pull, service-container health-check timing) — the same caveat this
+# repo's own SQL migrations carry ("reading SQL does not catch bugs that
+# executing it does") applied one level up, to CI config.
+
+on:
+  push:
+    branches: [main]
+    paths: ['chat-pipeline/**']
+  pull_request:
+    branches: [main]
+    paths: ['chat-pipeline/**']
+
+defaults:
+  run:
+    working-directory: chat-pipeline
+
+jobs:
+  typecheck-and-unit:
+    name: Typecheck + unit tests + eval gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: chat-pipeline/package-lock.json
+      - run: npm ci
+      - name: Typecheck (src/ only — see tsconfig.json's include)
+        run: npm run typecheck
+      - name: Unit tests (pure functions, no DB/network)
+        run: npm test
+      - name: "§6.4 eval gate (pure functions, no DB/network — see eval/run-eval.ts)"
+        run: npm run eval
+
+  db-integration:
+    name: DB smoke test + orchestration integration test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Plain postgres:16 does not carry the pgvector extension db/000
+        # needs (`CREATE EXTENSION vector`) — pgvector/pgvector ships it
+        # pre-built on top of the same postgres:16 base image.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: hp_test
+      DATABASE_URL: postgres://hp_app:hp_app_pw@localhost:5432/hp_test
+      DATA_REGION: IN
+      # Fixed, non-secret local/CI-only values — never the real deployment
+      # secrets. A real deployment supplies these via its own secrets
+      # manager (see chat-pipeline/DEPLOY.md); this workflow only ever
+      # talks to the ephemeral service-container Postgres above.
+      SUBJECT_HMAC_KEY: 'base64:Y2ktb25seS1kdW1teS1obWFjLWtleS0zMmIh'
+      SUPABASE_JWT_SECRET: 'ci-only-dummy-jwt-secret'
+      PROMPT_VERSION_COMPOSE: 'compose-2026.08.1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: chat-pipeline/package-lock.json
+      - run: npm ci
+      - name: Create hp_test database
+        run: psql -c "CREATE DATABASE hp_test;"
+      - name: Apply stub schema (db/001 roles, db/000, db/010, db/020 RLS, db/999 seed)
+        run: |
+          psql -d hp_test -v ON_ERROR_STOP=1 -f db/001_roles.sql
+          psql -d hp_test -v ON_ERROR_STOP=1 -f db/000_stub_upstream.sql
+          psql -d hp_test -v ON_ERROR_STOP=1 -f db/010_chat_pipeline_support.sql
+          psql -d hp_test -v ON_ERROR_STOP=1 -f db/020_rls.sql
+          psql -d hp_test -v ON_ERROR_STOP=1 -f db/999_seed_smoke_test.sql
+      - name: "Backfill test-only pseudo-embeddings (exercises claim_search()'s vector branch — see scripts/pseudo-embed.mjs)"
+        run: node scripts/generate-embeddings.mjs
+      - name: DB smoke test (scripts/smoke-test.mjs — raw SQL + RLS role impersonation, connects as hp_app)
+        run: npm run test:db
+      - name: Orchestration integration test (runs the real runPipeline against Postgres, Anthropic client mocked)
+        run: npm run test:integration

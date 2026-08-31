@@ -1,0 +1,19 @@
+{
+  "suite": "categoryClassifier.parseAndResolveCategory",
+  "version": "eval-2026.08.1",
+  "targetFunction": "src/lib/pipeline/categoryClassifier.ts#parseAndResolveCategory",
+  "charterClauses": ["§2.0.2", "§2.0.3"],
+  "description": "Gold-set for the RESPONSE_CATEGORY classifier's pure parse+resolve step — the part of the classifier that does not require a live model call. Covers §2.0.3 ('uncertain -> select the higher category') and the fail-closed behaviour on unparsable model output. Does NOT cover the model's own classification judgement (that needs a live Anthropic call — see scripts/live-anthropic-smoke.mjs and the README's honest note on why that half of this classifier is unevaluated here). Re-run (npm run eval) whenever parseAndResolveCategory's ambiguity-resolution or fail-closed logic changes, or whenever CATEGORY_CLASSIFIER_VERSION's prompt is revised in a way that could change the SHAPE of its JSON output.",
+  "cases": [
+    { "id": "cc-01", "description": "A clean, unambiguous INFORMATIONAL classification is returned as-is", "clause": "baseline", "rawText": "{\"category\":\"INFORMATIONAL\",\"confidence\":0.9,\"ambiguousBetween\":[]}", "expect": { "category": "INFORMATIONAL", "ambiguous": false } },
+    { "id": "cc-02", "description": "A clean DECISION_SUPPORT classification is returned as-is", "clause": "baseline", "rawText": "{\"category\":\"DECISION_SUPPORT\",\"confidence\":0.85,\"ambiguousBetween\":[]}", "expect": { "category": "DECISION_SUPPORT", "ambiguous": false } },
+    { "id": "cc-03", "description": "Ambiguity between INFORMATIONAL and DECISION_SUPPORT resolves to the higher, DECISION_SUPPORT", "clause": "§2.0.3", "rawText": "{\"category\":\"INFORMATIONAL\",\"confidence\":0.4,\"ambiguousBetween\":[\"DECISION_SUPPORT\"]}", "expect": { "category": "DECISION_SUPPORT", "ambiguous": true } },
+    { "id": "cc-04", "description": "Ambiguity between DECISION_SUPPORT and CLINICAL_DECISION resolves to the higher, CLINICAL_DECISION", "clause": "§2.0.3", "rawText": "{\"category\":\"DECISION_SUPPORT\",\"confidence\":0.5,\"ambiguousBetween\":[\"CLINICAL_DECISION\"]}", "expect": { "category": "CLINICAL_DECISION", "ambiguous": true } },
+    { "id": "cc-05", "description": "Ambiguity across all three named candidates resolves to the highest, CLINICAL_DECISION", "clause": "§2.0.3", "rawText": "{\"category\":\"INFORMATIONAL\",\"confidence\":0.3,\"ambiguousBetween\":[\"DECISION_SUPPORT\",\"CLINICAL_DECISION\"]}", "expect": { "category": "CLINICAL_DECISION", "ambiguous": true } },
+    { "id": "cc-06", "description": "Completely unparsable model output fails closed to CLINICAL_DECISION", "clause": "fail-closed", "rawText": "not valid json at all", "expect": { "category": "CLINICAL_DECISION", "ambiguous": false } },
+    { "id": "cc-07", "description": "Valid JSON but an unrecognized category string falls back to the fail-closed default", "clause": "fail-closed", "rawText": "{\"category\":\"SOMETHING_ELSE\",\"confidence\":0.9,\"ambiguousBetween\":[]}", "expect": { "category": "CLINICAL_DECISION", "ambiguous": false } },
+    { "id": "cc-08", "description": "Missing confidence field defaults to 0 rather than throwing", "clause": "robustness", "rawText": "{\"category\":\"INFORMATIONAL\",\"ambiguousBetween\":[]}", "expect": { "category": "INFORMATIONAL", "confidence": 0, "ambiguous": false } },
+    { "id": "cc-09", "description": "An ambiguousBetween entry that isn't a recognized category is ignored, not treated as a crash", "clause": "robustness", "rawText": "{\"category\":\"INFORMATIONAL\",\"confidence\":0.6,\"ambiguousBetween\":[\"NOT_A_CATEGORY\"]}", "expect": { "category": "INFORMATIONAL", "ambiguous": true } },
+    { "id": "cc-10", "description": "Empty string input fails closed the same as any other unparsable output", "clause": "fail-closed", "rawText": "", "expect": { "category": "CLINICAL_DECISION", "ambiguous": false } }
+  ]
+}

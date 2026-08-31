@@ -1,5 +1,14 @@
 # HealthPlus — extractClaimsFromProviderSubmission
 
+> **This repo now holds more than one HealthPlus job.** This file, and everything else
+> at the repo root, documents `HP-OIR-002` (below). A second job, `HP-JOB-003` — the
+> `/api/chat` chat pipeline — lives in [`chat-pipeline/`](./chat-pipeline/README.md),
+> with its own `README.md`, tests, CI workflow
+> (`.github/workflows/chat-pipeline-ci.yml`, scoped to `chat-pipeline/**`), and
+> deployment docs. Each job is self-contained — separate `package.json`, separate
+> `node_modules`, run from within its own directory — so `cd` into the one you're
+> working on before running `npm install`/`npm test`/etc.
+
 A pg-boss background task implementing the "extract" stage of the ingestion
 pipeline described in `HP-ADR-001` §5 (fetch → parse → **extract** → embed →
 score), tracked as Build Queue item #4 in the HealthPlus Open Items Register
