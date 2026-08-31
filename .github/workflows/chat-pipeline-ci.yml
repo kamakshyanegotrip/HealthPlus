@@ -106,7 +106,7 @@ jobs:
           cache-dependency-path: chat-pipeline/package-lock.json
       - run: npm ci
       - name: Create hp_test database
-        run: psql -c "CREATE DATABASE hp_test;"
+        run: psql -d postgres -c "CREATE DATABASE hp_test;"
       - name: Apply stub schema (db/001 roles, db/000, db/010, db/020 RLS, db/999 seed)
         run: |
           psql -d hp_test -v ON_ERROR_STOP=1 -f db/001_roles.sql
