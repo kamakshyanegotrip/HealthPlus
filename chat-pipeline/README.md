@@ -381,6 +381,8 @@ result, since a real CI run is the first true test of the runner environment its
 (image pull, service-container health-check timing), the same way executing SQL is the
 first true test of a migration.
 
+**Correction to the claim above**: the first real run of this workflow (Actions run #1, job "DB smoke test + orchestration integration test") failed immediately, at the very first database step, with `FATAL: database "hp_test" does not exist`. The job-level `PGDATABASE: hp_test` env var applies to every step in the job, including `Create hp_test database` itself, so a bare `psql -c "CREATE DATABASE hp_test;"` tried to connect to `hp_test` in order to create `hp_test` — a chicken-and-egg failure that only a real GitHub Actions runner could surface, since a local dev machine's `hp_test` database, once created, stays around across runs and never re-triggers this. Fixed by pointing that one step at Postgres's always-present `postgres` administrative database instead: `psql -d postgres -c "CREATE DATABASE hp_test;"`. Same lesson as every other bug documented in this file, one level up: CI config, not just application code, only proves itself by actually running.
+
 **`claim_search()`'s vector branch has now actually been executed**, not just written.
 No real embedding model was reachable to generate genuine semantic vectors
 (`huggingface.co` returns 403 from this sandbox), so `scripts/pseudo-embed.mjs` builds a
