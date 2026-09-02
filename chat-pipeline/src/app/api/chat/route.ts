@@ -251,8 +251,17 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // classification. Static template, model does not touch the wording,
   // rendered immediately, no gating on review.
   if (SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['CRITICAL']) {
-    const templateText = await loadSafetyTemplate(redFlag.templateId!);
-    await recordAuditEvent(ctx, 'TEMPLATE_RENDERED', 'system', { template_id: redFlag.templateId, template_version: redFlag.templateVersion });
+    const loadedTemplate = await loadSafetyTemplate(redFlag.templateId!);
+    const templateText = loadedTemplate.body;
+    await recordAuditEvent(ctx, 'TEMPLATE_RENDERED', 'system', {
+      template_id: redFlag.templateId,
+      template_version: redFlag.templateVersion,
+      // J3-5: an emergency rendered from the unapproved hard-coded fallback
+      // must be distinguishable in the audit trail from a clinician-authored
+      // one. Before this, the two were identical in the record.
+      template_source: loadedTemplate.source,
+      template_load_failure: loadedTemplate.failure,
+    });
     send('sentence', { text: templateText, citedClaimIds: [] });
     const templateDisplayedAt = new Date();
     // BUG FIXED (found by test/runPipeline.integration.test.ts running this

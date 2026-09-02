@@ -441,22 +441,69 @@ export async function clearSessionSeverityFloor(sessionId: string, clinicianId: 
  * template table is unreachable, because an emergency response must never
  * simply fail to render.
  */
-export async function loadSafetyTemplate(templateId: string): Promise<string> {
+export interface LoadedSafetyTemplate {
+  body: string;
+  /**
+   * Which of the two this actually is. The caller records it, so an emergency
+   * rendered from the unapproved fallback is visible in the audit trail rather
+   * than indistinguishable from a clinician-authored one.
+   */
+  source: 'APPROVED_TEMPLATE' | 'HARDCODED_FALLBACK';
+  /** Set when the lookup failed rather than simply finding no row. */
+  failure: string | null;
+}
+
+/**
+ * §4.0.9 last-resort text. Not clinician-approved — HP-JOB-003 J3-8 tracks
+ * that. It exists because §4.0.9 forbids rendering nothing on an emergency
+ * path, and rendering nothing is worse than rendering this.
+ */
+const HARDCODED_EMERGENCY_FALLBACK =
+  'This may be a medical emergency. Please contact your local emergency number or go to ' +
+  'the nearest emergency department now. This message is shown automatically and has not ' +
+  'been reviewed for your specific situation, but that review does not need to happen ' +
+  'before you get help — it happens alongside it.';
+
+export async function loadSafetyTemplate(templateId: string): Promise<LoadedSafetyTemplate> {
   try {
+    // NOTE (J3-5 reconciliation, 2 Sep 2026): this query previously read
+    // `AND active = true`. The real committed schema
+    // (migrations/001_003_reconciled_baseline.sql) has NO `active` column on
+    // safety.safety_template — only the chat-pipeline stub in db/010 does.
+    // Against the real schema that predicate raised "column active does not
+    // exist", the catch below swallowed it, and EVERY CRITICAL/EMERGENCY
+    // render silently fell back to the unapproved hard-coded string above
+    // while reporting nothing. The clinician-authored template would never
+    // have been shown and nothing would have said so.
+    //
+    // The predicate is dropped rather than made conditional: a template row's
+    // right to be displayed is `clinically_adopted` in the stub and
+    // `approved_by`/`approved_at` in the real schema, and neither is spelled
+    // `active`. Until db/010 is reconciled to the real shape (J3-5), the
+    // adoption gate in matchDeterministicRules is what keeps unadopted
+    // content off the screen.
     const { rows } = await db().query<{ body: string }>(
-      `SELECT body FROM safety.safety_template WHERE id = $1 AND active = true LIMIT 1`,
+      `SELECT body FROM safety.safety_template WHERE id = $1 LIMIT 1`,
       [templateId],
     );
-    if (rows[0]) return rows[0].body;
-  } catch {
-    // fall through to the hard-coded fallback below
+    if (rows[0]) {
+      return { body: rows[0].body, source: 'APPROVED_TEMPLATE', failure: null };
+    }
+    return {
+      body: HARDCODED_EMERGENCY_FALLBACK,
+      source: 'HARDCODED_FALLBACK',
+      failure: `no safety_template row for ${templateId}`,
+    };
+  } catch (err) {
+    // Still falls back — §4.0.9 — but loudly. A silent catch on the emergency
+    // path is how a schema mismatch hides for weeks.
+    const failure = err instanceof Error ? err.message : String(err);
+    console.error('loadSafetyTemplate FAILED — rendering unapproved fallback', {
+      templateId,
+      failure,
+    });
+    return { body: HARDCODED_EMERGENCY_FALLBACK, source: 'HARDCODED_FALLBACK', failure };
   }
-  return (
-    'This may be a medical emergency. Please contact your local emergency number or go to ' +
-    'the nearest emergency department now. This message is shown automatically and has not ' +
-    'been reviewed for your specific situation, but that review does not need to happen ' +
-    'before you get help — it happens alongside it.'
-  );
 }
 
 
