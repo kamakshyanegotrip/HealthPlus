@@ -111,6 +111,14 @@ export interface RedFlagResult {
   // between the two is intent/complexity classification time, which §6.5
   // deliberately excludes from the latency figure it cares about.
   scannerStartedAt: string;
+  // §0.6 / AMB-17. 'FAIL_CLOSED' means no clinically adopted rule was available
+  // to scan with (or the rule table was unreachable) — NOT that the message was
+  // scanned and found clean. Required, not optional, so every construction site
+  // has to state which it is and no caller can quietly treat the two as the
+  // same thing.
+  adoptionGate: 'OPEN' | 'FAIL_CLOSED';
+  // Non-null iff adoptionGate === 'FAIL_CLOSED'. What the surface must render.
+  unavailability: import('./pipeline/unavailability').ServiceUnavailability | null;
 }
 
 export interface PatientProfile {
@@ -135,6 +143,11 @@ export interface PipelineContext {
   // handler doesn't expose one — flagged here rather than silently treated
   // as exact.
   receivedAt: string;
+  // §4.5.1(b): emergency routing uses the patient's STATED CURRENT LOCATION,
+  // never their account address. Null when they have not stated one — in which
+  // case §3.12.1's generic "call your local emergency number" line stands, and
+  // nothing is guessed from the billing country.
+  statedCountry?: string | null;
   // HP-SEC-001 RLS (db/020_rls.sql): the caller's verified role/hospital
   // claims, threaded through so any DB access needing row-level enforcement
   // can call db.ts's runAsUser(ctx.authClaims, ...) rather than querying on

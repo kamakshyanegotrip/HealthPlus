@@ -382,3 +382,110 @@ CREATE TABLE safety.session_severity_floor (
 
 GRANT SELECT, INSERT, UPDATE ON safety.session_severity_floor TO hp_app;
 GRANT SELECT ON safety.session_severity_floor TO hp_reader;
+
+-- ---- 9. safety.red_flag_log + safety.emergency_facility_reference ----------
+-- HP-JOB-004 RF1/RF2. The real, shipping DDL for both is
+-- `migrations/027_red_flag_module_additions.sql` in this same repo — now
+-- reachable from this line of history, which it was not when db/000 was
+-- written (see STUB_VS_REAL.md's opening paragraph). What follows is the
+-- stub-shaped equivalent so this pipeline's own tests can run against plain
+-- local Postgres; it uses `ruleset_version text` where the real table uses a
+-- `rule_set_id uuid` FK, exactly as the STAND-IN red_flag_rule above does.
+--
+-- DO NOT ship this block. Migration 027 is the one that ships.
+
+-- §4.0.7 gives MONITOR as the persistence floor and red_flag_event enforces it.
+-- That is right for the governed record and useless for §6.4's false-negative
+-- review, which is entirely about the messages the rules called NORMAL. You
+-- cannot review what you did not write down. Hence a second, wider table.
+CREATE TABLE safety.red_flag_log (
+  id                      uuid PRIMARY KEY,
+  event_id                uuid REFERENCES safety.red_flag_event(id),  -- null iff NORMAL
+  audit_id                uuid,
+  subject_pseudonym       bytea NOT NULL,
+  session_pseudonym       bytea NOT NULL,
+  occurred_at             timestamptz NOT NULL,
+
+  rule_derived_severity   red_flag_severity NOT NULL,
+  model_proposed_severity red_flag_severity,
+  applied_severity        red_flag_severity NOT NULL,
+
+  context_escalation      text[] NOT NULL DEFAULT '{}',
+  rule_set_id             uuid,
+  matched_rule_ids        uuid[] NOT NULL DEFAULT '{}',
+  trigger_detail          jsonb NOT NULL,
+  query_hash              bytea NOT NULL,          -- §3.13.1: a hash, never the query
+
+  branch                  text NOT NULL
+    CHECK (branch IN ('CONTINUE','MONITOR_PANEL','SAFETY_BLOCK_FIRST',
+                      'TEMPLATE_TAKEOVER','FAIL_CLOSED')),
+  template_id             uuid,
+  template_version        int,
+  commercial_suppressed   boolean NOT NULL,
+  generation_blocked      boolean NOT NULL,
+  needs_review            boolean NOT NULL,
+  shadow_mode             boolean NOT NULL DEFAULT false,
+
+  -- §6.5: from FIRST BYTE of the inbound message, not from scanner start.
+  first_byte_at           timestamptz NOT NULL,
+  scanner_started_at      timestamptz NOT NULL,
+  scanner_completed_at    timestamptz NOT NULL,
+  template_displayed_at   timestamptz,
+  display_latency_ms      int,
+
+  scanner_version         text NOT NULL,
+  fail_safe_reason        text,
+  data_region             char(2) NOT NULL,
+
+  -- §4.0.3, restated where false-negative review will read it: the model may
+  -- raise and may never lower. A clamping bug is a write failure, not a silent
+  -- one. Relies on red_flag_severity's declaration order (AMB-S-11).
+  CONSTRAINT c_never_lowered CHECK (
+    applied_severity >= rule_derived_severity
+    AND (model_proposed_severity IS NULL OR applied_severity >= model_proposed_severity)
+  ),
+  CONSTRAINT c_fail_closed_attributed CHECK (
+    branch <> 'FAIL_CLOSED' OR fail_safe_reason IS NOT NULL
+  ),
+  CONSTRAINT c_latency_ordered CHECK (
+    template_displayed_at IS NULL OR template_displayed_at >= first_byte_at
+  )
+);
+CREATE INDEX idx_rfl_severity_time ON safety.red_flag_log (applied_severity, occurred_at);
+-- the false-negative review's own query: rows the model wanted to raise and
+-- the signed rules did not.
+CREATE INDEX idx_rfl_model_disagreed ON safety.red_flag_log (occurred_at)
+  WHERE model_proposed_severity IS NOT NULL
+    AND model_proposed_severity > rule_derived_severity;
+
+REVOKE UPDATE, DELETE ON safety.red_flag_log FROM PUBLIC;
+GRANT INSERT, SELECT ON safety.red_flag_log TO hp_app;
+GRANT SELECT ON safety.red_flag_log TO hp_reader;
+
+-- §3.12.1's facility half. emergency_contact_reference holds phone numbers
+-- only; §4.1's CRITICAL/EMERGENCY rows name a nearest ED and §3.12.1 forbids
+-- the model supplying one. Job 18 populates this. An EMPTY TABLE IS A CORRECT
+-- STATE — the slot resolves to unavailable and the template renders with the
+-- emergency number alone. It is never a reason to name an unverified hospital,
+-- and domain.hospital is TIER_4 commercial data (§1.4) that may never back an
+-- emergency routing instruction.
+CREATE TABLE safety.emergency_facility_reference (
+  id                       uuid PRIMARY KEY,
+  country                  char(2) NOT NULL,
+  subdivision              text,
+  city                     text,
+  facility_name            text NOT NULL,
+  address_line             text NOT NULL,
+  has_emergency_department boolean NOT NULL,
+  open_24h                 boolean NOT NULL,
+  phone_e164               text,
+  language                 text NOT NULL,
+  last_verified_at         timestamptz NOT NULL,
+  active                   boolean NOT NULL DEFAULT true,
+  UNIQUE (country, subdivision, city, facility_name, language)
+);
+CREATE INDEX idx_efr_lookup
+  ON safety.emergency_facility_reference (country, subdivision, city, language)
+  WHERE active AND has_emergency_department;
+
+GRANT SELECT ON safety.emergency_facility_reference TO hp_app, hp_reader;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { clampSeverity, resolveTemplateRequirement, deriveActionTaken, applySessionFloor, GENERIC_ESCALATION_TEMPLATE_ID } from '../src/lib/pipeline/redFlagEngine';
+import { clampSeverity, resolveTemplateRequirement, deriveActionTaken, applySessionFloor, GENERIC_ESCALATION_TEMPLATE_ID, resolveAdoptionGate } from '../src/lib/pipeline/redFlagEngine';
 
 describe('redFlagEngine', () => {
   it('test_hp_esc_4_0_3_model_may_raise_never_lower_raises', () => {
@@ -75,5 +75,25 @@ describe('redFlagEngine', () => {
 
   it('test_hp_esc_4_0_8_apply_session_floor_no_floor_is_a_no_op', () => {
     expect(applySessionFloor('MONITOR', null)).toBe('MONITOR');
+  });
+
+  // ---- §0.6 / AMB-17 adoption gate (HP-JOB-004) ----------------------------
+
+  it('test_hp_esc_0_6_no_adopted_rule_fails_closed_rather_than_returning_normal', () => {
+    // The failure this gate exists to prevent: with CL2 unsigned, every rule
+    // has clinically_adopted = false, the WHERE clause matches nothing, and a
+    // scanner without this gate reports NORMAL for every message ever sent —
+    // an unsigned deployment looking perfectly healthy while detecting zero.
+    expect(resolveAdoptionGate({ adoptedRuleCount: 0, lookupFailed: false })).toBe('FAIL_CLOSED');
+  });
+
+  it('test_hp_esc_0_6_at_least_one_adopted_rule_opens_the_gate', () => {
+    expect(resolveAdoptionGate({ adoptedRuleCount: 1, lookupFailed: false })).toBe('OPEN');
+    expect(resolveAdoptionGate({ adoptedRuleCount: 42, lookupFailed: false })).toBe('OPEN');
+  });
+
+  it('test_hp_esc_4_0_9_a_failed_rule_lookup_fails_closed_not_open', () => {
+    // Even with rules on file: if we could not read them, we did not scan.
+    expect(resolveAdoptionGate({ adoptedRuleCount: 7, lookupFailed: true })).toBe('FAIL_CLOSED');
   });
 });
