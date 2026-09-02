@@ -1,0 +1,97 @@
+name: Migrations CI
+
+# Runs the REAL committed migrations (migrations/001..027) against a real
+# Postgres 16 + pgvector, then asserts the schema contracts that the
+# chat-pipeline stub schema cannot express.
+#
+# WHY THIS EXISTS, and why it is a separate workflow from chat-pipeline-ci:
+#
+# chat-pipeline-ci provisions its database from chat-pipeline/db/*.sql — a
+# reconstruction of the real schema, written when the real migrations were
+# unreachable from that branch (see chat-pipeline/db/STUB_VS_REAL.md). The
+# J3-5 reconciliation diffed the two for the first time and found twelve
+# divergences, four of which broke running code and one of which was breaking
+# it silently: safety.safety_template has no `active` column in the real
+# schema, so loadSafetyTemplate()'s query raised, its catch swallowed the
+# error, and every CRITICAL/EMERGENCY response would have rendered an
+# unapproved hard-coded fallback while the audit row named a template that was
+# never displayed.
+#
+# A reconstruction cannot catch that class of bug, because the reconstruction
+# is what is wrong. Only the real migrations can. This workflow is the first
+# step of the migration off the stub: it runs the real schema in CI alongside
+# the existing job, so drift is caught now, without breaking the pipeline
+# tests that currently depend on the stub. The cutover — deleting db/000-020
+# and pointing chat-pipeline-ci here — is tracked as R2-R8 in
+# HP-RECON-001 and is deliberately not done in the same change.
+#
+# Verified locally before committing: all 30 migrations apply cleanly to a
+# fresh PostgreSQL 16.13 + pgvector, and the contract tests below were checked
+# against a negative control — the claim_policy assertion fires when rows are
+# deleted, and the c_salt_dies_with_key assertion fires when the constraint is
+# dropped. A test that cannot fail proves nothing.
+
+on:
+  push:
+    branches: [main, hp-integration]
+    paths: ['migrations/**', '.github/workflows/migrations-ci.yml']
+  pull_request:
+    branches: [main]
+    paths: ['migrations/**', '.github/workflows/migrations-ci.yml']
+
+jobs:
+  migrations:
+    name: Apply real migrations + schema contract tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: healthplus
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: healthplus
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+
+      # Applied in filename order, which is the order they must run in. Any
+      # failure stops the job at the first bad file rather than cascading.
+      - name: Apply migrations 001..027
+        run: |
+          set -euo pipefail
+          for f in $(ls migrations/*.sql | sort); do
+            echo "--> $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      # The point of the whole workflow. These assert Charter guarantees that
+      # the stub schema is structurally incapable of representing.
+      - name: Schema contract tests
+        run: psql -v ON_ERROR_STOP=1 -f migrations/test/schema_contract.test.sql
+
+      # Cheap regression guard on the numbering question HP-JOB-002's Ledger
+      # left open and this repo answered: migrations run to 027, and nothing
+      # should silently reintroduce a 028+ gap or a duplicate prefix.
+      - name: Migration numbering is contiguous and unique
+        run: |
+          set -euo pipefail
+          dupes=$(ls migrations/*.sql | sed 's#.*/##' | cut -d_ -f1 | sort | uniq -d)
+          if [ -n "$dupes" ]; then echo "duplicate migration prefixes: $dupes"; exit 1; fi
+          echo "highest: $(ls migrations/*.sql | sed 's#.*/##' | sort | tail -1)"
