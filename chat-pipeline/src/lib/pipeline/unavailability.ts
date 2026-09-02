@@ -19,6 +19,36 @@ import type { RedFlagSeverity } from '../types';
  *
  * So: no adopted rules ⇒ refuse the generative path. NOT a triage outcome.
  * Nothing was assessed, so nothing is asserted about this person.
+ *
+ * ── RF8, DECIDED: this copy is NOT a `safety.safety_template` row ───────────
+ * Asked and answered (CL5-ADD-001 Q4), recorded here so it is not re-litigated.
+ *
+ * Three reasons, in order of force:
+ *
+ *  1. `safety_template.severity` is `red_flag_severity NOT NULL`. This notice
+ *     has no severity — nothing was assessed. Filing it as 'NORMAL' would
+ *     assert, in the one table the Clinical Governance Board reads as the
+ *     register of approved safety content, that it is a NORMAL-severity triage
+ *     output. It is not a triage output at all, and the schema would be
+ *     recording something untrue.
+ *  2. One of the three FAIL_CLOSED triggers is the database being unreachable.
+ *     A notice that requires a database read cannot be the notice for "the
+ *     database did not answer." A code-resident string is mandatory whatever
+ *     else is built, so a template row could only ever be an addition to this,
+ *     never a replacement for it.
+ *  3. Templates live in the §4.3.3 severity ladder — selectTemplate climbs it
+ *     on a miss. This notice sits outside that ladder entirely; putting it in
+ *     the same table invites a future escalation path to find it.
+ *
+ * What the template argument was right about — approval provenance, and
+ * localisation — is real and unaddressed. The answer to it is a separate
+ * `safety.service_notice` table with no severity column, carrying
+ * approved_by / approved_at / language, with this string as the last-resort
+ * fallback behind it. NOT BUILT YET, deliberately: until B2 (clinical lead)
+ * closes there is nobody to approve a row, so the table would have zero rows
+ * and the loader would be a guaranteed-dead code path. Trigger to build it:
+ * CL5 sign-off.
+ * ────────────────────────────────────────────────────────────────────────────
  */
 
 /** Surfaces the module can speak about. Named, so callers cannot improvise. */
