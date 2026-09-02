@@ -1,0 +1,29 @@
+# HP-ADR-001 §3.4: "Always-on Node worker on Fly.io — never Vercel
+# Functions" ($10-31/mo, a shared-cpu or performance-1x instance). This app
+# name is a placeholder — `fly launch` / `fly apps create` will prompt for
+# (or generate) the real one; rename this file's `app` line to match before
+# deploying for real. See DEPLOY.md for the full walkthrough, including what
+# in this file is a guess vs. what's been verified.
+app = "healthplus-side-effect-worker"
+primary_region = "bom"  # Mumbai — HP-ADR-004/HP-ADR-003 pin data (and so the worker that touches it) to ap-south-1; "bom" is Fly.io's Mumbai region code. CONFIRM this region is actually available on your Fly.io org before deploying — capacity varies and this has not been checked against a live account.
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Non-secret only. DATABASE_URL and any other credential are set with
+  # `fly secrets set`, never written here (this file is committed to git).
+  WORKER_POLL_INTERVAL_MS = "2000"
+  WORKER_BATCH_SIZE = "5"
+  WORKER_MAX_ATTEMPTS = "3"
+
+# Always-on, not autostop/autostart — this process holds a long-lived
+# Postgres connection and polls continuously; scaling it to zero between
+# requests (Fly's usual autostop behaviour for HTTP services) defeats the
+# entire point of "always-on" that HP-ADR-001 chose Fly.io for in the first
+# place. No [[services]] / [http_service] block is defined at all — this
+# process serves no HTTP traffic (see the Dockerfile's own comment) so there
+# is nothing for Fly's HTTP proxy to route to.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

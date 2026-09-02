@@ -1,0 +1,35 @@
+{
+  "name": "healthplus-chat-pipeline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HealthPlus chat pipeline: USER MESSAGE -> classifiers -> safety engine -> knowledge lookup -> reasoning -> streamed synthesis -> emission validator -> audit -> side-effect dispatch. Implements Evidence & Safety Charter v1.0 (HP-ESC) end to end for a single chat turn.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:db": "node scripts/smoke-test.mjs",
+    "test:integration": "RUN_PIPELINE_INTEGRATION=1 vitest run test/runPipeline.integration.test.ts",
+    "eval": "tsx eval/run-eval.ts",
+    "smoke:live": "tsx scripts/live-anthropic-smoke.ts",
+    "db:migrate:stub": "psql -f db/001_roles.sql && psql -f db/000_stub_upstream.sql && psql -f db/010_chat_pipeline_support.sql && psql -f db/020_rls.sql && psql -f db/999_seed_smoke_test.sql && node scripts/generate-embeddings.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "jose": "^6.2.10",
+    "next": "16.0.0",
+    "pg": "^8.13.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19.0.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "suite": "redFlagEngine severity composition",
+  "version": "eval-2026.08.1",
+  "targetFunctions": [
+    "src/lib/pipeline/redFlagEngine.ts#clampSeverity",
+    "src/lib/pipeline/redFlagEngine.ts#resolveTemplateRequirement",
+    "src/lib/pipeline/redFlagEngine.ts#deriveActionTaken",
+    "src/lib/pipeline/redFlagEngine.ts#applySessionFloor"
+  ],
+  "charterClauses": ["§4.0.2", "§4.0.3", "§4.0.7", "§4.0.8"],
+  "description": "Gold-set for the deterministic composition logic around red-flag severity — everything downstream of the (model-assisted, not evaluated here) deterministic rule match and model propose step. §4.0.3: model may raise, never lower. §4.0.2: WARNING+ always carries a template, falling back to the generic escalation template. §4.0.7/§4.0.8: action-taken derivation and the sticky session floor never lower an in-turn severity. RED_FLAG_RULESET_VERSION bumps and any change to this composition logic should re-run this suite (npm run eval) before shipping — this is the layer c_urgent_needs_template and c_urgent_template_only (Annex A) actually depend on being correct.",
+  "clampSeverity_cases": [
+    { "id": "cs-01", "description": "Model proposes higher than the rule-matched base — raise applies", "base": "WARNING", "proposed": "URGENT", "expect": "URGENT" },
+    { "id": "cs-02", "description": "Model proposes lower than the rule-matched base — ignored, never lowers", "base": "URGENT", "proposed": "WARNING", "expect": "URGENT" },
+    { "id": "cs-03", "description": "Equal proposal is a no-op", "base": "URGENT", "proposed": "URGENT", "expect": "URGENT" },
+    { "id": "cs-04", "description": "No rule matched (NORMAL base), model proposes the maximum severity", "base": "NORMAL", "proposed": "EMERGENCY", "expect": "EMERGENCY" }
+  ],
+  "resolveTemplateRequirement_cases": [
+    { "id": "rt-01", "description": "Below WARNING needs no template even if the rule happened to carry one", "applied": "NORMAL", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": null, "templateVersion": null } },
+    { "id": "rt-02", "description": "MONITOR still needs no template", "applied": "MONITOR", "ruleTemplateId": "some-rule-template", "ruleTemplateVersion": 3, "expect": { "templateId": null, "templateVersion": null } },
+    { "id": "rt-03", "description": "WARNING+ with a rule-supplied template uses that template", "applied": "WARNING", "ruleTemplateId": "rule-supplied-template", "ruleTemplateVersion": 2, "expect": { "templateId": "rule-supplied-template", "templateVersion": 2 } },
+    { "id": "rt-04", "description": "EMERGENCY with no rule-supplied template falls back to the generic escalation template", "applied": "EMERGENCY", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": "GENERIC_ESCALATION_TEMPLATE_ID", "templateVersion": 1 } },
+    { "id": "rt-05", "description": "A model-driven raise past WARNING with a template-less rule still gets the generic fallback, not a null template_id", "applied": "URGENT", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": "GENERIC_ESCALATION_TEMPLATE_ID", "templateVersion": 1 } }
+  ],
+  "deriveActionTaken_cases": [
+    { "id": "da-01", "description": "Emergency template shown wins regardless of the severity argument passed alongside it", "severity": "MONITOR", "emergencyTemplateShown": true, "expect": "TEMPLATE_SHOWN" },
+    { "id": "da-02", "description": "EMERGENCY severity with the template shown is still TEMPLATE_SHOWN, not ESCALATED", "severity": "EMERGENCY", "emergencyTemplateShown": true, "expect": "TEMPLATE_SHOWN" },
+    { "id": "da-03", "description": "WARNING with no template shown escalates", "severity": "WARNING", "emergencyTemplateShown": false, "expect": "ESCALATED" },
+    { "id": "da-04", "description": "CRITICAL with no template shown escalates", "severity": "CRITICAL", "emergencyTemplateShown": false, "expect": "ESCALATED" },
+    { "id": "da-05", "description": "MONITOR alone is logged but takes no action", "severity": "MONITOR", "emergencyTemplateShown": false, "expect": "NONE" },
+    { "id": "da-06", "description": "NORMAL takes no action", "severity": "NORMAL", "emergencyTemplateShown": false, "expect": "NONE" }
+  ],
+  "applySessionFloor_cases": [
+    { "id": "sf-01", "description": "An active floor raises a lower in-turn severity", "severity": "NORMAL", "floor": { "floorSeverity": "WARNING", "active": true }, "expect": "WARNING" },
+    { "id": "sf-02", "description": "An active floor never lowers a higher in-turn severity", "severity": "CRITICAL", "floor": { "floorSeverity": "WARNING", "active": true }, "expect": "CRITICAL" },
+    { "id": "sf-03", "description": "A cleared (inactive) floor is ignored entirely", "severity": "NORMAL", "floor": { "floorSeverity": "URGENT", "active": false }, "expect": "NORMAL" },
+    { "id": "sf-04", "description": "No floor at all is a no-op", "severity": "MONITOR", "floor": null, "expect": "MONITOR" },
+    { "id": "sf-05", "description": "Equal floor and in-turn severity is a no-op (stays at that severity)", "severity": "URGENT", "floor": { "floorSeverity": "URGENT", "active": true }, "expect": "URGENT" }
+  ]
+}
