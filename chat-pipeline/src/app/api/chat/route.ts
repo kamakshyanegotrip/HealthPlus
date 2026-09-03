@@ -5,7 +5,8 @@ import { requireAuth, AuthError } from '@/lib/auth';
 import { classifyIntentComplexity } from '@/lib/pipeline/intentComplexity';
 import { classifyCategory, reconcileAfterRetrieval } from '@/lib/pipeline/categoryClassifier';
 import { CLINICAL_DECISION_REFUSAL } from '@/lib/prompts/annexB';
-import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken, getSessionFloor, applySessionFloor, resolveTemplateRequirement, recordRedFlagLog } from '@/lib/pipeline/redFlagEngine';
+import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken, getSessionFloor, applySessionFloor, recordRedFlagLog } from '@/lib/pipeline/redFlagEngine';
+import { resolveTemplateForSeverity } from '@/lib/pipeline/templateResolution';
 import { lookupPatientProfile } from '@/lib/pipeline/patientProfile';
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
@@ -230,9 +231,20 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     // its own header comment and the
     // test_hp_esc_4_0_2_model_raised_severity_past_warning_with_no_rule_template_still_gets_one
     // unit test) — a session-floor raise needs the identical treatment.
-    const { templateId, templateVersion } = resolveTemplateRequirement(flooredSeverity, redFlag.templateId, redFlag.templateVersion);
-    redFlag.templateId = templateId;
-    redFlag.templateVersion = templateVersion;
+    // R2: re-resolve through the §4.3.3 ladder at the floored severity. The
+    // original bug this block fixes is unchanged in shape — a floor raise past
+    // WARNING must not leave the pre-floor (null) template behind, which would
+    // hard-fail red_flag_event's c_urgent_needs_template — but the resolution
+    // is now by (severity, jurisdiction, language) rather than by an FK the
+    // real schema does not have.
+    const floorSelection = await resolveTemplateForSeverity(
+      flooredSeverity,
+      ctx.statedCountry ?? ctx.dataRegion,
+      ctx.language ?? 'en',
+    ).catch(() => null);
+    redFlag.templateId = floorSelection?.template.id ?? null;
+    redFlag.templateVersion = floorSelection?.template.version ?? null;
+    redFlag.templateBody = floorSelection?.template.body ?? null;
     redFlag.triggerDetail = { ...redFlag.triggerDetail, sessionFloorApplied: true, sessionFloorSeverity: flooredSeverity };
     redFlag.severity = flooredSeverity;
   }
@@ -251,7 +263,7 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // classification. Static template, model does not touch the wording,
   // rendered immediately, no gating on review.
   if (SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['CRITICAL']) {
-    const loadedTemplate = await loadSafetyTemplate(redFlag.templateId!);
+    const loadedTemplate = loadSafetyTemplate(redFlag.templateBody);
     const templateText = loadedTemplate.body;
     await recordAuditEvent(ctx, 'TEMPLATE_RENDERED', 'system', {
       template_id: redFlag.templateId,

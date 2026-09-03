@@ -151,4 +151,91 @@ BEGIN
   RAISE NOTICE 'c_salt_dies_with_key: all four states behave as ADR-003 2.4 requires';
 END $$;
 
+-- ---------------------------------------------------------------------------
+-- 3. The engine's own queries must PARSE against this schema (R2/R3)
+--
+-- Two production bugs came from the pipeline querying columns that exist only
+-- in the chat-pipeline stub and not in the committed schema:
+--
+--   safety_template.active        -> loadSafetyTemplate() raised, its catch
+--                                    swallowed the error, and every
+--                                    CRITICAL/EMERGENCY silently rendered an
+--                                    unapproved hard-coded fallback.
+--   red_flag_rule.ruleset_version -> matchDeterministicRules() raised.
+--
+-- A third, safety_template.clinically_adopted, was caught during R2 only
+-- because these queries were run against both schemas by hand. This section
+-- makes that check permanent. It asserts nothing about ROWS — the real schema
+-- is correctly empty until CL2 is signed — only that every column the engine
+-- names exists here. Zero rows is a pass; a missing column is a failure.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE n int;
+BEGIN
+  -- matchDeterministicRules(), verbatim in shape
+  SELECT count(*) INTO n FROM (
+    SELECT r.id, r.version, r.severity, r.pattern, r.clinically_adopted, s.rule_set_id
+      FROM safety.adopted_rule_set('IN', 'en') s
+      JOIN safety.red_flag_rule r
+        ON r.rule_set_id = s.rule_set_id
+       AND r.clinically_adopted = true
+       AND r.retired_at IS NULL
+  ) q;
+
+  -- lookupTemplate(), the §4.3.3 ladder's single rung
+  SELECT count(*) INTO n FROM (
+    SELECT id, version, severity, jurisdiction, language, body, slots,
+           is_fallback, machine_translated
+      FROM safety.safety_template
+     WHERE severity = 'CRITICAL' AND jurisdiction = 'IN' AND language = 'en'
+     ORDER BY version DESC LIMIT 1
+  ) q;
+
+  -- recordRedFlagEvent(), every column the INSERT names
+  SELECT count(*) INTO n FROM (
+    SELECT id, audit_id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+           rule_id, rule_version, rule_set_id, trigger_detail, template_id, template_version,
+           action_taken, commercial_suppressed, first_byte_at, scanner_started_at,
+           template_displayed_at, data_region
+      FROM safety.red_flag_event
+  ) q;
+
+  -- recordRedFlagLog(), likewise
+  SELECT count(*) INTO n FROM (
+    SELECT id, event_id, audit_id, subject_pseudonym, session_pseudonym, occurred_at,
+           rule_derived_severity, model_proposed_severity, applied_severity,
+           context_escalation, rule_set_id, matched_rule_ids, trigger_detail, query_hash,
+           branch, template_id, template_version, commercial_suppressed, generation_blocked,
+           needs_review, shadow_mode, first_byte_at, scanner_started_at, scanner_completed_at,
+           template_displayed_at, display_latency_ms, scanner_version, fail_safe_reason, data_region
+      FROM safety.red_flag_log
+  ) q;
+
+  RAISE NOTICE 'engine queries parse against this schema';
+END $$;
+
+-- §4.0.3 / R3: the pattern column is jsonb, not text. A regex cannot express a
+-- unit-checked threshold, and §3.5.3 forbids coercing across units.
+DO $$
+DECLARE t text;
+BEGIN
+  SELECT data_type INTO t FROM information_schema.columns
+   WHERE table_schema='safety' AND table_name='red_flag_rule' AND column_name='pattern';
+  ASSERT t = 'jsonb', format('red_flag_rule.pattern must be jsonb (§4.0.3); found %s', t);
+END $$;
+
+-- R2: a template is identified by (severity, jurisdiction, language, version),
+-- never by a foreign key from the rule.
+DO $$
+DECLARE n int;
+BEGIN
+  SELECT count(*) INTO n FROM information_schema.columns
+   WHERE table_schema='safety' AND table_name='red_flag_rule'
+     AND column_name IN ('template_id','template_version');
+  ASSERT n = 0,
+    'red_flag_rule must not carry a template FK — §4.3.3 resolves templates by '
+    '(severity, jurisdiction, language)';
+END $$;
+
+
 ROLLBACK;

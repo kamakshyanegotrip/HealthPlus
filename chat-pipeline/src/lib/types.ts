@@ -101,11 +101,18 @@ export interface RedFlagResult {
   severity: RedFlagSeverity;
   ruleId: string | null;
   ruleVersion: number | null;
-  ruleSetId: string;
+  // Nullable since R3: the live set is resolved by safety.adopted_rule_set(),
+  // and on a FAIL_CLOSED scan there is no adopted set to name. A non-null type
+  // here previously forced a placeholder string into the audit record.
+  ruleSetId: string | null;
   triggerDetail: Record<string, unknown>; // which pattern matched — no free user text (§4.0.7)
   proposedSeverityByModel: RedFlagSeverity | null; // §4.0.3 — model may only raise
   templateId: string | null; // required when severity >= WARNING (c_urgent_template_only)
   templateVersion: number | null;
+  // R2: the approved body, resolved by the §4.3.3 ladder in the same pass that
+  // chose the template. Carried on the result so the caller does not make a
+  // second round trip on the one path where §6.5 measures latency.
+  templateBody: string | null;
   // §6.5: when the scan itself began, ISO 8601. Distinct from
   // PipelineContext.receivedAt (first byte of the inbound message) — the gap
   // between the two is intent/complexity classification time, which §6.5
@@ -148,6 +155,10 @@ export interface PipelineContext {
   // case §3.12.1's generic "call your local emergency number" line stands, and
   // nothing is guessed from the billing country.
   statedCountry?: string | null;
+  // §4.3.4: template language. Defaults to 'en'. A template that exists only
+  // machine-translated is never rendered — approved English plus the local
+  // emergency number is the fallback, not a machine translation.
+  language?: string;
   // HP-SEC-001 RLS (db/020_rls.sql): the caller's verified role/hospital
   // claims, threaded through so any DB access needing row-level enforcement
   // can call db.ts's runAsUser(ctx.authClaims, ...) rather than querying on

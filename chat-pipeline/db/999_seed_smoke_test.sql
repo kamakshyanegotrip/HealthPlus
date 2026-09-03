@@ -44,24 +44,64 @@ INSERT INTO evidence.claim_source (claim_id, source_id, confidence) VALUES
 INSERT INTO evidence.claim_policy (tier, kind, category, disposition, confidence_cap, min_sources, charter_clause, adopted_version, adopted_by, effective_from)
   VALUES ('TIER_2', 'GUIDELINE', 'DECISION_SUPPORT', 'PERMITTED', NULL, 1, 'HP-ESC 2.2.2', 'SMOKE-TEST', '11111111-1111-1111-1111-111111111111', now() - interval '1 day');
 
-INSERT INTO safety.red_flag_rule (ruleset_version, severity, pattern, pattern_notes, clinically_adopted, adopted_by, adopted_at)
-  VALUES ('rf-rules-2026.08.1', 'URGENT', 'chest pain|crushing pain|can''t breathe', 'cardiac/respiratory emergency keywords — SMOKE TEST ONLY, not clinician-authored', true, '11111111-1111-1111-1111-111111111111', now());
+-- R3: the rule set, then the rule. Patterns are structured jsonb, matching the
+-- committed column — see src/lib/pipeline/rulePattern.ts.
+--
+-- SMOKE TEST CONTENT ONLY. Not clinician-authored, not adopted content in the
+-- §0.6 sense: `clinically_adopted` is set true here purely so the smoke test
+-- can exercise a path that a real deployment reaches only after CL2 is signed.
+-- Nothing in this file may be seeded into any environment serving users.
+INSERT INTO safety.red_flag_rule_set
+    (id, version_label, jurisdiction, language, approved_by, approved_at, effective_from, recall_floor)
+  VALUES ('77777777-7777-7777-7777-777777777777', 'smoke-test-1.0', 'IN', 'en',
+          '11111111-1111-1111-1111-111111111111', now(), now() - interval '1 day', 0.950);
 
-INSERT INTO safety.safety_template (id, body, active, clinically_adopted, adopted_by, adopted_at)
-  VALUES ('44444444-4444-4444-4444-444444444444',
-          'This may be a medical emergency. Contact your local emergency number now.',
-          true, true, '11111111-1111-1111-1111-111111111111', now());
+INSERT INTO safety.red_flag_rule
+    (id, version, rule_set_id, severity, pattern, rationale, jurisdiction,
+     approved_by, approved_at, clinically_adopted, adopted_by, adopted_at)
+  VALUES
+  ('88888888-8888-8888-8888-888888888801', 1, '77777777-7777-7777-7777-777777777777',
+   'URGENT',
+   '{"kind":"KEYWORD_ANY","terms":["chest pain","crushing pain","can''t breathe"]}'::jsonb,
+   'cardiac/respiratory emergency keywords — SMOKE TEST ONLY, not clinician-authored',
+   'IN', '11111111-1111-1111-1111-111111111111', now(), true,
+   '11111111-1111-1111-1111-111111111111', now()),
+  -- A THRESHOLD rule, which the old regex model could not express at all: the
+  -- unit is data, so 38 degC does not also match 38 degF (§3.5.3).
+  ('88888888-8888-8888-8888-888888888802', 1, '77777777-7777-7777-7777-777777777777',
+   'WARNING',
+   '{"kind":"THRESHOLD","source":"VITAL","code":"TEMP_C","op":"GTE","value":38,"unit":"C"}'::jsonb,
+   'fever threshold — SMOKE TEST ONLY',
+   'IN', '11111111-1111-1111-1111-111111111111', now(), true,
+   '11111111-1111-1111-1111-111111111111', now());
 
--- ---- GENERIC_ESCALATION_TEMPLATE_ID (redFlagEngine.ts's
--- resolveTemplateRequirement fallback for a WARNING+ severity whose rule
--- carries no template of its own). Seeded so that fallback resolves to a
--- real row — see redFlagEngine.ts's GENERIC_ESCALATION_TEMPLATE_ID comment
--- for the bug (a bare non-UUID placeholder string) this closes.
-INSERT INTO safety.safety_template (id, body, active, clinically_adopted, adopted_by, adopted_at)
-  VALUES ('55555555-5555-5555-5555-555555555555',
-          'This has been flagged for clinical review. A member of our care team will follow up; if your situation ' ||
-          'changes or feels urgent in the meantime, please seek in-person care rather than waiting for that follow-up.',
-          true, true, '11111111-1111-1111-1111-111111111111', now());
+-- R2: templates are keyed by (severity, jurisdiction, language, version) — no
+-- FK from the rule. One row per level the smoke test reaches; the §4.3.3 ladder
+-- climbs from a missing level to the next one up, so URGENT resolves to
+-- CRITICAL here rather than needing its own row.
+INSERT INTO safety.safety_template
+    (id, version, severity, jurisdiction, language, body, slots,
+     approved_by, approved_at)
+  VALUES
+  ('44444444-4444-4444-4444-444444444401', 1, 'WARNING', 'IN', 'en',
+   'This should be assessed by a clinician. Arrange to be seen within the next few days.',
+   '[]'::jsonb, '11111111-1111-1111-1111-111111111111', now()),
+  ('44444444-4444-4444-4444-444444444402', 1, 'CRITICAL', 'IN', 'en',
+   'This may be a medical emergency. Contact your local emergency number now.',
+   '[]'::jsonb, '11111111-1111-1111-1111-111111111111', now()),
+  ('44444444-4444-4444-4444-444444444403', 1, 'EMERGENCY', 'IN', 'en',
+   'Call your local emergency number now. Do not delay and do not drive yourself.',
+   '[]'::jsonb, '11111111-1111-1111-1111-111111111111', now());
+
+-- R2 removed the GENERIC_ESCALATION_TEMPLATE_ID row that used to sit here.
+--
+-- It existed as the stand-in for "this severity needs a template and the rule
+-- named none" — a case that only arose because templates hung off the rule.
+-- Under the §4.3.3 ladder that case is not special: a level with no row of its
+-- own resolves UPWARD to the next level that has one, which is what §4.0.9
+-- asks for and is strictly safer than one generic row standing in for every
+-- level. A single catch-all template is also the wrong shape for §4.4's
+-- time-to-care language, which differs per level by design.
 
 -- ---- Other 8 of 9 knowledge domains ----------------------------------------
 -- Turn-5 gap: only GUIDELINE (seeded above) had ever been exercised. One

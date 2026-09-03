@@ -81,39 +81,126 @@ GRANT SELECT ON obs.model_pricing, obs.ai_call_cost TO hp_app, hp_reader;
 -- loadSafetyTemplate() both already fail safe (severity NORMAL / hard-coded
 -- fallback message) when no rows match, so an empty table is a safe, not a
 -- broken, starting state.
-CREATE TABLE safety.red_flag_rule (
-  id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  ruleset_version    text NOT NULL,
-  version            int NOT NULL DEFAULT 1,
-  severity           red_flag_severity NOT NULL,
-  pattern            text NOT NULL,          -- Postgres regex; clinician-authored
-  pattern_notes      text,                   -- what the pattern is meant to catch, for the reviewing clinician
-  template_id        uuid,
-  template_version   int,
-  clinically_adopted boolean NOT NULL DEFAULT false,   -- AMB-17 gate
-  adopted_by         uuid,
-  adopted_at         timestamptz,
-  CONSTRAINT c_adopted_needs_reviewer CHECK (
-    clinically_adopted = false OR (adopted_by IS NOT NULL AND adopted_at IS NOT NULL)
-  )
-);
-CREATE INDEX idx_red_flag_rule_active ON safety.red_flag_rule (ruleset_version) WHERE clinically_adopted;
+-- R2/R3 RECONCILIATION (2 Sep 2026): both tables below now carry the REAL
+-- committed shape from migrations/001_003 + 012, not a reconstruction of it.
+-- Before this, three columns differed in ways that broke the engine against
+-- the shipping schema (HP-RECON-001 §2, §3):
+--
+--   pattern was `text` holding a Postgres regex; the real column is `jsonb`
+--   holding a structured pattern. A regex cannot express "temp >= 38 degC"
+--   without also matching 38 degF, and §3.5.3 forbids converting between
+--   units without a sourced factor. See src/lib/pipeline/rulePattern.ts.
+--
+--   red_flag_rule carried template_id/template_version. The real table does
+--   not: a template is resolved by (severity, jurisdiction, language) through
+--   §4.3.3's fallback ladder, not by a foreign key from the rule.
+--
+--   safety_template had `active` and no severity/jurisdiction/language/slots,
+--   so loadSafetyTemplate()'s `AND active = true` raised against the real
+--   schema and its catch silently served the unapproved hard-coded fallback.
+--
+-- What still differs, and why: no `principal.clinician` or
+-- `safety.clinical_domain` table exists in this stub, so approved_by /
+-- adopted_by / clinical_domain are plain columns rather than FKs. The
+-- adoption columns (clinically_adopted / adopted_by / adopted_at) come from
+-- migration 012 and are real.
 
-CREATE TABLE safety.safety_template (
-  id                 uuid PRIMARY KEY,
+-- §4.0.3 / §6.4: rules are versioned as a SET, because recall is a property of
+-- the set rather than of any rule in it.
+CREATE TABLE safety.red_flag_rule_set (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  version_label    text NOT NULL,
+  jurisdiction     char(2),
+  language         text NOT NULL,
+  approved_by      uuid NOT NULL,          -- real: FK principal.clinician(user_id)
+  approved_at      timestamptz NOT NULL,
+  effective_from   timestamptz NOT NULL,
+  superseded_by    uuid REFERENCES safety.red_flag_rule_set(id),
+  retired_at       timestamptz,
+  gold_set_version text,                   -- §6.4: what it was validated against
+  recall_floor     numeric(4,3),           -- §4.0.3 published recall floor
+  UNIQUE (version_label, jurisdiction, language),
+  CONSTRAINT c_set_not_self_supersede CHECK (superseded_by IS DISTINCT FROM id)
+);
+
+CREATE TABLE safety.red_flag_rule (
+  id                 uuid NOT NULL DEFAULT gen_random_uuid(),
   version            int NOT NULL DEFAULT 1,
-  body               text NOT NULL,
-  active             boolean NOT NULL DEFAULT false,   -- also AMB-17-gated, same reasoning
+  -- §4.0.3 "pattern, keyword and structured-symptom rules". Structured, not a
+  -- regex: parsed and evaluated by src/lib/pipeline/rulePattern.ts.
+  pattern            jsonb NOT NULL,
+  severity           red_flag_severity NOT NULL,
+  rationale          text,                 -- what the rule is meant to catch, for the reviewing clinician
+  approved_by        uuid NOT NULL,        -- real: FK principal.clinician(user_id)
+  approved_at        timestamptz NOT NULL,
+  retired_at         timestamptz,
+  rule_set_id        uuid REFERENCES safety.red_flag_rule_set(id),
+  clinical_domain    text,                 -- real: FK safety.clinical_domain(code)
+  jurisdiction       char(2),
+  -- §0.6 / AMB-17: a rule that has not been signed must not be able to fire.
   clinically_adopted boolean NOT NULL DEFAULT false,
   adopted_by         uuid,
   adopted_at         timestamptz,
-  CONSTRAINT c_template_adopted_needs_reviewer CHECK (
+  PRIMARY KEY (id, version),
+  CONSTRAINT c_adoption_attributed CHECK (
     clinically_adopted = false OR (adopted_by IS NOT NULL AND adopted_at IS NOT NULL)
-  ),
-  CONSTRAINT c_active_requires_adopted CHECK (active = false OR clinically_adopted = true)
+  )
 );
-ALTER TABLE safety.red_flag_rule ADD CONSTRAINT fk_red_flag_template
-  FOREIGN KEY (template_id) REFERENCES safety.safety_template(id);
+CREATE INDEX idx_red_flag_rule_live ON safety.red_flag_rule (rule_set_id)
+  WHERE clinically_adopted AND retired_at IS NULL;
+
+CREATE TABLE safety.safety_template (
+  id                 uuid NOT NULL,
+  version            int NOT NULL DEFAULT 1,
+  severity           red_flag_severity NOT NULL,
+  jurisdiction       text NOT NULL,
+  language           text NOT NULL,
+  body               text NOT NULL,
+  -- §4.3.2: the declared, typed slots. Nothing outside this list may be
+  -- substituted into the body.
+  slots              jsonb NOT NULL DEFAULT '[]'::jsonb,
+  approved_by        uuid NOT NULL,        -- real: FK principal.clinician(user_id)
+  approved_at        timestamptz NOT NULL,
+  rule_set_id        uuid REFERENCES safety.red_flag_rule_set(id),
+  is_fallback        boolean NOT NULL DEFAULT false,
+  machine_translated boolean NOT NULL DEFAULT false,
+  -- NO clinically_adopted/adopted_by/adopted_at here, deliberately. The real
+  -- safety_template has none: migration 012 adds the adoption columns to
+  -- red_flag_rule only, and approval of a TEMPLATE is expressed by
+  -- approved_by/approved_at being NOT NULL. An earlier draft of this table
+  -- invented them, and the resolver then filtered on clinically_adopted —
+  -- which is the same shape of bug as the `active = true` predicate that made
+  -- every emergency render an unapproved fallback (HP-RECON-001 §2).
+  PRIMARY KEY (id, version),
+  UNIQUE (severity, jurisdiction, language, version),
+  -- §4.3.4: an untranslated template falls back to the approved English one
+  -- plus the local emergency number, never to machine translation of
+  -- safety-critical text.
+  CONSTRAINT c_no_mt_safety_text CHECK (machine_translated = false)
+);
+
+-- §0.6 / AMB-17, mirroring migrations/027. Zero rows means nothing is signed to
+-- run, and the engine refuses generative output rather than reporting NORMAL.
+-- Defined here as well as there so ONE code path serves both schemas.
+CREATE OR REPLACE FUNCTION safety.adopted_rule_set(
+  p_jurisdiction char(2),
+  p_language     text
+) RETURNS TABLE (rule_set_id uuid, version_label text, recall_floor numeric(4,3), adopted_rules bigint)
+LANGUAGE sql STABLE AS $$
+  SELECT rs.id, rs.version_label, rs.recall_floor, count(r.id)
+  FROM safety.red_flag_rule_set rs
+  JOIN safety.red_flag_rule r
+    ON r.rule_set_id = rs.id AND r.clinically_adopted AND r.retired_at IS NULL
+  WHERE rs.retired_at IS NULL
+    AND rs.superseded_by IS NULL
+    AND rs.effective_from <= now()
+    AND (rs.jurisdiction = p_jurisdiction OR rs.jurisdiction IS NULL)
+    AND rs.language = p_language
+  GROUP BY rs.id, rs.version_label, rs.recall_floor
+  HAVING count(r.id) > 0
+  ORDER BY rs.jurisdiction NULLS LAST, rs.effective_from DESC
+  LIMIT 1;
+$$;
 
 GRANT SELECT ON safety.red_flag_rule, safety.safety_template TO hp_app, hp_reader;
 
@@ -292,7 +379,7 @@ GRANT EXECUTE ON FUNCTION claim_search TO hp_app;
 --     table this stub doesn't build (db/000 keeps red_flag_rule/
 --     safety_template as single-`id`-PK STAND-INs) — here rule_id/
 --     template_id are plain FKs into those STAND-IN tables, and
---     ruleset_version is the text column the STAND-IN red_flag_rule already
+--     (RESOLVED 2 Sep 2026 by R2/R3: red_flag_rule now carries the real
 --     carries rather than a rule_set_id FK to a table that doesn't exist yet.
 --   * `safety.session_severity_floor` (§4.0.8, the per-session sticky-
 --     upward companion table this same doc section defines right after
@@ -313,11 +400,12 @@ CREATE TABLE safety.red_flag_event (
   session_pseudonym      bytea NOT NULL,
   occurred_at            timestamptz NOT NULL DEFAULT now(),
   severity               red_flag_severity NOT NULL,
-  rule_id                uuid REFERENCES safety.red_flag_rule(id),
+  rule_id                uuid,
+  -- composite, matching red_flag_rule's real PRIMARY KEY (id, version)
   rule_version           int,
-  ruleset_version        text,                  -- STAND-IN for the real rule_set_id FK, see header
+  rule_set_id            uuid REFERENCES safety.red_flag_rule_set(id),
   trigger_detail         jsonb NOT NULL,        -- which pattern matched; no free user text
-  template_id            uuid REFERENCES safety.safety_template(id),
+  template_id            uuid,
   template_version       int,
   -- Doc vocabulary is 'TEMPLATE_SHOWN'|'INTERSTITIAL'|'TAKEOVER'
   -- |'PANEL_ADDED'|'ESCALATED'. This pipeline only ever writes
@@ -339,6 +427,8 @@ CREATE TABLE safety.red_flag_event (
   outcome                  text,
   data_region              char(2) NOT NULL REFERENCES public.region_registry(code),
   -- §4.0.2: MONITOR is the floor for persistence.
+  FOREIGN KEY (rule_id, rule_version)         REFERENCES safety.red_flag_rule(id, version),
+  FOREIGN KEY (template_id, template_version) REFERENCES safety.safety_template(id, version),
   CONSTRAINT c_event_at_least_monitor CHECK (severity >= 'MONITOR'),
   -- §4.1: at URGENT and above a pre-approved template is the only permitted output.
   CONSTRAINT c_urgent_needs_template CHECK (severity < 'URGENT' OR template_id IS NOT NULL),
@@ -389,8 +479,9 @@ GRANT SELECT ON safety.session_severity_floor TO hp_reader;
 -- reachable from this line of history, which it was not when db/000 was
 -- written (see STUB_VS_REAL.md's opening paragraph). What follows is the
 -- stub-shaped equivalent so this pipeline's own tests can run against plain
--- local Postgres; it uses `ruleset_version text` where the real table uses a
--- `rule_set_id uuid` FK, exactly as the STAND-IN red_flag_rule above does.
+-- local Postgres. Since R2/R3 the rule and template tables carry the real
+-- committed shape, so this file's divergence from migrations/ is now confined
+-- to the tables listed in STUB_VS_REAL.md's remaining rows.
 --
 -- DO NOT ship this block. Migration 027 is the one that ships.
 
