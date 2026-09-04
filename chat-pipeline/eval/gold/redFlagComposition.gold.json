@@ -1,26 +1,92 @@
 {
   "suite": "redFlagEngine severity composition",
-  "version": "eval-2026.08.1",
+  "version": "eval-2026.09.1",
   "targetFunctions": [
     "src/lib/pipeline/redFlagEngine.ts#clampSeverity",
-    "src/lib/pipeline/redFlagEngine.ts#resolveTemplateRequirement",
+    "src/lib/pipeline/templateResolution.ts#resolveTemplateForSeverity",
+    "src/lib/pipeline/templateResolution.ts#selectTemplate",
     "src/lib/pipeline/redFlagEngine.ts#deriveActionTaken",
     "src/lib/pipeline/redFlagEngine.ts#applySessionFloor"
   ],
-  "charterClauses": ["§4.0.2", "§4.0.3", "§4.0.7", "§4.0.8"],
-  "description": "Gold-set for the deterministic composition logic around red-flag severity — everything downstream of the (model-assisted, not evaluated here) deterministic rule match and model propose step. §4.0.3: model may raise, never lower. §4.0.2: WARNING+ always carries a template, falling back to the generic escalation template. §4.0.7/§4.0.8: action-taken derivation and the sticky session floor never lower an in-turn severity. RED_FLAG_RULESET_VERSION bumps and any change to this composition logic should re-run this suite (npm run eval) before shipping — this is the layer c_urgent_needs_template and c_urgent_template_only (Annex A) actually depend on being correct.",
+  "charterClauses": ["§4.0.3", "§4.0.7", "§4.0.8", "§4.0.9", "§4.3.1", "§4.3.3", "§4.3.4"],
+  "description": "Gold-set for the deterministic composition logic around red-flag severity — everything downstream of the (model-assisted, not evaluated here) deterministic rule match and model propose step. §4.0.3: model may raise, never lower. §4.3.1/§4.3.3/§4.3.4: WARNING+ always renders from an approved, versioned template, found by climbing the fallback ladder (exact → approved English → GLOBAL jurisdiction → next severity UP) and never from a machine translation. R2 (2 Sep 2026) replaced the old resolveTemplateRequirement_cases here: templates no longer hang off the rule row, so a rule that names no template is not a special case with a generic stand-in — it is the ladder, and §4.0.9 makes the ladder climb rather than descend. The ladder is driven through an injected lookup, so this stays a pure-function suite with no DB. §4.0.7/§4.0.8: action-taken derivation and the sticky session floor never lower an in-turn severity. RED_FLAG_RULESET_VERSION bumps and any change to this composition logic should re-run this suite (npm run eval) before shipping — this is the layer c_urgent_needs_template and c_urgent_template_only (Annex A) actually depend on being correct.",
   "clampSeverity_cases": [
     { "id": "cs-01", "description": "Model proposes higher than the rule-matched base — raise applies", "base": "WARNING", "proposed": "URGENT", "expect": "URGENT" },
     { "id": "cs-02", "description": "Model proposes lower than the rule-matched base — ignored, never lowers", "base": "URGENT", "proposed": "WARNING", "expect": "URGENT" },
     { "id": "cs-03", "description": "Equal proposal is a no-op", "base": "URGENT", "proposed": "URGENT", "expect": "URGENT" },
     { "id": "cs-04", "description": "No rule matched (NORMAL base), model proposes the maximum severity", "base": "NORMAL", "proposed": "EMERGENCY", "expect": "EMERGENCY" }
   ],
-  "resolveTemplateRequirement_cases": [
-    { "id": "rt-01", "description": "Below WARNING needs no template even if the rule happened to carry one", "applied": "NORMAL", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": null, "templateVersion": null } },
-    { "id": "rt-02", "description": "MONITOR still needs no template", "applied": "MONITOR", "ruleTemplateId": "some-rule-template", "ruleTemplateVersion": 3, "expect": { "templateId": null, "templateVersion": null } },
-    { "id": "rt-03", "description": "WARNING+ with a rule-supplied template uses that template", "applied": "WARNING", "ruleTemplateId": "rule-supplied-template", "ruleTemplateVersion": 2, "expect": { "templateId": "rule-supplied-template", "templateVersion": 2 } },
-    { "id": "rt-04", "description": "EMERGENCY with no rule-supplied template falls back to the generic escalation template", "applied": "EMERGENCY", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": "GENERIC_ESCALATION_TEMPLATE_ID", "templateVersion": 1 } },
-    { "id": "rt-05", "description": "A model-driven raise past WARNING with a template-less rule still gets the generic fallback, not a null template_id", "applied": "URGENT", "ruleTemplateId": null, "ruleTemplateVersion": null, "expect": { "templateId": "GENERIC_ESCALATION_TEMPLATE_ID", "templateVersion": 1 } }
+  "templateLadder_cases": [
+    { "id": "tl-01", "description": "Below WARNING nothing is resolved at all — §4.3.1 only governs WARNING and above",
+      "requested": "NORMAL", "jurisdiction": "IN", "language": "en",
+      "available": [
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "needed": false } },
+    { "id": "tl-02", "description": "MONITOR still resolves nothing even when a MONITOR-severity row exists",
+      "requested": "MONITOR", "jurisdiction": "IN", "language": "en",
+      "available": [
+        { "id": "t-mon-in-en", "version": 1, "severity": "MONITOR", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-mon-in-en", "slots": [], "is_fallback": false, "machine_translated": false },
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "needed": false } },
+    { "id": "tl-03", "description": "Exact severity + jurisdiction + language is not a fallback",
+      "requested": "WARNING", "jurisdiction": "IN", "language": "hi",
+      "available": [
+        { "id": "t-warn-in-hi", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "hi", "body": "seeded body for t-warn-in-hi", "slots": [], "is_fallback": false, "machine_translated": false },
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-warn-in-hi", "resolvedSeverity": "WARNING", "isFallback": false } },
+    { "id": "tl-04", "description": "§4.3.4: no row in the patient language falls back to approved English at the same jurisdiction",
+      "requested": "WARNING", "jurisdiction": "IN", "language": "hi",
+      "available": [
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false },
+        { "id": "t-warn-global-hi", "version": 1, "severity": "WARNING", "jurisdiction": "GLOBAL", "language": "hi", "body": "seeded body for t-warn-global-hi", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-warn-in-en", "resolvedSeverity": "WARNING", "isFallback": true } },
+    { "id": "tl-05", "description": "§4.3.3: no row for the jurisdiction falls back to GLOBAL in the patient language",
+      "requested": "CRITICAL", "jurisdiction": "TR", "language": "de",
+      "available": [
+        { "id": "t-crit-global-de", "version": 1, "severity": "CRITICAL", "jurisdiction": "GLOBAL", "language": "de", "body": "seeded body for t-crit-global-de", "slots": [], "is_fallback": false, "machine_translated": false },
+        { "id": "t-crit-global-en", "version": 1, "severity": "CRITICAL", "jurisdiction": "GLOBAL", "language": "en", "body": "seeded body for t-crit-global-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-crit-global-de", "resolvedSeverity": "CRITICAL", "isFallback": true } },
+    { "id": "tl-06", "description": "§4.3.3: last rung at this severity is GLOBAL English",
+      "requested": "CRITICAL", "jurisdiction": "TR", "language": "de",
+      "available": [
+        { "id": "t-crit-global-en", "version": 1, "severity": "CRITICAL", "jurisdiction": "GLOBAL", "language": "en", "body": "seeded body for t-crit-global-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-crit-global-en", "resolvedSeverity": "CRITICAL", "isFallback": true } },
+    { "id": "tl-07", "description": "§4.0.9: a missing URGENT template climbs to CRITICAL and never descends to the WARNING row sitting right there",
+      "requested": "URGENT", "jurisdiction": "IN", "language": "en",
+      "available": [
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false },
+        { "id": "t-crit-in-en", "version": 1, "severity": "CRITICAL", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-crit-in-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-crit-in-en", "resolvedSeverity": "CRITICAL", "isFallback": true } },
+    { "id": "tl-08", "description": "§4.3.4: a machine-translated exact match is skipped in favour of approved English",
+      "requested": "WARNING", "jurisdiction": "IN", "language": "hi",
+      "available": [
+        { "id": "t-warn-in-hi-mt", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "hi", "body": "seeded body for t-warn-in-hi-mt", "slots": [], "is_fallback": false, "machine_translated": true },
+        { "id": "t-warn-in-en", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en", "slots": [], "is_fallback": false, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-warn-in-en", "resolvedSeverity": "WARNING", "isFallback": true } },
+    { "id": "tl-09", "description": "§4.3.4 is absolute: a machine-translated row is skipped even when it is the only row anywhere on the ladder — fail closed, do not render it",
+      "requested": "EMERGENCY", "jurisdiction": "IN", "language": "hi",
+      "available": [
+        { "id": "t-emerg-in-hi-mt", "version": 1, "severity": "EMERGENCY", "jurisdiction": "IN", "language": "hi", "body": "seeded body for t-emerg-in-hi-mt", "slots": [], "is_fallback": false, "machine_translated": true }
+      ],
+      "expect": { "failClosed": true } },
+    { "id": "tl-10", "description": "§4.0.9: an empty template table at EMERGENCY fails closed rather than falling through to generative output",
+      "requested": "EMERGENCY", "jurisdiction": "IN", "language": "en",
+      "available": [],
+      "expect": { "failClosed": true } },
+    { "id": "tl-11", "description": "A row the clinician marked is_fallback is reported as a fallback even on an otherwise exact match",
+      "requested": "WARNING", "jurisdiction": "IN", "language": "en",
+      "available": [
+        { "id": "t-warn-in-en-fb", "version": 1, "severity": "WARNING", "jurisdiction": "IN", "language": "en", "body": "seeded body for t-warn-in-en-fb", "slots": [], "is_fallback": true, "machine_translated": false }
+      ],
+      "expect": { "templateId": "t-warn-in-en-fb", "resolvedSeverity": "WARNING", "isFallback": true } }
   ],
   "deriveActionTaken_cases": [
     { "id": "da-01", "description": "Emergency template shown wins regardless of the severity argument passed alongside it", "severity": "MONITOR", "emergencyTemplateShown": true, "expect": "TEMPLATE_SHOWN" },

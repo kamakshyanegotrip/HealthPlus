@@ -6,12 +6,15 @@
   "description": "HP-OIR-002 Build Queue #4 — extractClaimsFromProviderSubmission pg-boss task",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "start": "tsx src/worker.ts",
+    "migrate": "node migrations/run_migrations.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "pg": "^8.13.0",
     "pg-boss": "^10.1.5",
+    "tsx": "^4.23.13",
     "zod": "^3.24.1"
   },
   "devDependencies": {

@@ -273,39 +273,82 @@ async function main() {
   });
 
   // ---- redFlagEngine.ts matchDeterministicRules --------------------------
+  // R3: the live rule set is chosen by safety.adopted_rule_set(jurisdiction,
+  // language) — not by a `ruleset_version` string — and `pattern` is structured
+  // jsonb, not a regex. RULE_QUERY below is matchDeterministicRules' query
+  // verbatim. Running it here is the whole point of this script: a column the
+  // module names but the schema does not have fails LOUDLY at this line instead
+  // of silently at request time, which is exactly how `active = true` and
+  // `clinically_adopted = true` were each caught.
+  const RULE_QUERY = `SELECT r.id, r.version, r.severity, r.pattern, r.clinically_adopted,
+              s.rule_set_id
+         FROM safety.adopted_rule_set($1, $2) s
+         JOIN safety.red_flag_rule r
+           ON r.rule_set_id = s.rule_set_id
+          AND r.clinically_adopted = true
+          AND r.retired_at IS NULL`;
+
+  // Mirrors rulePattern.ts's KEYWORD_ANY arm — the only kind evaluable from raw
+  // SQL, since THRESHOLD needs a structured PatternInput this script has no way
+  // to build. test/rulePattern.test.ts covers every kind properly; what is
+  // being proved here is the QUERY, not the matcher.
+  const keywordAnyMatches = (pattern, message) =>
+    pattern.kind === 'KEYWORD_ANY' &&
+    pattern.terms.some((t) => message.toLowerCase().includes(t.toLowerCase()));
+
   await check('redFlagEngine.matchDeterministicRules [no match]', async () => {
-    const { rows } = await pool.query(
-      `SELECT id, version, severity, pattern, template_id, template_version, clinically_adopted
-         FROM safety.red_flag_rule
-        WHERE clinically_adopted = true AND ruleset_version = $1`,
-      ['rf-rules-2026.08.1'],
-    );
+    const { rows } = await pool.query(RULE_QUERY, ['IN', 'en']);
+    if (rows.length === 0) throw new Error('adopted_rule_set returned nothing — the §0.6 gate would FAIL_CLOSED, so no match assertion below would mean anything');
     const message = 'How much does a hip replacement typically cost in Chennai?';
-    const matched = rows.filter((r) => new RegExp(r.pattern, 'i').test(message));
+    const matched = rows.filter((r) => keywordAnyMatches(r.pattern, message));
     if (matched.length !== 0) throw new Error(`expected no match, got ${matched.length}`);
-    return 'no match, as expected';
+    return `no match across ${rows.length} adopted rule(s), as expected`;
   });
 
   await check('redFlagEngine.matchDeterministicRules [match: chest pain]', async () => {
-    const { rows } = await pool.query(
-      `SELECT id, version, severity, pattern, template_id, template_version, clinically_adopted
-         FROM safety.red_flag_rule
-        WHERE clinically_adopted = true AND ruleset_version = $1`,
-      ['rf-rules-2026.08.1'],
-    );
+    const { rows } = await pool.query(RULE_QUERY, ['IN', 'en']);
     const message = "I'm having crushing chest pain and can't breathe";
-    const matched = rows.filter((r) => new RegExp(r.pattern, 'i').test(message));
+    const matched = rows.filter((r) => keywordAnyMatches(r.pattern, message));
     if (matched.length === 0) throw new Error('expected a match, got none');
     if (matched[0].severity !== 'URGENT') throw new Error(`expected URGENT, got ${matched[0].severity}`);
-    return `matched severity=${matched[0].severity}`;
+    // red_flag_event.rule_set_id is what ties an event to the signed set it came
+    // from; if the join stops returning it the module writes null and the
+    // provenance is gone.
+    if (!matched[0].rule_set_id) throw new Error('rule_set_id must come back from the join');
+    return `matched severity=${matched[0].severity} rule_set_id=${matched[0].rule_set_id}`;
   });
 
-  await check('redFlagEngine.loadSafetyTemplate', async () => {
-    const { rows } = await pool.query(`SELECT body FROM safety.safety_template WHERE id = $1 AND active = true LIMIT 1`, [
-      '44444444-4444-4444-4444-444444444444',
-    ]);
-    if (rows.length !== 1) throw new Error('expected the seeded template to load');
+  await check('§0.6 / AMB-17: adopted_rule_set returns nothing for a jurisdiction with no signed set', async () => {
+    // Negative control for the gate. resolveAdoptionGate() turns zero adopted
+    // rules into FAIL_CLOSED rather than NORMAL — an unsigned deployment must
+    // not look healthy while detecting nothing.
+    const { rows } = await pool.query(RULE_QUERY, ['TR', 'en']);
+    if (rows.length !== 0) throw new Error(`expected zero adopted rules for TR/en, got ${rows.length}`);
+    return 'zero adopted rules for TR/en -> resolveAdoptionGate() = FAIL_CLOSED';
+  });
+
+  // ---- templateResolution.ts lookupTemplate (R2) --------------------------
+  await check('templateResolution.lookupTemplate (keyed by severity/jurisdiction/language — no `active`, no `clinically_adopted`)', async () => {
+    const { rows } = await pool.query(
+      `SELECT id, version, severity, jurisdiction, language, body, slots,
+              is_fallback, machine_translated
+         FROM safety.safety_template
+        WHERE severity = $1 AND jurisdiction = $2 AND language = $3
+        ORDER BY version DESC
+        LIMIT 1`,
+      ['CRITICAL', 'IN', 'en'],
+    );
+    if (rows.length !== 1) throw new Error('expected the seeded CRITICAL template to load');
+    if (rows[0].id !== '44444444-4444-4444-4444-444444444402') throw new Error(`unexpected template ${rows[0].id}`);
     return rows[0].body;
+  });
+
+  await check('§4.3.3: no URGENT template exists, which is why a URGENT scan resolves UPWARD to the CRITICAL one', async () => {
+    const { rows } = await pool.query(
+      `SELECT id FROM safety.safety_template WHERE severity = 'URGENT' AND jurisdiction = 'IN' AND language = 'en'`,
+    );
+    if (rows.length !== 0) throw new Error(`expected no URGENT row, got ${rows.length} — the ladder-climb the event insert below relies on is no longer being exercised`);
+    return 'no URGENT row — selectTemplate climbs to CRITICAL (eval case tl-07 proves the climb itself)';
   });
 
   // ---- anthropic.ts logAiCall --------------------------------------------
@@ -517,7 +560,7 @@ async function main() {
     const { rows } = await pool.query(
       `INSERT INTO safety.red_flag_event
          (id, audit_id, subject_pseudonym, session_pseudonym, occurred_at, severity,
-          rule_id, rule_version, ruleset_version, trigger_detail, template_id, template_version,
+          rule_id, rule_version, rule_set_id, trigger_detail, template_id, template_version,
           action_taken, commercial_suppressed, first_byte_at, scanner_started_at,
           template_displayed_at, data_region)
        VALUES (gen_random_uuid(), $1, $2, $3, now(), $4,
@@ -530,11 +573,18 @@ async function main() {
         Buffer.from('feedface', 'hex'),
         Buffer.from('deadbeef', 'hex'),
         'URGENT',
-        null,
-        null,
-        'rf-rules-2026.08.1',
-        JSON.stringify({ matchedRuleIds: [] }),
-        '55555555-5555-5555-5555-555555555555', // GENERIC_ESCALATION_TEMPLATE_ID
+        // R3: the seeded rule and set, so FOREIGN KEY (rule_id, rule_version)
+        // is actually exercised rather than skipped by passing nulls.
+        '88888888-8888-8888-8888-888888888801',
+        1,
+        '77777777-7777-7777-7777-777777777777',
+        JSON.stringify({ matchedRuleIds: ['88888888-8888-8888-8888-888888888801'] }),
+        // R2: the generic escalation template is gone. red_flag_event's
+        // FOREIGN KEY (template_id, template_version) means this id has to
+        // be a template that actually exists — and under the §4.3.3 ladder a
+        // URGENT row with no URGENT template resolves UPWARD to the seeded
+        // CRITICAL one (db/999), never down to WARNING.
+        '44444444-4444-4444-4444-444444444402',
         1,
         'ESCALATED',
         true,

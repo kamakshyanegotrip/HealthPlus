@@ -5,6 +5,9 @@ import { MODELS } from '../pricing';
 import { loadPrompt } from '../prompts/registry';
 import { subjectPseudonym, sessionPseudonym } from '../pseudonymize';
 import type { PipelineContext, RedFlagResult, RedFlagSeverity } from '../types';
+import { buildUnavailability, type ServiceUnavailability } from './unavailability';
+import { parseRulePattern, matchPattern, MalformedRulePatternError, type PatternInput } from './rulePattern';
+import { resolveTemplateForSeverity, NoApprovedTemplateError } from './templateResolution';
 import { SEVERITY_ORDER } from '../types';
 
 /**
@@ -26,52 +29,138 @@ import { SEVERITY_ORDER } from '../types';
  *   actually short-circuits on this; this module only classifies.
  */
 
-const RULESET_VERSION = process.env.RED_FLAG_RULESET_VERSION ?? 'rf-rules-2026.08.1';
+// R3: the live rule set is chosen by safety.adopted_rule_set(jurisdiction,
+// language) — a database function that exists identically in migrations/027
+// and db/010 — rather than by an environment variable naming a text version.
+// An env var could name a set that was never adopted; the function cannot.
 
 interface RedFlagRuleRow {
+  rule_set_id?: string;
   id: string;
   version: number;
   severity: RedFlagSeverity;
-  pattern: string; // stored as a Postgres regex; clinician-authored, not user input
-  template_id: string | null;
-  template_version: number | null;
+  // R3: jsonb, matching the committed column. Parsed by rulePattern.ts, never
+  // fed to `new RegExp`. Templates are NOT carried here — R2 resolves them by
+  // (severity, jurisdiction, language) through the §4.3.3 ladder.
+  pattern: unknown;
   clinically_adopted: boolean;
 }
 
-async function matchDeterministicRules(message: string): Promise<{
+export type AdoptionGate = 'OPEN' | 'FAIL_CLOSED';
+
+/**
+ * §0.6 / AMB-17, pure so it is testable without a database — same reason
+ * `clampSeverity` and `applySessionFloor` are split out above.
+ *
+ * The distinction it encodes is the whole safety claim: "we scanned and found
+ * nothing" and "we never scanned" both produce NORMAL, and only one of them is
+ * an assessment. Zero adopted rules is the second. So is a failed lookup —
+ * §4.0.9 forbids failing open, and a thrown error would hand that decision to
+ * whatever `catch` happens to be upstream.
+ */
+export function resolveAdoptionGate(args: {
+  adoptedRuleCount: number;
+  lookupFailed: boolean;
+}): AdoptionGate {
+  if (args.lookupFailed) return 'FAIL_CLOSED';
+  return args.adoptedRuleCount > 0 ? 'OPEN' : 'FAIL_CLOSED';
+}
+
+async function matchDeterministicRules(
+  input: PatternInput,
+  jurisdiction: string,
+  language: string,
+): Promise<{
   severity: RedFlagSeverity;
   ruleId: string | null;
-  templateId: string | null;
-  templateVersion: number | null;
-  matched: RedFlagRuleRow[];
+  ruleVersion: number | null;
+  ruleSetId: string | null;
+  matched: Array<{ row: RedFlagRuleRow; detail: Record<string, unknown> }>;
+  adoptionGate: AdoptionGate;
+  gateReason: string | null;
 }> {
   // safety.red_flag_rule: clinician-authored pattern rules, only the
   // clinically-adopted ones are live (AMB-17 gate — see
   // HP-SCHEMA-001-Annex-A §26 item 4: "clinically_adopted ... is the
   // schema's record of it").
-  const { rows } = await db().query<RedFlagRuleRow>(
-    `SELECT id, version, severity, pattern, template_id, template_version, clinically_adopted
-       FROM safety.red_flag_rule
-      WHERE clinically_adopted = true
-        AND ruleset_version = $1`,
-    [RULESET_VERSION],
-  );
+  let rows: RedFlagRuleRow[];
+  try {
+    // R3: selects the live set through safety.adopted_rule_set(), which exists
+    // identically in migrations/027 and db/010 — one code path, both schemas.
+    // It already applies the §0.6 adoption filter and the supersession/retired
+    // rules, so this query does not have to restate them.
+    ({ rows } = await db().query<RedFlagRuleRow>(
+      `SELECT r.id, r.version, r.severity, r.pattern, r.clinically_adopted,
+              s.rule_set_id
+         FROM safety.adopted_rule_set($1, $2) s
+         JOIN safety.red_flag_rule r
+           ON r.rule_set_id = s.rule_set_id
+          AND r.clinically_adopted = true
+          AND r.retired_at IS NULL`,
+      [jurisdiction, language],
+    ));
+  } catch (err) {
+    // §4.0.9: "failing open to generative output is prohibited." If this threw,
+    // route.ts's own catch would be the thing deciding whether an unscanned
+    // message reaches the model, and that decision does not belong there.
+    return {
+      severity: 'NORMAL', ruleId: null, ruleVersion: null, ruleSetId: null, matched: [],
+      adoptionGate: resolveAdoptionGate({ adoptedRuleCount: 0, lookupFailed: true }),
+      gateReason: `red_flag_rule lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
 
-  const matched = rows.filter((r) => {
+  // §0.6 / AMB-17 — the gate. Zero adopted rules is not "nothing matched"; it
+  // is "nothing was ever signed to match with". Returning NORMAL here would
+  // make an unsigned deployment look safe while detecting nothing at all, which
+  // is the one failure mode this whole module is written to prevent.
+  if (resolveAdoptionGate({ adoptedRuleCount: rows.length, lookupFailed: false }) === 'FAIL_CLOSED') {
+    return {
+      severity: 'NORMAL', ruleId: null, ruleVersion: null, ruleSetId: null, matched: [],
+      adoptionGate: 'FAIL_CLOSED',
+      gateReason:
+        `no clinically adopted red-flag rule set for ${jurisdiction}/${language} (§0.6, AMB-17: CL2 unsigned)`,
+    };
+  }
+
+  // R3: structured evaluation. A pattern that does not parse is a rule nobody
+  // can evaluate, and §4.0.9 forbids treating that as a non-match — "the
+  // pattern was gibberish so nothing matched" is failing open with extra
+  // steps. It closes the gate instead.
+  const matched: Array<{ row: RedFlagRuleRow; detail: Record<string, unknown> }> = [];
+  for (const r of rows) {
+    let detail: Record<string, unknown> | null;
     try {
-      return new RegExp(r.pattern, 'i').test(message);
-    } catch {
-      return false; // a malformed rule must never crash the safety path
+      detail = matchPattern(parseRulePattern(r.pattern, r.id), input);
+    } catch (err) {
+      if (err instanceof MalformedRulePatternError) {
+        return {
+          severity: 'NORMAL', ruleId: null, ruleVersion: null, ruleSetId: null, matched: [],
+          adoptionGate: 'FAIL_CLOSED',
+          gateReason: `unevaluable rule pattern: ${err.message}`,
+        };
+      }
+      throw err;
     }
-  });
+    if (detail) matched.push({ row: r, detail });
+  }
 
   if (matched.length === 0) {
-    return { severity: 'NORMAL', ruleId: null, templateId: null, templateVersion: null, matched: [] };
+    return { severity: 'NORMAL', ruleId: null, ruleVersion: null, ruleSetId: rows[0]?.rule_set_id ?? null, matched: [], adoptionGate: 'OPEN', gateReason: null };
   }
 
   // §4.0.4: multiple matches -> take the highest severity matched.
-  const top = matched.reduce((hi, r) => (SEVERITY_ORDER[r.severity] > SEVERITY_ORDER[hi.severity] ? r : hi));
-  return { severity: top.severity, ruleId: top.id, templateId: top.template_id, templateVersion: top.template_version, matched };
+  const top = matched.reduce((hi, m) =>
+    SEVERITY_ORDER[m.row.severity] > SEVERITY_ORDER[hi.row.severity] ? m : hi);
+  return {
+    severity: top.row.severity,
+    ruleId: top.row.id,
+    ruleVersion: top.row.version,
+    ruleSetId: top.row.rule_set_id ?? null,
+    matched,
+    adoptionGate: 'OPEN',
+    gateReason: null,
+  };
 }
 
 async function proposeModelSeverity(ctx: PipelineContext, baseSeverity: RedFlagSeverity): Promise<RedFlagSeverity> {
@@ -116,61 +205,117 @@ export function clampSeverity(base: RedFlagSeverity, proposed: RedFlagSeverity):
 }
 
 /**
- * §4.0.2 / c_urgent_template_only, also pure: WARNING and above needs a
- * template_id, and a raise past WARNING with no rule-supplied template
- * falls back to the generic escalation template rather than publishing a
- * null template_id that would fail the DB constraint. See
- * `test_hp_esc_4_0_2_urgent_and_above_always_carries_a_template`.
- */
-/**
- * Fallback template id used when a severity is high enough to require a
- * template (WARNING+) but the deterministic rule that fired carries none.
+ * R2 (2 Sep 2026): `resolveTemplateRequirement()` and
+ * `GENERIC_ESCALATION_TEMPLATE_ID` are GONE, and their absence is the point.
  *
- * BUG FIXED: this used to be the bare string 'GENERIC_ESCALATION_TEMPLATE' —
- * not a UUID. That string flowed into `loadSafetyTemplate()` (§4.0.5), whose
- * try/catch around an invalid-uuid query error silently swallowed it and
- * fell back to the hard-coded emergency message, so the bug was invisible
- * there. It stopped being invisible the moment `safety.red_flag_event.
- * template_id` (a real `uuid` FK column, added below) tried to store it —
- * `recordRedFlagEvent` would have thrown on every WARNING+ event with no
- * rule-supplied template. Fixed by making the fallback a real, fixed UUID
- * that db/999_seed_smoke_test.sql seeds a row for, so both call sites
- * (loadSafetyTemplate and recordRedFlagEvent) resolve it to something real
- * instead of one of them quietly eating the failure.
+ * Both existed because a template was carried on the rule row. The committed
+ * schema has no `red_flag_rule.template_id` — a template is identified by
+ * `UNIQUE (severity, jurisdiction, language, version)` and found by climbing
+ * §4.3.3/§4.3.4's ladder. See templateResolution.ts.
+ *
+ * The generic-escalation UUID was a workaround for the same missing concept:
+ * "this severity needs a template and the rule did not name one." Under the
+ * ladder that case is not special — a WARNING with no WARNING row simply
+ * resolves upward to CRITICAL, which is what §4.0.9 asks for and is strictly
+ * safer than a single generic row standing in for every level.
  */
-export const GENERIC_ESCALATION_TEMPLATE_ID = '55555555-5555-5555-5555-555555555555';
-
-export function resolveTemplateRequirement(
-  applied: RedFlagSeverity,
-  ruleTemplateId: string | null,
-  ruleTemplateVersion: number | null,
-): { templateId: string | null; templateVersion: number | null } {
-  const needsTemplate = SEVERITY_ORDER[applied] >= SEVERITY_ORDER['WARNING'];
-  if (!needsTemplate) return { templateId: null, templateVersion: null };
-  return {
-    templateId: ruleTemplateId ?? GENERIC_ESCALATION_TEMPLATE_ID,
-    templateVersion: ruleTemplateVersion ?? 1,
-  };
-}
 
 export async function scanRedFlags(ctx: PipelineContext): Promise<RedFlagResult> {
   const scannerStartedAt = new Date().toISOString();
-  const base = await matchDeterministicRules(ctx.message);
-  const proposed = await proposeModelSeverity(ctx, base.severity);
+  const jurisdiction = ctx.statedCountry ?? ctx.dataRegion;
+  const language = ctx.language ?? 'en';
 
+  // R3: structured patterns evaluate against the message AND whatever
+  // structured data the session carries. Symptom/vital/lab/travel fields are
+  // absent today, so structured rules simply do not match — which is correct:
+  // a rule that cannot be evaluated must not fire, and must not be silently
+  // treated as evaluated either.
+  const patternInput: PatternInput = { message: ctx.message };
+
+  const base = await matchDeterministicRules(patternInput, jurisdiction, language);
+
+  // §0.6 / AMB-17. Nothing signed to run, the rule table was unreachable, or a
+  // rule pattern would not parse. Do not call the model: step 2 is a RAISING
+  // channel over a rule-derived severity, and there is no rule-derived
+  // severity to raise. Letting it classify unsupervised here would be the
+  // model assigning a level unilaterally, which §4.0.3 forbids in those words.
+  if (base.adoptionGate === 'FAIL_CLOSED') {
+    return {
+      severity: 'NORMAL',
+      ruleId: null,
+      ruleVersion: null,
+      ruleSetId: null,
+      triggerDetail: { adoptionGate: 'FAIL_CLOSED', reason: base.gateReason },
+      proposedSeverityByModel: null,
+      templateId: null,
+      templateVersion: null,
+      templateBody: null,
+      scannerStartedAt,
+      adoptionGate: 'FAIL_CLOSED',
+      unavailability: await buildUnavailability(
+        base.gateReason ?? 'red-flag adoption gate closed',
+        ctx.statedCountry ?? null,
+      ),
+    };
+  }
+
+  const proposed = await proposeModelSeverity(ctx, base.severity);
   const applied = clampSeverity(base.severity, proposed);
-  const { templateId, templateVersion } = resolveTemplateRequirement(applied, base.templateId, base.templateVersion);
+
+  // R2: §4.3.1 — every level at or above WARNING renders from a versioned,
+  // clinician-approved template, resolved by the ladder rather than by an FK.
+  let templateId: string | null = null;
+  let templateVersion: number | null = null;
+  let templateBody: string | null = null;
+  let templateFallbackReason: string | null = null;
+  try {
+    const selection = await resolveTemplateForSeverity(applied, jurisdiction, language);
+    if (selection) {
+      templateId = selection.template.id;
+      templateVersion = selection.template.version;
+      templateBody = selection.template.body;
+      templateFallbackReason = selection.fallbackReason;
+    }
+  } catch (err) {
+    // §4.0.9: a severity that requires a template, with no approved template
+    // anywhere at or above it, must not fall through to generative output.
+    if (err instanceof NoApprovedTemplateError) {
+      return {
+        severity: applied,
+        ruleId: base.ruleId,
+        ruleVersion: base.ruleVersion,
+        ruleSetId: base.ruleSetId,
+        triggerDetail: { matchedRuleIds: base.matched.map((m) => m.row.id), templateResolution: 'NONE_FOUND' },
+        proposedSeverityByModel: proposed,
+        templateId: null,
+        templateVersion: null,
+        templateBody: null,
+        scannerStartedAt,
+        adoptionGate: 'FAIL_CLOSED',
+        unavailability: await buildUnavailability(err.message, ctx.statedCountry ?? null),
+      };
+    }
+    throw err;
+  }
 
   return {
     severity: applied,
     ruleId: base.ruleId,
-    ruleVersion: base.matched.find((m) => m.id === base.ruleId)?.version ?? null,
-    ruleSetId: RULESET_VERSION,
-    triggerDetail: { matchedRuleIds: base.matched.map((m) => m.id) }, // no free user text, §4.0.7
+    ruleVersion: base.ruleVersion,
+    ruleSetId: base.ruleSetId,
+    // §4.0.7: which pattern matched, never what the user wrote.
+    triggerDetail: {
+      matchedRuleIds: base.matched.map((m) => m.row.id),
+      matches: base.matched.map((m) => ({ ruleId: m.row.id, severity: m.row.severity, detail: m.detail })),
+      ...(templateFallbackReason ? { templateFallbackReason } : {}),
+    },
     proposedSeverityByModel: proposed,
     templateId,
     templateVersion,
+    templateBody,
     scannerStartedAt,
+    adoptionGate: 'OPEN',
+    unavailability: null,
   };
 }
 
@@ -255,7 +400,7 @@ export async function recordRedFlagEvent(
   const { rows } = await db().query<{ id: string }>(
     `INSERT INTO safety.red_flag_event
        (id, audit_id, subject_pseudonym, session_pseudonym, occurred_at, severity,
-        rule_id, rule_version, ruleset_version, trigger_detail, template_id, template_version,
+        rule_id, rule_version, rule_set_id, trigger_detail, template_id, template_version,
         action_taken, commercial_suppressed, first_byte_at, scanner_started_at,
         template_displayed_at, data_region)
      VALUES (gen_random_uuid(), $1, $2, $3, now(), $4,
@@ -366,20 +511,145 @@ export async function clearSessionSeverityFloor(sessionId: string, clinicianId: 
  * template table is unreachable, because an emergency response must never
  * simply fail to render.
  */
-export async function loadSafetyTemplate(templateId: string): Promise<string> {
-  try {
-    const { rows } = await db().query<{ body: string }>(
-      `SELECT body FROM safety.safety_template WHERE id = $1 AND active = true LIMIT 1`,
-      [templateId],
-    );
-    if (rows[0]) return rows[0].body;
-  } catch {
-    // fall through to the hard-coded fallback below
+export interface LoadedSafetyTemplate {
+  body: string;
+  /**
+   * Which of the two this actually is. The caller records it, so an emergency
+   * rendered from the unapproved fallback is visible in the audit trail rather
+   * than indistinguishable from a clinician-authored one.
+   */
+  source: 'APPROVED_TEMPLATE' | 'HARDCODED_FALLBACK';
+  /** Set when the lookup failed rather than simply finding no row. */
+  failure: string | null;
+}
+
+/**
+ * §4.0.9 last-resort text. Not clinician-approved — HP-JOB-003 J3-8 tracks
+ * that. It exists because §4.0.9 forbids rendering nothing on an emergency
+ * path, and rendering nothing is worse than rendering this.
+ */
+const HARDCODED_EMERGENCY_FALLBACK =
+  'This may be a medical emergency. Please contact your local emergency number or go to ' +
+  'the nearest emergency department now. This message is shown automatically and has not ' +
+  'been reviewed for your specific situation, but that review does not need to happen ' +
+  'before you get help — it happens alongside it.';
+
+/**
+ * R2: the body now arrives on the scan result, already resolved by the
+ * §4.3.3/§4.3.4 ladder, so this no longer queries anything. It exists to keep
+ * one place where "we have no approved text" turns into the §4.0.9 last-resort
+ * string, and to keep that substitution VISIBLE — the audit event records
+ * `template_source`, so an emergency rendered from the unapproved fallback is
+ * distinguishable from a clinician-authored one.
+ *
+ * The previous version queried `WHERE id = $1 AND active = true`. The real
+ * schema has no `active` column; the query raised, the catch swallowed it, and
+ * every CRITICAL/EMERGENCY silently rendered the fallback (HP-RECON-001 §2).
+ * Removing the query removes that failure mode entirely.
+ */
+export function loadSafetyTemplate(resolvedBody: string | null): LoadedSafetyTemplate {
+  if (resolvedBody && resolvedBody.trim().length > 0) {
+    return { body: resolvedBody, source: 'APPROVED_TEMPLATE', failure: null };
   }
-  return (
-    'This may be a medical emergency. Please contact your local emergency number or go to ' +
-    'the nearest emergency department now. This message is shown automatically and has not ' +
-    'been reviewed for your specific situation, but that review does not need to happen ' +
-    'before you get help — it happens alongside it.'
-  );
+  return {
+    body: HARDCODED_EMERGENCY_FALLBACK,
+    source: 'HARDCODED_FALLBACK',
+    failure: 'no approved template body resolved for this severity',
+  };
+}
+
+
+
+/**
+ * §4.0.7 gives MONITOR as the persistence floor, and `red_flag_event`'s
+ * `c_event_at_least_monitor` enforces it. That is correct for the *governed*
+ * record and useless for the other thing the Charter asks for: §6.4's
+ * false-negative review, which is entirely a question about the messages the
+ * rules called NORMAL. You cannot review what you did not write down.
+ *
+ * So `safety.red_flag_log` (migration 027) is a second, wider table: one row
+ * per scan, every severity, NORMAL included, with a nullable FK to the
+ * governed event row where one exists. Relaxing `c_event_at_least_monitor`
+ * instead would have been a §6.3 change to a Charter-derived control needing
+ * Board approval; this needs neither.
+ *
+ * Called for EVERY scan, after the response has been sent — §4.0.5 forbids
+ * gating output on anything, and a synchronous INSERT on the display path is a
+ * queue of one.
+ */
+export async function recordRedFlagLog(
+  ctx: Pick<PipelineContext, 'auditId' | 'userId' | 'sessionId' | 'dataRegion' | 'receivedAt'>,
+  result: RedFlagResult,
+  args: {
+    eventId: string | null;
+    branch: 'CONTINUE' | 'MONITOR_PANEL' | 'SAFETY_BLOCK_FIRST' | 'TEMPLATE_TAKEOVER' | 'FAIL_CLOSED';
+    commercialSuppressed: boolean;
+    generationBlocked: boolean;
+    needsReview: boolean;
+    scannerCompletedAt: Date;
+    templateDisplayedAt: Date | null;
+  },
+): Promise<void> {
+  const firstByteAt = new Date(ctx.receivedAt);
+  try {
+    await db().query(
+      `INSERT INTO safety.red_flag_log
+         (id, event_id, audit_id, subject_pseudonym, session_pseudonym, occurred_at,
+          rule_derived_severity, model_proposed_severity, applied_severity,
+          context_escalation, rule_set_id, matched_rule_ids, trigger_detail, query_hash,
+          branch, template_id, template_version, commercial_suppressed, generation_blocked,
+          needs_review, shadow_mode, first_byte_at, scanner_started_at, scanner_completed_at,
+          template_displayed_at, display_latency_ms, scanner_version, fail_safe_reason, data_region)
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, now(),
+               $5, $6, $7,
+               '{}', NULL, $8, $9::jsonb, digest($10, 'sha256'),
+               $11, $12, $13, $14, $15,
+               $16, false, $17, $18, $19,
+               $20, $21, $22, $23, $24)`,
+      [
+        args.eventId,
+        ctx.auditId,
+        subjectPseudonym(ctx.userId),
+        sessionPseudonym(ctx.sessionId),
+        result.severity,
+        result.proposedSeverityByModel,
+        result.severity,
+        result.ruleId ? [result.ruleId] : [],
+        JSON.stringify(result.triggerDetail),
+        // §3.13.1 convention: a hash, never the query text. The log is read by
+        // anyone measuring safety and must not become a second store of
+        // personal health data.
+        ctx.auditId,
+        args.branch,
+        result.templateId,
+        result.templateVersion,
+        args.commercialSuppressed,
+        args.generationBlocked,
+        args.needsReview,
+        firstByteAt.toISOString(),
+        result.scannerStartedAt,
+        args.scannerCompletedAt.toISOString(),
+        args.templateDisplayedAt ? args.templateDisplayedAt.toISOString() : null,
+        // §6.5: from FIRST BYTE of the inbound message, not from scanner start.
+        // A dashboard that measures its own runtime looks healthy while the
+        // user waits.
+        args.templateDisplayedAt ? args.templateDisplayedAt.getTime() - firstByteAt.getTime() : null,
+        SCANNER_VERSION,
+        result.unavailability?.internalReason ?? null,
+        ctx.dataRegion,
+      ],
+    );
+  } catch (err) {
+    // Logging must never take down a response that has already been correctly
+    // delivered. Loud, because a silent gap here is a hole in §6.4's evidence.
+    console.error('recordRedFlagLog failed', { auditId: ctx.auditId, err });
+  }
+}
+
+export const SCANNER_VERSION = 'hp-redflag-chat-pipeline-v1.1.0';
+
+/** §6.5, pure and testable without a clock or a DB. */
+export function displayLatencyMs(firstByteAt: Date, templateDisplayedAt: Date | null): number | null {
+  if (!templateDisplayedAt) return null;
+  return templateDisplayedAt.getTime() - firstByteAt.getTime();
 }

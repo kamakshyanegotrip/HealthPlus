@@ -50,3 +50,150 @@ Every genuinely dangerous case — a table whose real shape differs from this st
 3. For every row marked **DERIVED**, treat the stub's column list as a first draft, not a source of truth — replace it with the real one wholesale.
 4. For every row marked **STAND-IN**, the real migration (once it exists) simply replaces the stub table outright — expect `knowledgeLookup.ts`'s `DOMAIN_TABLE` map and `patientProfile.ts`'s query to both need column-name updates to match.
 5. Re-run this repo's full test battery (`npm run typecheck && npm test && npm run eval && npm run db:migrate:stub && npm run test:db && npm run test:integration`) against the reconciled schema — that sequence is what actually catches a column-name mismatch, not a read-through (see this repo's own recurring lesson, e.g. `knowledgeLookup.ts`'s `domain_table` bug, caught only by `scripts/smoke-test.mjs` executing).
+
+---
+
+# Reconciliation performed — 2 September 2026 (J3-5)
+
+The blocker this document opens with is gone. It said *"there is still no `migrations/` folder anywhere in this repo to diff against."* There was one the whole time — on a divergent, unpushed branch that this line of history could not see. Both halves were merged on `hp-integration` (`02783eb`), so the diff this document asks for could finally be run. It was, column by column, against `migrations/001–027`.
+
+**Headline: 155 real tables, 20 stub tables, 18 in common. Six are identical. Twelve diverge, and four of those break running code.**
+
+## A. Divergences that break code against the real schema
+
+### A1. 🔴 `safety_template` has no `active` column — and the failure was silent
+
+`loadSafetyTemplate()` queried `WHERE id = $1 AND active = true`. The real `safety.safety_template` (migration `001_003`) has columns `id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at` — and **no `active`**. Only the stub in `db/010` has one.
+
+Against the real schema that predicate raises `column "active" does not exist`. The function's `catch` swallowed it and returned the hard-coded fallback. So **every CRITICAL and EMERGENCY response would have rendered the unapproved hard-coded string instead of the clinician-authored template, and nothing anywhere would have said so.** The audit row recorded a `template_id` that was never actually displayed.
+
+This is precisely the case this document's own §"What this means practically" was written to catch — *"a table whose real shape differs from this stub in a way that would silently break something"* — and it was not on the list, because the list was built without the real migrations to diff against.
+
+**Fixed** (same commit as this note): the `active` predicate is dropped, the not-found and query-failed paths are separated, failures are logged loudly, and `loadSafetyTemplate()` now returns `{ body, source, failure }` so `route.ts` records `template_source: 'APPROVED_TEMPLATE' | 'HARDCODED_FALLBACK'` in the audit event. An emergency shown from the fallback is now distinguishable in the record from a real template.
+
+### A2. 🔴 `red_flag_rule` carries no template in the real schema
+
+Stub has `template_id` / `template_version` on the rule row; the real table does not. `matchDeterministicRules` SELECTs both, so against the real schema **the whole query fails** — which now degrades to `FAIL_CLOSED` rather than a fail-open (see `resolveAdoptionGate`), so it fails in the safe direction, but the engine cannot function against the shipping schema until template resolution is rewritten.
+
+The real design resolves a template by `UNIQUE (severity, jurisdiction, language, version)`, not by a foreign key from the rule. **Not fixed** — this is a real rewrite of `resolveTemplateRequirement()` and needs the §4.3.3/§4.3.4 fallback ladder (exact → approved English → generic jurisdiction → next severity up) that the stub's shape cannot express.
+
+### A3. 🔴 `red_flag_rule.pattern` is `jsonb`, not a regex string
+
+Real: `pattern jsonb NOT NULL`. Stub: `pattern text -- Postgres regex`. The engine does `new RegExp(r.pattern, 'i').test(message)`.
+
+These are two different rule-evaluation models. The real schema expects structured patterns — symptom-code sets, thresholds with units, keyword lists, travel-context predicates, conjunctions — which is also what Charter §4.0.3 describes ("pattern, keyword and structured-symptom rules"). A regex cannot express a unit-checked vital threshold, and §3.5.3 forbids coercing across units.
+
+**Not fixed.** This is the largest single item in the reconciliation and should be scheduled as its own job.
+
+### A4. 🟠 `safety_template` lacks `severity`, `jurisdiction`, `language`, `slots` in the stub
+
+Which is why §4.3.2 slot-filling and §4.3.4's machine-translation ban were never testable here, and why the nearest-ED slot (RF4) is still unwired. The real table has all four, plus the `c_no_mt_safety_text` guard.
+
+## B. Divergences that weaken testing rather than break it
+
+### B1. 🟠 `claim_kind` enum: the stub has 10 of 15 values
+
+Missing: `CLINICAL_EFFICACY`, `REFERENCE_RANGE`, `ELIGIBILITY`, `LOGISTICS`, `SENTIMENT`.
+
+This matters more than a missing enum value usually would. `claim_policy` is the §1.5.3 tier × kind × category matrix — 5 × 15 × 3 = **225 rows** in migration 022. The stub can only express 5 × 10 × 3 = 150. **The two most safety-critical kinds in §1.5.3 — `CLINICAL_EFFICACY` and `REFERENCE_RANGE` — have no policy rows here at all**, so `emissionValidator`'s tier gate has never been exercised against them.
+
+### B2. 🟠 `review_state` is missing `ESCALATED`
+
+Charter §2.3.5b names four clinician actions: `APPROVED`, `APPROVED_WITH_EDITS`, `REJECTED`, `ESCALATED`. The stub enum omits the fourth, so an escalation cannot be recorded here. The declaration order also differs from the real enum; harmless today because nothing orders `review_state`, but worth knowing given `red_flag_severity` **is** ordered and three CHECK constraints depend on it (AMB-S-11).
+
+### B3. 🟡 `claim.statement` vs `claim.text`
+
+A straight rename. Code written against one fails against the other. Real also has `provider_org_id`, `effective_at`, `expires_at` — and `expires_at` carries the `cost_expiry` CHECK requiring it for `COST` claims (§1.7.1 hard expiry), which is therefore untestable here.
+
+### B4. 🟡 `subject_key` shape differs
+
+Real: `salt`, `wrapped_dek`, `destroyed_at`, with `c_salt_dies_with_key`. Stub: `key_material`, `revoked_at`. The stub cannot express ADR-003 §2.4's actual guarantee — *"a pseudonym you can still recompute from a user id is re-identifiable"* — so the erasure-vs-audit reconciliation (B4-legal) has never been tested here.
+
+### B5. 🟡 `patient_profile` / `patient_attribute`
+
+Confirmed STAND-IN, as this document already said. `patient_attribute` diverges on eighteen columns — the real one carries AEAD ciphertext, key ids, provenance and confirmation state; the stub has `label`/`user_id`.
+
+### B6. 🟢 `region_registry`
+
+Stub: `(code, name)`. Real: `(code, legal_basis, primary_regime, active_from, active_to)`. Minor, but `name` does not exist in the real schema.
+
+## C. Confirmed correct
+
+`claim_policy`, `fabrication_block`, `response_audit_event`, `response_category_state`, `response_content` and `session_severity_floor` match the real migrations column-for-column. The `response_audit_event` hash chain — the C-30 correction from HP-RB-001 — is faithful, which is the single most important thing on this list to have got right.
+
+`red_flag_log` and `emergency_facility_reference` (added by migration 027) differ only in the stub dropping `ai_call_id`, the two floor columns, and the geo/source columns — deliberate, since the stub has no `obs.ai_call` FK target for some of them.
+
+## D. What to do about it
+
+| # | Action | Priority |
+|---|---|---|
+| 1 | ~~Fix `loadSafetyTemplate`'s `active` predicate and its silent catch~~ | ✅ done |
+| 2 | Rewrite template resolution to select by `(severity, jurisdiction, language)` with the §4.3.3/§4.3.4 ladder; drop `template_id` from `red_flag_rule` in `db/010` | 🔴 high |
+| 3 | Move rule patterns from regex `text` to structured `jsonb`, matching the real column and §4.0.3 | 🔴 high, own job |
+| 4 | Bring `db/010`'s `safety_template` up to the real shape (severity, jurisdiction, language, slots, approval columns) so §4.3 is testable | 🟠 |
+| 5 | Complete the `claim_kind` enum and seed the full 225-row `claim_policy` matrix | 🟠 |
+| 6 | Add `ESCALATED` to `review_state` | 🟠 |
+| 7 | Decide the direction for `claim.statement`/`claim.text` and `subject_key` | 🟡 |
+
+**The strategic question these raise:** the stub was built because the real migrations were unreachable. They are reachable now. Options 2–7 all patch the stub to look more like the real schema; the alternative is to delete `db/000`–`db/020` and run the real `migrations/` in CI against a throwaway Postgres, which is what `run_migrations.mjs` already does and what removes this entire class of drift permanently. That is a bigger change and a real decision, not a default — but it is the one worth having.
+
+---
+
+## E. Divergence found by *running* the stub — 4 Sep 2026
+
+Everything in sections A–D was found by comparing DDL. This one was not, and it is
+the most serious item in this document.
+
+### E1. 🔴 `db/010` never granted `hp_app` read on `safety.red_flag_rule_set`
+
+`safety.adopted_rule_set()` is `LANGUAGE sql STABLE` — **invoker's rights, not
+`SECURITY DEFINER`**. It reads `red_flag_rule_set`, so it reads that table as
+whoever called it. The application connects as `hp_app`, and `db/010`'s grant was:
+
+```sql
+GRANT SELECT ON safety.red_flag_rule, safety.safety_template TO hp_app, hp_reader;
+```
+
+`red_flag_rule_set` is not in that list. Every call to `matchDeterministicRules`
+would therefore have raised `permission denied for table red_flag_rule_set`, been
+swallowed by the function's own `try/catch`, and returned
+`adoptionGate = FAIL_CLOSED` with `lookupFailed: true`. The red-flag module would
+have been **permanently unavailable in production** — correctly failing closed,
+which is the design working, but for a reason nobody would have looked for.
+
+Nothing caught this. The unit tests inject a fake rule-set repository and never
+touch a role. `tsc` cannot see a grant. Both CI jobs were green on the day the
+grant was written, because at that point the smoke test was still issuing the
+*old* pre-R3 query, which read `red_flag_rule` directly and never called the
+function. It surfaced only when `scripts/smoke-test.mjs` was rewritten to issue
+`matchDeterministicRules`' query **verbatim, as `hp_app`** — which is the entire
+justification for that script existing.
+
+Fixed in `db/010`: `red_flag_rule_set` added to the grant, plus an explicit
+`GRANT EXECUTE` on the function.
+
+**`migrations/027` was already correct** — it grants `red_flag_rule_set` to
+`redflag_role` and `EXECUTE` on `adopted_rule_set` at lines 223 and 317. So this
+is drift in the safe direction for the real deployment, and it means the *stub*
+was the thing that would have shipped broken had CI been trusted as the gate. The
+lesson generalises past this one grant: a stub that omits a privilege the real
+schema grants produces a false RED, but a stub that grants a privilege the real
+schema omits would produce a false GREEN, and this document's section D option —
+run the real migrations in CI — is the only thing that closes that direction.
+
+### E2. Stale test fixtures that the R2/R3 rewrites left behind
+
+Found the same way, in the same run. All fixed:
+
+| Where | Referenced | Now |
+|---|---|---|
+| `scripts/smoke-test.mjs` | `red_flag_rule.template_id`, `ruleset_version` filter | `safety.adopted_rule_set($1,$2)` join, jsonb `pattern` |
+| `scripts/smoke-test.mjs` | `safety_template.active` | `(severity, jurisdiction, language)` + `ORDER BY version DESC` |
+| `scripts/smoke-test.mjs` | `red_flag_event.ruleset_version` | `rule_set_id`, plus the real rule id/version so the composite FK is exercised |
+| `scripts/smoke-test.mjs`, `test/runPipeline.integration.test.ts` | `GENERIC_ESCALATION_TEMPLATE_ID` (`5555…`) | the seeded CRITICAL template `4444…402`, which is what the §4.3.3 ladder resolves a URGENT/CRITICAL scan to |
+| `eval/gold/redFlagComposition.gold.json`, `eval/run-eval.ts` | `resolveTemplateRequirement` | 11 `templateLadder_cases` driving `resolveTemplateForSeverity` through an injected lookup |
+
+Two of these were cascades: four `session_severity_floor` checks failed only
+because the `red_flag_event` insert above them had failed, leaving
+`set_by_event_id` null. Eight reported failures, four distinct causes.
+

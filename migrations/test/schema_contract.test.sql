@@ -1,0 +1,315 @@
+-- ============================================================================
+-- Schema contract tests — run against the REAL migrations (001..027)
+--
+-- These exist because HP-RECON-001 found two Charter guarantees that the
+-- chat-pipeline stub schema could not express, and which therefore had never
+-- been exercised anywhere:
+--
+--   1. §1.5.3's tier x claim_kind matrix. The stub's claim_kind enum carries
+--      10 of 15 values, so its claim_policy could only ever hold 150 of the
+--      225 rows, and CLINICAL_EFFICACY and REFERENCE_RANGE — two of the most
+--      safety-critical kinds in the Charter — had no policy rows at all.
+--
+--   2. ADR-003 §2.4 / migration 018's c_salt_dies_with_key. The stub's
+--      subject_key has key_material/revoked_at instead of salt/wrapped_dek/
+--      destroyed_at, so it cannot represent the constraint at all. B4-legal's
+--      technical half was recorded as done on the strength of the design; no
+--      test had ever run it.
+--
+-- Run with: psql -v ON_ERROR_STOP=1 -f schema_contract.test.sql
+-- Any failure raises and aborts. Silence is success.
+-- ============================================================================
+
+\set ON_ERROR_STOP on
+
+-- One transaction for the whole file: the subject_key cases below insert a
+-- fixture, and CI must be able to run this repeatedly against the same database
+-- without the second run tripping over the first run's rows.
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- 1. §1.5.3 — the tier x kind x category matrix is complete
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+  n_rows   int;
+  n_kinds  int;
+  n_tiers  int;
+  n_cats   int;
+BEGIN
+  SELECT count(*) INTO n_rows FROM evidence.claim_policy;
+  ASSERT n_rows = 225,
+    format('claim_policy must hold 225 rows (5 tiers x 15 kinds x 3 categories); found %s', n_rows);
+
+  SELECT count(DISTINCT kind), count(DISTINCT tier), count(DISTINCT category)
+    INTO n_kinds, n_tiers, n_cats FROM evidence.claim_policy;
+  ASSERT n_kinds = 15, format('expected 15 claim kinds, found %s', n_kinds);
+  ASSERT n_tiers = 5,  format('expected 5 source tiers, found %s', n_tiers);
+  ASSERT n_cats  = 3,  format('expected 3 response categories, found %s', n_cats);
+END $$;
+
+-- The five kinds the stub schema could not express at all.
+DO $$
+DECLARE k text; c int;
+BEGIN
+  FOREACH k IN ARRAY ARRAY['CLINICAL_EFFICACY','REFERENCE_RANGE','ELIGIBILITY','LOGISTICS','SENTIMENT']
+  LOOP
+    SELECT count(*) INTO c FROM evidence.claim_policy WHERE kind = k::claim_kind;
+    ASSERT c = 15, format('claim_kind %s must have 15 policy rows (5 tiers x 3 categories); found %s', k, c);
+  END LOOP;
+END $$;
+
+-- §1.5.3: "A Tier 5 source MUST NOT be used as the basis for any statement
+-- about: clinical efficacy or safety; ... test interpretation; ... reference
+-- ranges" — so TIER_5 is PROHIBITED for these kinds in EVERY category.
+DO $$
+DECLARE bad int;
+BEGIN
+  SELECT count(*) INTO bad
+    FROM evidence.claim_policy
+   WHERE tier = 'TIER_5'
+     AND kind IN ('CLINICAL_EFFICACY','REFERENCE_RANGE','TEST_INTERPRETATION','ELIGIBILITY')
+     AND disposition <> 'PROHIBITED';
+  ASSERT bad = 0,
+    format('§1.5.3: TIER_5 must be PROHIBITED for clinical kinds in every category; %s row(s) are not', bad);
+END $$;
+
+-- §1.4.4: provider-supplied clinical claims are capped, never presented as fact.
+DO $$
+DECLARE bad int;
+BEGIN
+  SELECT count(*) INTO bad
+    FROM evidence.claim_policy
+   WHERE tier = 'TIER_4' AND kind = 'PROVIDER_OUTCOME'
+     AND (disposition = 'PERMITTED' AND (confidence_cap IS NULL OR confidence_cap > 0.40));
+  ASSERT bad = 0,
+    format('§1.4.4: TIER_4 PROVIDER_OUTCOME must be capped at 0.40 or prohibited; %s row(s) are not', bad);
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 2. ADR-003 §2.4 — c_salt_dies_with_key actually enforces
+--
+-- "a pseudonym you can still recompute from a user id is re-identifiable, and
+-- therefore still personal data". The constraint makes the destroyed state the
+-- ONLY state in which salt may be NULL, and the only state in which it may not
+-- be present. These four cases are the whole guarantee.
+-- ---------------------------------------------------------------------------
+-- subject_key.subject_id is NOT NULL and FKs to principal.app_user, and
+-- app_user.data_region FKs to region_registry — so the fixture has to be built
+-- before the constraint can be exercised. Everything here runs inside the
+-- surrounding transaction and is rolled back.
+DO $$
+DECLARE ok boolean; uid uuid := 'bbbbbbbb-0000-4000-8000-000000000001';
+BEGIN
+  INSERT INTO principal.app_user (id, auth_subject, data_region) VALUES (uid, 'schema-contract-test', 'IN')
+    ON CONFLICT DO NOTHING;
+
+  -- (a) live key: salt and wrapped_dek present, destroyed_at null — ACCEPTED
+  BEGIN
+    INSERT INTO principal.subject_key (id, subject_id, salt, wrapped_dek, destroyed_at)
+      VALUES ('aaaaaaaa-0000-4000-8000-000000000001', uid, '\x01'::bytea, '\x02'::bytea, NULL);
+    ok := true;
+  EXCEPTION WHEN check_violation THEN ok := false;
+  END;
+  ASSERT ok, 'a live subject_key with salt + wrapped_dek must be accepted';
+  DELETE FROM principal.subject_key WHERE subject_id = uid;
+
+  -- (b) destroyed key: salt and wrapped_dek NULL, destroyed_at set — ACCEPTED
+  BEGIN
+    INSERT INTO principal.subject_key (id, subject_id, salt, wrapped_dek, destroyed_at)
+      VALUES ('aaaaaaaa-0000-4000-8000-000000000002', uid, NULL, NULL, now());
+    ok := true;
+  EXCEPTION WHEN check_violation THEN ok := false;
+  END;
+  ASSERT ok, 'a destroyed subject_key with salt and wrapped_dek nulled must be accepted';
+  DELETE FROM principal.subject_key WHERE subject_id = uid;
+
+  -- (c) THE ONE THAT MATTERS: destroyed, but the salt survived — REJECTED.
+  -- This is the state in which erasure has been performed on paper while every
+  -- pseudonym remains recomputable from a user id in practice. ADR-003 §2.4
+  -- names exactly this: "a pseudonym you can still recompute from a user id is
+  -- re-identifiable, and therefore still personal data."
+  BEGIN
+    INSERT INTO principal.subject_key (id, subject_id, salt, wrapped_dek, destroyed_at)
+      VALUES ('aaaaaaaa-0000-4000-8000-000000000003', uid, '\x01'::bytea, NULL, now());
+    ok := true;
+  EXCEPTION WHEN check_violation THEN ok := false;
+  END;
+  ASSERT NOT ok,
+    'ADR-003 §2.4: a DESTROYED subject_key that still carries its salt must be rejected — '
+    'erasure that leaves the salt behind is not erasure';
+
+  -- (d) live key with no salt — REJECTED (nothing to pseudonymise with)
+  BEGIN
+    INSERT INTO principal.subject_key (id, subject_id, salt, wrapped_dek, destroyed_at)
+      VALUES ('aaaaaaaa-0000-4000-8000-000000000004', uid, NULL, '\x02'::bytea, NULL);
+    ok := true;
+  EXCEPTION WHEN check_violation THEN ok := false;
+  END;
+  ASSERT NOT ok, 'a live subject_key with a NULL salt must be rejected';
+
+  RAISE NOTICE 'c_salt_dies_with_key: all four states behave as ADR-003 2.4 requires';
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 3. The engine's own queries must PARSE against this schema (R2/R3)
+--
+-- Two production bugs came from the pipeline querying columns that exist only
+-- in the chat-pipeline stub and not in the committed schema:
+--
+--   safety_template.active        -> loadSafetyTemplate() raised, its catch
+--                                    swallowed the error, and every
+--                                    CRITICAL/EMERGENCY silently rendered an
+--                                    unapproved hard-coded fallback.
+--   red_flag_rule.ruleset_version -> matchDeterministicRules() raised.
+--
+-- A third, safety_template.clinically_adopted, was caught during R2 only
+-- because these queries were run against both schemas by hand. This section
+-- makes that check permanent. It asserts nothing about ROWS — the real schema
+-- is correctly empty until CL2 is signed — only that every column the engine
+-- names exists here. Zero rows is a pass; a missing column is a failure.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE n int;
+BEGIN
+  -- matchDeterministicRules(), verbatim in shape
+  SELECT count(*) INTO n FROM (
+    SELECT r.id, r.version, r.severity, r.pattern, r.clinically_adopted, s.rule_set_id
+      FROM safety.adopted_rule_set('IN', 'en') s
+      JOIN safety.red_flag_rule r
+        ON r.rule_set_id = s.rule_set_id
+       AND r.clinically_adopted = true
+       AND r.retired_at IS NULL
+  ) q;
+
+  -- lookupTemplate(), the §4.3.3 ladder's single rung
+  SELECT count(*) INTO n FROM (
+    SELECT id, version, severity, jurisdiction, language, body, slots,
+           is_fallback, machine_translated
+      FROM safety.safety_template
+     WHERE severity = 'CRITICAL' AND jurisdiction = 'IN' AND language = 'en'
+     ORDER BY version DESC LIMIT 1
+  ) q;
+
+  -- recordRedFlagEvent(), every column the INSERT names
+  SELECT count(*) INTO n FROM (
+    SELECT id, audit_id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+           rule_id, rule_version, rule_set_id, trigger_detail, template_id, template_version,
+           action_taken, commercial_suppressed, first_byte_at, scanner_started_at,
+           template_displayed_at, data_region
+      FROM safety.red_flag_event
+  ) q;
+
+  -- recordRedFlagLog(), likewise
+  SELECT count(*) INTO n FROM (
+    SELECT id, event_id, audit_id, subject_pseudonym, session_pseudonym, occurred_at,
+           rule_derived_severity, model_proposed_severity, applied_severity,
+           context_escalation, rule_set_id, matched_rule_ids, trigger_detail, query_hash,
+           branch, template_id, template_version, commercial_suppressed, generation_blocked,
+           needs_review, shadow_mode, first_byte_at, scanner_started_at, scanner_completed_at,
+           template_displayed_at, display_latency_ms, scanner_version, fail_safe_reason, data_region
+      FROM safety.red_flag_log
+  ) q;
+
+  RAISE NOTICE 'engine queries parse against this schema';
+END $$;
+
+-- §4.0.3 / R3: the pattern column is jsonb, not text. A regex cannot express a
+-- unit-checked threshold, and §3.5.3 forbids coercing across units.
+DO $$
+DECLARE t text;
+BEGIN
+  SELECT data_type INTO t FROM information_schema.columns
+   WHERE table_schema='safety' AND table_name='red_flag_rule' AND column_name='pattern';
+  ASSERT t = 'jsonb', format('red_flag_rule.pattern must be jsonb (§4.0.3); found %s', t);
+END $$;
+
+-- R2: a template is identified by (severity, jurisdiction, language, version),
+-- never by a foreign key from the rule.
+DO $$
+DECLARE n int;
+BEGIN
+  SELECT count(*) INTO n FROM information_schema.columns
+   WHERE table_schema='safety' AND table_name='red_flag_rule'
+     AND column_name IN ('template_id','template_version');
+  ASSERT n = 0,
+    'red_flag_rule must not carry a template FK — §4.3.3 resolves templates by '
+    '(severity, jurisdiction, language)';
+END $$;
+
+
+-- R12 / HP-RECON-001 §2b: privileges, not just columns.
+--
+-- Every assertion above this line checks that a column EXISTS. None of them
+-- checks that the role running the module may READ or WRITE it, and that gap
+-- has now produced two production bugs — a missing SELECT on red_flag_rule_set
+-- (stub, false RED) and a missing UPDATE on session_severity_floor's two clear
+-- columns (this schema, false GREEN, every red_flag_event write failing at plan
+-- time). A schema is not a contract until the grants are part of it.
+DO $$
+DECLARE
+  missing text[] := '{}';
+  c       text;
+BEGIN
+  -- Reads. adopted_rule_set() is LANGUAGE sql STABLE — invoker's rights — so
+  -- red_flag_rule_set is read as the CALLER, which is why it must be listed.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_rule', 'safety.red_flag_rule_set', 'safety.safety_template',
+    'safety.emergency_contact_reference', 'safety.emergency_facility_reference',
+    'safety.red_flag_event', 'safety.red_flag_log', 'safety.session_severity_floor'
+  ] LOOP
+    IF NOT has_table_privilege('redflag_role', c, 'SELECT') THEN
+      missing := missing || (c || ':SELECT');
+    END IF;
+  END LOOP;
+
+  -- Writes the module actually issues.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_event', 'safety.red_flag_log', 'safety.session_severity_floor'
+  ] LOOP
+    IF NOT has_table_privilege('redflag_role', c, 'INSERT') THEN
+      missing := missing || (c || ':INSERT');
+    END IF;
+  END LOOP;
+
+  -- The §4.0.8 floor. recordRedFlagEvent's upsert re-arms a cleared floor
+  -- (cleared_at = NULL, cleared_by = NULL) and clearSessionSeverityFloor writes
+  -- those two columns alone; PostgreSQL checks column UPDATE privilege at PLAN
+  -- time, so a missing one fails every write, not just the conflicting ones.
+  FOREACH c IN ARRAY ARRAY[
+    'floor_severity', 'set_by_event_id', 'set_at', 'cleared_at', 'cleared_by'
+  ] LOOP
+    IF NOT has_column_privilege('redflag_role', 'safety.session_severity_floor', c, 'UPDATE') THEN
+      missing := missing || ('session_severity_floor.' || c || ':UPDATE');
+    END IF;
+  END LOOP;
+
+  -- And the one the scanner must NOT have: moving a floor between sessions.
+  IF has_column_privilege('redflag_role', 'safety.session_severity_floor', 'session_pseudonym', 'UPDATE') THEN
+    missing := missing || 'session_severity_floor.session_pseudonym:UPDATE MUST NOT BE GRANTED'::text;
+  END IF;
+
+  -- §4.0.3: a scanner that can edit its own rules is not a control.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_rule', 'safety.red_flag_rule_set', 'safety.safety_template'
+  ] LOOP
+    IF has_table_privilege('redflag_role', c, 'INSERT')
+       OR has_table_privilege('redflag_role', c, 'UPDATE')
+       OR has_table_privilege('redflag_role', c, 'DELETE') THEN
+      missing := missing || (c || ':WRITE MUST NOT BE GRANTED');
+    END IF;
+  END LOOP;
+
+  -- HP-RB-001 append-only.
+  IF has_table_privilege('redflag_role', 'safety.red_flag_log', 'UPDATE')
+     OR has_table_privilege('redflag_role', 'safety.red_flag_log', 'DELETE') THEN
+    missing := missing || 'red_flag_log:UPDATE/DELETE MUST NOT BE GRANTED'::text;
+  END IF;
+
+  ASSERT array_length(missing, 1) IS NULL,
+    format('redflag_role grant contract violated: %s', array_to_string(missing, ', '));
+  RAISE NOTICE 'redflag_role grants match what the module issues';
+END $$;
+
+
+ROLLBACK;

@@ -5,7 +5,8 @@ import { requireAuth, AuthError } from '@/lib/auth';
 import { classifyIntentComplexity } from '@/lib/pipeline/intentComplexity';
 import { classifyCategory, reconcileAfterRetrieval } from '@/lib/pipeline/categoryClassifier';
 import { CLINICAL_DECISION_REFUSAL } from '@/lib/prompts/annexB';
-import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken, getSessionFloor, applySessionFloor, resolveTemplateRequirement } from '@/lib/pipeline/redFlagEngine';
+import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken, getSessionFloor, applySessionFloor, recordRedFlagLog } from '@/lib/pipeline/redFlagEngine';
+import { resolveTemplateForSeverity } from '@/lib/pipeline/templateResolution';
 import { lookupPatientProfile } from '@/lib/pipeline/patientProfile';
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
@@ -149,6 +150,65 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // ---- 3. Safety / red-flag engine — ALWAYS runs, independent of category -
   const redFlag = await scanRedFlags(ctx);
 
+  // §0.6 / AMB-17 — the adoption gate, checked before ANY severity-based
+  // branching below. If it is closed, no clinically adopted rule existed to
+  // scan this message with, so `redFlag.severity` is NORMAL by absence rather
+  // than by assessment. Every branch after this point reads that NORMAL as a
+  // finding; none of them can tell the difference. So the difference is made
+  // here, and it is made by returning rather than by setting a flag someone
+  // downstream has to remember to check.
+  //
+  // This is deliberately NOT a triage outcome: nothing is asserted about this
+  // person's symptoms, no template is shown, no severity is claimed. See
+  // unavailability.ts for why the copy is shaped the way it is.
+  if (redFlag.adoptionGate === 'FAIL_CLOSED') {
+    const unavailable = redFlag.unavailability!;
+    await recordAuditEvent(ctx, 'SEVERITY_ASSIGNED', 'system', {
+      severity: 'NORMAL',
+      adoption_gate: 'FAIL_CLOSED',
+      reason: unavailable.internalReason,
+    });
+    send('unavailable', {
+      heading: unavailable.heading,
+      body: unavailable.body,
+      emergencyNumber: unavailable.emergencyNumber,
+      humanContact: unavailable.humanContact,
+      suppressed: unavailable.suppressed,
+      permitted: unavailable.permitted,
+      copyVersion: unavailable.copyVersion,
+    });
+    await upsertResponseAudit({
+      ctx,
+      // The notice is product chrome about the service, not a determination
+      // about this person — see unavailability.ts. Recording it as anything
+      // else would put a clinical category on a message nobody assessed.
+      category: 'INFORMATIONAL',
+      classifierVersion: classification.classifierVersion,
+      severity: 'NORMAL',
+      ruleId: null,
+      templateId: null,
+      aggConfidence: 1.0, // static, non-clinical copy; no model uncertainty
+      modelVersion: 'n/a-safety-unavailable',
+      promptVersion: 'n/a-safety-unavailable',
+      citedClaimIds: [],
+      // Nothing was generated, so there is nothing to review. The thing that
+      // needs human attention is the unsigned rule set (AMB-17), and that is a
+      // governance item, not a per-response review queue entry.
+      reviewRequired: false,
+    });
+    await recordRedFlagLog(ctx, redFlag, {
+      eventId: null,
+      branch: 'FAIL_CLOSED',
+      commercialSuppressed: true,
+      generationBlocked: true,
+      needsReview: false,
+      scannerCompletedAt: new Date(),
+      templateDisplayedAt: null,
+    });
+    send('done', { reason: 'SAFETY_UNAVAILABLE' });
+    return;
+  }
+
   // §4.0.8: apply the session's sticky severity floor BEFORE any
   // severity-based branching below — a session already sitting at WARNING+
   // stays at least there even if this one message, read alone, looks
@@ -167,13 +227,24 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     // combination hard-fails safety.red_flag_event's own
     // c_urgent_needs_template CHECK downstream in recordRedFlagEvent. This is
     // exactly the composition scanRedFlags itself already performs for a
-    // model-side raise (clampSeverity then resolveTemplateRequirement, see
+    // model-side raise (clampSeverity then resolveTemplateForSeverity, see
     // its own header comment and the
     // test_hp_esc_4_0_2_model_raised_severity_past_warning_with_no_rule_template_still_gets_one
     // unit test) — a session-floor raise needs the identical treatment.
-    const { templateId, templateVersion } = resolveTemplateRequirement(flooredSeverity, redFlag.templateId, redFlag.templateVersion);
-    redFlag.templateId = templateId;
-    redFlag.templateVersion = templateVersion;
+    // R2: re-resolve through the §4.3.3 ladder at the floored severity. The
+    // original bug this block fixes is unchanged in shape — a floor raise past
+    // WARNING must not leave the pre-floor (null) template behind, which would
+    // hard-fail red_flag_event's c_urgent_needs_template — but the resolution
+    // is now by (severity, jurisdiction, language) rather than by an FK the
+    // real schema does not have.
+    const floorSelection = await resolveTemplateForSeverity(
+      flooredSeverity,
+      ctx.statedCountry ?? ctx.dataRegion,
+      ctx.language ?? 'en',
+    ).catch(() => null);
+    redFlag.templateId = floorSelection?.template.id ?? null;
+    redFlag.templateVersion = floorSelection?.template.version ?? null;
+    redFlag.templateBody = floorSelection?.template.body ?? null;
     redFlag.triggerDetail = { ...redFlag.triggerDetail, sessionFloorApplied: true, sessionFloorSeverity: flooredSeverity };
     redFlag.severity = flooredSeverity;
   }
@@ -192,8 +263,17 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // classification. Static template, model does not touch the wording,
   // rendered immediately, no gating on review.
   if (SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['CRITICAL']) {
-    const templateText = await loadSafetyTemplate(redFlag.templateId!);
-    await recordAuditEvent(ctx, 'TEMPLATE_RENDERED', 'system', { template_id: redFlag.templateId, template_version: redFlag.templateVersion });
+    const loadedTemplate = loadSafetyTemplate(redFlag.templateBody);
+    const templateText = loadedTemplate.body;
+    await recordAuditEvent(ctx, 'TEMPLATE_RENDERED', 'system', {
+      template_id: redFlag.templateId,
+      template_version: redFlag.templateVersion,
+      // J3-5: an emergency rendered from the unapproved hard-coded fallback
+      // must be distinguishable in the audit trail from a clinician-authored
+      // one. Before this, the two were identical in the record.
+      template_source: loadedTemplate.source,
+      template_load_failure: loadedTemplate.failure,
+    });
     send('sentence', { text: templateText, citedClaimIds: [] });
     const templateDisplayedAt = new Date();
     // BUG FIXED (found by test/runPipeline.integration.test.ts running this

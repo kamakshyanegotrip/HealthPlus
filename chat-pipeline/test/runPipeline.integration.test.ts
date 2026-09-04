@@ -41,7 +41,14 @@ const SEEDED_USER_ID = '11111111-1111-1111-1111-111111111111';
 // isolation (db/020_rls.sql) below; never referenced by any non-RLS test.
 const SEEDED_USER_ID_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 const SEEDED_GUIDELINE_CLAIM_ID = '33333333-3333-3333-3333-333333333333';
-const GENERIC_ESCALATION_TEMPLATE_ID = '55555555-5555-5555-5555-555555555555';
+// R2: templates are resolved by (severity, jurisdiction, language) through the
+// §4.3.3 ladder, not by an FK on the rule row, so there is no longer a generic
+// stand-in. newCtx() below is dataRegion 'IN' with no statedCountry and no
+// language, i.e. jurisdiction 'IN' / language 'en' — which is an exact match
+// on the seeded CRITICAL template in db/999_seed_smoke_test.sql.
+const SEEDED_CRITICAL_TEMPLATE_ID = '44444444-4444-4444-4444-444444444402';
+const SEEDED_CRITICAL_TEMPLATE_BODY =
+  'This may be a medical emergency. Contact your local emergency number now.';
 
 interface SseEvent {
   event: string;
@@ -189,7 +196,11 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     expect(events.find((e) => e.event === 'severity')).toMatchObject({ data: { severity: 'CRITICAL' } });
     const sentences = events.filter((e) => e.event === 'sentence');
     expect(sentences).toHaveLength(1);
-    expect((sentences[0]!.data as { text: string }).text).toContain('flagged for clinical review');
+    // R2: what is rendered is the seeded CRITICAL template's own body, verbatim
+    // — not the generic escalation copy that used to stand in for every level.
+    // §4.4's time-to-care language differs per level by design, which is the
+    // reason one catch-all template was the wrong shape in the first place.
+    expect((sentences[0]!.data as { text: string }).text).toBe(SEEDED_CRITICAL_TEMPLATE_BODY);
     // §3.0.4-adjacent sanity: knowledge lookup must never have run on this path.
     expect(events.find((e) => e.event === 'sources')).toBeUndefined();
 
@@ -202,7 +213,7 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     expect(rfe.rows).toHaveLength(1);
     expect(rfe.rows[0].severity).toBe('CRITICAL');
     expect(rfe.rows[0].action_taken).toBe('TEMPLATE_SHOWN');
-    expect(rfe.rows[0].template_id).toBe(GENERIC_ESCALATION_TEMPLATE_ID); // the seeded rule carries no template of its own
+    expect(rfe.rows[0].template_id).toBe(SEEDED_CRITICAL_TEMPLATE_ID); // resolved by severity+jurisdiction+language, not by the rule
     expect(rfe.rows[0].template_displayed_at).not.toBeNull(); // c_emergency_display_not_gated requires this at CRITICAL+
 
     const published = await db().query(`SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
