@@ -136,3 +136,64 @@ Stub: `(code, name)`. Real: `(code, legal_basis, primary_regime, active_from, ac
 | 7 | Decide the direction for `claim.statement`/`claim.text` and `subject_key` | 🟡 |
 
 **The strategic question these raise:** the stub was built because the real migrations were unreachable. They are reachable now. Options 2–7 all patch the stub to look more like the real schema; the alternative is to delete `db/000`–`db/020` and run the real `migrations/` in CI against a throwaway Postgres, which is what `run_migrations.mjs` already does and what removes this entire class of drift permanently. That is a bigger change and a real decision, not a default — but it is the one worth having.
+
+---
+
+## E. Divergence found by *running* the stub — 4 Sep 2026
+
+Everything in sections A–D was found by comparing DDL. This one was not, and it is
+the most serious item in this document.
+
+### E1. 🔴 `db/010` never granted `hp_app` read on `safety.red_flag_rule_set`
+
+`safety.adopted_rule_set()` is `LANGUAGE sql STABLE` — **invoker's rights, not
+`SECURITY DEFINER`**. It reads `red_flag_rule_set`, so it reads that table as
+whoever called it. The application connects as `hp_app`, and `db/010`'s grant was:
+
+```sql
+GRANT SELECT ON safety.red_flag_rule, safety.safety_template TO hp_app, hp_reader;
+```
+
+`red_flag_rule_set` is not in that list. Every call to `matchDeterministicRules`
+would therefore have raised `permission denied for table red_flag_rule_set`, been
+swallowed by the function's own `try/catch`, and returned
+`adoptionGate = FAIL_CLOSED` with `lookupFailed: true`. The red-flag module would
+have been **permanently unavailable in production** — correctly failing closed,
+which is the design working, but for a reason nobody would have looked for.
+
+Nothing caught this. The unit tests inject a fake rule-set repository and never
+touch a role. `tsc` cannot see a grant. Both CI jobs were green on the day the
+grant was written, because at that point the smoke test was still issuing the
+*old* pre-R3 query, which read `red_flag_rule` directly and never called the
+function. It surfaced only when `scripts/smoke-test.mjs` was rewritten to issue
+`matchDeterministicRules`' query **verbatim, as `hp_app`** — which is the entire
+justification for that script existing.
+
+Fixed in `db/010`: `red_flag_rule_set` added to the grant, plus an explicit
+`GRANT EXECUTE` on the function.
+
+**`migrations/027` was already correct** — it grants `red_flag_rule_set` to
+`redflag_role` and `EXECUTE` on `adopted_rule_set` at lines 223 and 317. So this
+is drift in the safe direction for the real deployment, and it means the *stub*
+was the thing that would have shipped broken had CI been trusted as the gate. The
+lesson generalises past this one grant: a stub that omits a privilege the real
+schema grants produces a false RED, but a stub that grants a privilege the real
+schema omits would produce a false GREEN, and this document's section D option —
+run the real migrations in CI — is the only thing that closes that direction.
+
+### E2. Stale test fixtures that the R2/R3 rewrites left behind
+
+Found the same way, in the same run. All fixed:
+
+| Where | Referenced | Now |
+|---|---|---|
+| `scripts/smoke-test.mjs` | `red_flag_rule.template_id`, `ruleset_version` filter | `safety.adopted_rule_set($1,$2)` join, jsonb `pattern` |
+| `scripts/smoke-test.mjs` | `safety_template.active` | `(severity, jurisdiction, language)` + `ORDER BY version DESC` |
+| `scripts/smoke-test.mjs` | `red_flag_event.ruleset_version` | `rule_set_id`, plus the real rule id/version so the composite FK is exercised |
+| `scripts/smoke-test.mjs`, `test/runPipeline.integration.test.ts` | `GENERIC_ESCALATION_TEMPLATE_ID` (`5555…`) | the seeded CRITICAL template `4444…402`, which is what the §4.3.3 ladder resolves a URGENT/CRITICAL scan to |
+| `eval/gold/redFlagComposition.gold.json`, `eval/run-eval.ts` | `resolveTemplateRequirement` | 11 `templateLadder_cases` driving `resolveTemplateForSeverity` through an injected lookup |
+
+Two of these were cascades: four `session_severity_floor` checks failed only
+because the `red_flag_event` insert above them had failed, leaving
+`set_by_event_id` null. Eight reported failures, four distinct causes.
+

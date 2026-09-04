@@ -227,7 +227,7 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     // combination hard-fails safety.red_flag_event's own
     // c_urgent_needs_template CHECK downstream in recordRedFlagEvent. This is
     // exactly the composition scanRedFlags itself already performs for a
-    // model-side raise (clampSeverity then resolveTemplateRequirement, see
+    // model-side raise (clampSeverity then resolveTemplateForSeverity, see
     // its own header comment and the
     // test_hp_esc_4_0_2_model_raised_severity_past_warning_with_no_rule_template_still_gets_one
     // unit test) — a session-floor raise needs the identical treatment.

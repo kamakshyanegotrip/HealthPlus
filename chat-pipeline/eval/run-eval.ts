@@ -38,12 +38,19 @@ import { classifySentence } from '../src/lib/pipeline/emissionValidator';
 import { parseAndResolveCategory } from '../src/lib/pipeline/categoryClassifier';
 import {
   clampSeverity,
-  resolveTemplateRequirement,
   deriveActionTaken,
   applySessionFloor,
-  GENERIC_ESCALATION_TEMPLATE_ID,
   type RedFlagActionTaken,
 } from '../src/lib/pipeline/redFlagEngine';
+// R2: template resolution moved out of redFlagEngine. `resolveTemplateRequirement`
+// and `GENERIC_ESCALATION_TEMPLATE_ID` no longer exist — a template is found by
+// climbing the §4.3.3/§4.3.4 ladder, not by an FK on the rule row. Both functions
+// below take an injected `lookup`, so the suite stays pure (no DB, no network).
+import {
+  resolveTemplateForSeverity,
+  NoApprovedTemplateError,
+  type SafetyTemplateRow,
+} from '../src/lib/pipeline/templateResolution';
 import type { RetrievedClaim, ResponseCategory, RedFlagSeverity } from '../src/lib/types';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -112,7 +119,7 @@ function runCategoryClassifierSuite() {
 }
 
 // ---- suite 3: redFlagEngine severity composition ---------------------------
-function runRedFlagCompositionSuite() {
+async function runRedFlagCompositionSuite() {
   const path = join(GOLD_DIR, 'redFlagComposition.gold.json');
   const gold = JSON.parse(readFileSync(path, 'utf8'));
   const suiteName = gold.suite as string;
@@ -122,12 +129,43 @@ function runRedFlagCompositionSuite() {
     record(suiteName, c.id, c.description, got === c.expect, got === c.expect ? undefined : `expected ${c.expect}, got ${got}`);
   }
 
-  for (const c of gold.resolveTemplateRequirement_cases) {
-    const wantTemplateId = c.expect.templateId === 'GENERIC_ESCALATION_TEMPLATE_ID' ? GENERIC_ESCALATION_TEMPLATE_ID : c.expect.templateId;
-    const got = resolveTemplateRequirement(c.applied as RedFlagSeverity, c.ruleTemplateId, c.ruleTemplateVersion);
+  for (const c of gold.templateLadder_cases) {
+    // Stands in for `lookupTemplate`, including its `ORDER BY version DESC
+    // LIMIT 1` — the ladder must be exercised against the same one-row-per-key
+    // contract the real query provides, or the eval proves nothing about it.
+    const rows = c.available as SafetyTemplateRow[];
+    const lookup = async (a: { severity: RedFlagSeverity; jurisdiction: string; language: string }) =>
+      rows
+        .filter((r) => r.severity === a.severity && r.jurisdiction === a.jurisdiction && r.language === a.language)
+        .sort((x, y) => y.version - x.version)[0] ?? null;
+
     const problems: string[] = [];
-    if (got.templateId !== wantTemplateId) problems.push(`templateId: expected ${wantTemplateId}, got ${got.templateId}`);
-    if (got.templateVersion !== c.expect.templateVersion) problems.push(`templateVersion: expected ${c.expect.templateVersion}, got ${got.templateVersion}`);
+    try {
+      const got = await resolveTemplateForSeverity(
+        c.requested as RedFlagSeverity,
+        c.jurisdiction as string,
+        c.language as string,
+        lookup,
+      );
+      if (c.expect.failClosed) {
+        problems.push(`expected NoApprovedTemplateError, got ${got ? got.template.id : 'null'}`);
+      } else if (c.expect.needed === false) {
+        if (got !== null) problems.push(`expected no template to be required, got ${got.template.id}`);
+      } else if (!got) {
+        problems.push(`templateId: expected ${c.expect.templateId}, got null`);
+      } else {
+        if (got.template.id !== c.expect.templateId) problems.push(`templateId: expected ${c.expect.templateId}, got ${got.template.id}`);
+        if (got.resolvedSeverity !== c.expect.resolvedSeverity) problems.push(`resolvedSeverity: expected ${c.expect.resolvedSeverity}, got ${got.resolvedSeverity}`);
+        if (got.isFallback !== c.expect.isFallback) problems.push(`isFallback: expected ${c.expect.isFallback}, got ${got.isFallback} (${got.fallbackReason ?? 'no reason'})`);
+      }
+    } catch (err) {
+      if (c.expect.failClosed && err instanceof NoApprovedTemplateError) {
+        // The §4.0.9 fail-closed path. Nothing to assert beyond the class:
+        // the caller turns this into FAIL_CLOSED, never into generation.
+      } else {
+        problems.push(`unexpected throw: ${(err as Error).name}: ${(err as Error).message}`);
+      }
+    }
     record(suiteName, c.id, c.description, problems.length === 0, problems.join('; '));
   }
 
@@ -143,39 +181,51 @@ function runRedFlagCompositionSuite() {
 }
 
 // ---- run + report -----------------------------------------------------------
-runEmissionValidatorSuite();
-runCategoryClassifierSuite();
-runRedFlagCompositionSuite();
+// NOTE (R2): the template-ladder suite is async, and this package is CommonJS
+// (no `"type": "module"` in package.json), so tsx transforms this file to CJS
+// where top-level await is a hard build error — not a runtime one, which means
+// it fails the gate before a single case runs. Hence the explicit `.then`
+// rather than `await` at module scope. Caught by running `npm run eval`; a
+// review would not have shown it.
+function report(): void {
 
-const bySuite = new Map<string, CaseResult[]>();
-for (const r of results) {
-  if (!bySuite.has(r.suite)) bySuite.set(r.suite, []);
-  bySuite.get(r.suite)!.push(r);
-}
+  const bySuite = new Map<string, CaseResult[]>();
+  for (const r of results) {
+    if (!bySuite.has(r.suite)) bySuite.set(r.suite, []);
+    bySuite.get(r.suite)!.push(r);
+  }
 
-let totalPass = 0;
-let totalCases = 0;
-for (const [suite, cases] of bySuite) {
-  const pass = cases.filter((c) => c.pass).length;
-  totalPass += pass;
-  totalCases += cases.length;
-  console.log(`\n${suite} — ${pass}/${cases.length} passed`);
-  for (const c of cases) {
-    if (c.pass) {
-      console.log(`  OK   ${c.id}  ${c.description}`);
-    } else {
-      console.log(`  FAIL ${c.id}  ${c.description}\n       ${c.detail}`);
+  let totalPass = 0;
+  let totalCases = 0;
+  for (const [suite, cases] of bySuite) {
+    const pass = cases.filter((c) => c.pass).length;
+    totalPass += pass;
+    totalCases += cases.length;
+    console.log(`\n${suite} — ${pass}/${cases.length} passed`);
+    for (const c of cases) {
+      if (c.pass) {
+        console.log(`  OK   ${c.id}  ${c.description}`);
+      } else {
+        console.log(`  FAIL ${c.id}  ${c.description}\n       ${c.detail}`);
+      }
     }
   }
+
+  const passRate = totalCases > 0 ? ((totalPass / totalCases) * 100).toFixed(1) : '0.0';
+  console.log(`\n${'='.repeat(70)}`);
+  console.log(`TOTAL: ${totalPass}/${totalCases} passed (${passRate}%)`);
+  console.log('='.repeat(70));
+
+  if (totalPass !== totalCases) {
+    console.error('\nEVAL GATE FAILED — at least one gold-set case regressed. This must be fixed (or the gold-set case deliberately revised with a documented reason) before the change that caused it ships.');
+    process.exit(1);
+  }
+  console.log('\nEVAL GATE PASSED.');
 }
 
-const passRate = totalCases > 0 ? ((totalPass / totalCases) * 100).toFixed(1) : '0.0';
-console.log(`\n${'='.repeat(70)}`);
-console.log(`TOTAL: ${totalPass}/${totalCases} passed (${passRate}%)`);
-console.log('='.repeat(70));
-
-if (totalPass !== totalCases) {
-  console.error('\nEVAL GATE FAILED — at least one gold-set case regressed. This must be fixed (or the gold-set case deliberately revised with a documented reason) before the change that caused it ships.');
+runEmissionValidatorSuite();
+runCategoryClassifierSuite();
+runRedFlagCompositionSuite().then(report, (err: unknown) => {
+  console.error('\nEVAL GATE FAILED — the red-flag composition suite threw before it could report:', err);
   process.exit(1);
-}
-console.log('\nEVAL GATE PASSED.');
+});

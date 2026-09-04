@@ -202,7 +202,21 @@ LANGUAGE sql STABLE AS $$
   LIMIT 1;
 $$;
 
-GRANT SELECT ON safety.red_flag_rule, safety.safety_template TO hp_app, hp_reader;
+-- BUG FOUND RUNNING scripts/smoke-test.mjs (R3 follow-up, 4 Sep 2026):
+-- safety.adopted_rule_set() is LANGUAGE sql STABLE, i.e. invoker's rights, so
+-- it reads red_flag_rule_set as whoever called it — hp_app, which had no grant
+-- on that table. Every call to matchDeterministicRules would therefore have
+-- raised "permission denied for table red_flag_rule_set", been caught by its
+-- own try/catch, and returned adoptionGate = FAIL_CLOSED with
+-- lookupFailed: true. The red-flag module would have been permanently
+-- unavailable in production while every unit test stayed green, because the
+-- unit tests inject a fake repository and never touch a role.
+--
+-- red_flag_rule_set is SELECT-only for both roles: rule sets are authored and
+-- adopted by clinicians through a path that is not this application.
+GRANT SELECT ON safety.red_flag_rule_set, safety.red_flag_rule, safety.safety_template
+  TO hp_app, hp_reader;
+GRANT EXECUTE ON FUNCTION safety.adopted_rule_set(char, text) TO hp_app, hp_reader;
 
 -- ---- 3. subject_key (HP-SCHEMA-001 §17.1, LAYER 3) -------------------------
 -- Referenced by response_content.key_id in the already-committed ADR-003
