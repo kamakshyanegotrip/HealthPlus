@@ -238,4 +238,78 @@ BEGIN
 END $$;
 
 
+-- R12 / HP-RECON-001 §2b: privileges, not just columns.
+--
+-- Every assertion above this line checks that a column EXISTS. None of them
+-- checks that the role running the module may READ or WRITE it, and that gap
+-- has now produced two production bugs — a missing SELECT on red_flag_rule_set
+-- (stub, false RED) and a missing UPDATE on session_severity_floor's two clear
+-- columns (this schema, false GREEN, every red_flag_event write failing at plan
+-- time). A schema is not a contract until the grants are part of it.
+DO $$
+DECLARE
+  missing text[] := '{}';
+  c       text;
+BEGIN
+  -- Reads. adopted_rule_set() is LANGUAGE sql STABLE — invoker's rights — so
+  -- red_flag_rule_set is read as the CALLER, which is why it must be listed.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_rule', 'safety.red_flag_rule_set', 'safety.safety_template',
+    'safety.emergency_contact_reference', 'safety.emergency_facility_reference',
+    'safety.red_flag_event', 'safety.red_flag_log', 'safety.session_severity_floor'
+  ] LOOP
+    IF NOT has_table_privilege('redflag_role', c, 'SELECT') THEN
+      missing := missing || (c || ':SELECT');
+    END IF;
+  END LOOP;
+
+  -- Writes the module actually issues.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_event', 'safety.red_flag_log', 'safety.session_severity_floor'
+  ] LOOP
+    IF NOT has_table_privilege('redflag_role', c, 'INSERT') THEN
+      missing := missing || (c || ':INSERT');
+    END IF;
+  END LOOP;
+
+  -- The §4.0.8 floor. recordRedFlagEvent's upsert re-arms a cleared floor
+  -- (cleared_at = NULL, cleared_by = NULL) and clearSessionSeverityFloor writes
+  -- those two columns alone; PostgreSQL checks column UPDATE privilege at PLAN
+  -- time, so a missing one fails every write, not just the conflicting ones.
+  FOREACH c IN ARRAY ARRAY[
+    'floor_severity', 'set_by_event_id', 'set_at', 'cleared_at', 'cleared_by'
+  ] LOOP
+    IF NOT has_column_privilege('redflag_role', 'safety.session_severity_floor', c, 'UPDATE') THEN
+      missing := missing || ('session_severity_floor.' || c || ':UPDATE');
+    END IF;
+  END LOOP;
+
+  -- And the one the scanner must NOT have: moving a floor between sessions.
+  IF has_column_privilege('redflag_role', 'safety.session_severity_floor', 'session_pseudonym', 'UPDATE') THEN
+    missing := missing || 'session_severity_floor.session_pseudonym:UPDATE MUST NOT BE GRANTED'::text;
+  END IF;
+
+  -- §4.0.3: a scanner that can edit its own rules is not a control.
+  FOREACH c IN ARRAY ARRAY[
+    'safety.red_flag_rule', 'safety.red_flag_rule_set', 'safety.safety_template'
+  ] LOOP
+    IF has_table_privilege('redflag_role', c, 'INSERT')
+       OR has_table_privilege('redflag_role', c, 'UPDATE')
+       OR has_table_privilege('redflag_role', c, 'DELETE') THEN
+      missing := missing || (c || ':WRITE MUST NOT BE GRANTED');
+    END IF;
+  END LOOP;
+
+  -- HP-RB-001 append-only.
+  IF has_table_privilege('redflag_role', 'safety.red_flag_log', 'UPDATE')
+     OR has_table_privilege('redflag_role', 'safety.red_flag_log', 'DELETE') THEN
+    missing := missing || 'red_flag_log:UPDATE/DELETE MUST NOT BE GRANTED'::text;
+  END IF;
+
+  ASSERT array_length(missing, 1) IS NULL,
+    format('redflag_role grant contract violated: %s', array_to_string(missing, ', '));
+  RAISE NOTICE 'redflag_role grants match what the module issues';
+END $$;
+
+
 ROLLBACK;

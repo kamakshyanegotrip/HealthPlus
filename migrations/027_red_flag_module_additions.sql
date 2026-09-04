@@ -224,7 +224,33 @@ GRANT  SELECT ON safety.red_flag_rule, safety.red_flag_rule_set,
                  safety.safety_template,
                  safety.emergency_contact_reference,
                  safety.emergency_facility_reference TO redflag_role;
-GRANT  INSERT, SELECT, UPDATE (floor_severity, set_by_event_id, set_at)
+-- BUG FOUND BY THE R12 GRANT AUDIT (HP-RECON-001 §2b, 4 Sep 2026). The column
+-- list above used to stop at (floor_severity, set_by_event_id, set_at), which
+-- looks right — those are the three columns a floor RAISE writes — and is
+-- wrong twice over:
+--
+--   * recordRedFlagEvent's upsert re-arms a cleared floor in the same
+--     statement: ON CONFLICT ... DO UPDATE SET ..., cleared_at = NULL,
+--     cleared_by = NULL. PostgreSQL checks column-level UPDATE privilege when
+--     it PLANS the statement, not when a conflict actually occurs, so this
+--     failed with "permission denied for table session_severity_floor" on
+--     EVERY red_flag_event write — no conflicting row required. §4.0.2's
+--     persistence floor would have been violated for every flagged message.
+--   * clearSessionSeverityFloor writes exactly those two columns and nothing
+--     else, so a clinician could never clear a session floor at all.
+--
+-- Verified against this migration applied to a real PostgreSQL 16.13: both
+-- statements raise as redflag_role before the fix and succeed after it. The
+-- stub (chat-pipeline/db/010) grants UPDATE on the whole table, so CI was
+-- green throughout — a false GREEN, the direction HP-RECON-001 §2b warns is
+-- unguarded. migrations/test/schema_contract.test.sql now asserts these six
+-- privileges directly.
+--
+-- The column list stays explicit rather than becoming a bare table grant:
+-- session_pseudonym must remain unwritable, or a scanner could move a floor
+-- from one session to another.
+GRANT  INSERT, SELECT,
+       UPDATE (floor_severity, set_by_event_id, set_at, cleared_at, cleared_by)
        ON safety.session_severity_floor TO redflag_role;
 GRANT  INSERT ON obs.ai_call TO redflag_role;
 
