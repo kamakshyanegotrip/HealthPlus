@@ -312,4 +312,121 @@ BEGIN
 END $$;
 
 
+-- HP-DR-002 / §2.4.2 — the transplant commercial block (migration 028).
+--
+-- Structure alone proves nothing here: the question is whether the trigger
+-- actually refuses, on the paths the schema actually has. The first draft of
+-- migration 028 guarded entity types 'treatment'/'procedure'/'surgery' and was
+-- unfireable, because migration 020's registry declares no commercial contract
+-- on any of them — every commercial contract that can reach a treatment runs
+-- through the PROVIDER side. That was found by running this test, not by
+-- reading the migration, which is the entire reason it builds real rows.
+DO $$
+DECLARE
+  v_org        uuid := gen_random_uuid();
+  v_hospital   uuid := gen_random_uuid();
+  v_tx         uuid := gen_random_uuid();   -- a transplant treatment
+  v_ord        uuid := gen_random_uuid();   -- an ordinary one
+  v_ht_tx      uuid := gen_random_uuid();
+  v_ht_ord     uuid := gen_random_uuid();
+  v_cost_tx    uuid := gen_random_uuid();
+  v_cost_ord   uuid := gen_random_uuid();
+  v_claim_cost uuid := gen_random_uuid();
+  v_claim_avail uuid := gen_random_uuid();
+  v_claim_edu  uuid := gen_random_uuid();
+  v_msg        text;
+  v_blocked    boolean;
+BEGIN
+  INSERT INTO domain.country (code, name) VALUES ('IN', 'India')
+    ON CONFLICT (code) DO NOTHING;
+  INSERT INTO principal.provider_org (id, legal_name, country, status)
+    VALUES (v_org, 'DR-002 Test Hospital Group', 'IN', 'ACTIVE');
+  INSERT INTO domain.hospital (id, provider_org_id, slug, legal_name, display_name, country_code)
+    VALUES (v_hospital, v_org, 'dr002-test-hospital', 'DR-002 Test Hospital',
+            'DR-002 Test Hospital', 'IN');
+
+  INSERT INTO domain.treatment (id, slug, name, kind, involves_donated_organ_or_tissue)
+  VALUES (v_tx,  'dr002-liver-transplant', 'Liver transplantation', 'SURGERY', true),
+         (v_ord, 'dr002-hip-replacement',  'Hip replacement',       'SURGERY', false);
+
+  INSERT INTO domain.hospital_treatment (id, hospital_id, treatment_id)
+  VALUES (v_ht_tx, v_hospital, v_tx), (v_ht_ord, v_hospital, v_ord);
+
+  INSERT INTO domain.hospital_cost
+      (id, hospital_id, hospital_treatment_id, currency, scope_key,
+       inclusions_stated, exclusions_stated)
+  VALUES (v_cost_tx,  v_hospital, v_ht_tx,  'INR', 'ALL_IN', true, true),
+         (v_cost_ord, v_hospital, v_ht_ord, 'INR', 'ALL_IN', true, true);
+
+  INSERT INTO evidence.claim (id, kind, statement, expires_at)
+    VALUES (v_claim_cost, 'COST', 'Package price is 100 INR.', current_date + 30);
+  INSERT INTO evidence.claim (id, kind, statement)
+    VALUES (v_claim_avail, 'LOGISTICS', 'Next available slot is in three weeks.'),
+           (v_claim_edu, 'GENERAL_EDUCATION', 'A liver transplant replaces a diseased liver.');
+
+  -- 1. The flagship path: a COST claim on a transplant hospital_cost row,
+  --    resolved two hops through hospital_treatment. Assert on the MESSAGE,
+  --    not merely that something raised — three BEFORE triggers sit on this
+  --    table and a test that accepts any exception cannot tell which one fired.
+  v_blocked := false;
+  BEGIN
+    INSERT INTO evidence.domain_attribute (id, entity_type, entity_id, attribute, claim_id)
+    VALUES (gen_random_uuid(), 'hospital_cost', v_cost_tx, 'amount', v_claim_cost);
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT;
+    v_blocked := v_msg LIKE '%HP-DR-002%';
+  END;
+  ASSERT v_blocked,
+    'HP-DR-002: a COST claim on a transplant hospital_cost row was accepted, or was '
+    'refused by a different trigger. Message: ' || COALESCE(v_msg, '(none)');
+
+  -- 2. hospital_treatment.availability is declared LOGISTICS, not COST. Kind
+  --    filtering alone would let it through — and "this hospital performs liver
+  --    transplants, next slot in three weeks" is routing a patient to a
+  --    transplant centre, which HP-DR-002 §1 names explicitly.
+  v_blocked := false; v_msg := NULL;
+  BEGIN
+    INSERT INTO evidence.domain_attribute (id, entity_type, entity_id, attribute, claim_id)
+    VALUES (gen_random_uuid(), 'hospital_treatment', v_ht_tx, 'availability', v_claim_avail);
+  EXCEPTION WHEN raise_exception THEN
+    GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT;
+    v_blocked := v_msg LIKE '%HP-DR-002%';
+  END;
+  ASSERT v_blocked,
+    'HP-DR-002: a non-commercial claim kind on a provider-commercial transplant entity '
+    'was accepted — the block is filtering on claim kind alone. Message: ' || COALESCE(v_msg, '(none)');
+
+  -- 3. NEGATIVE CONTROL. The identical COST claim binds fine to an ordinary
+  --    treatment's cost row. If this ever fails, the block has stopped being
+  --    conditional and is suppressing pricing across the whole product.
+  INSERT INTO evidence.domain_attribute (id, entity_type, entity_id, attribute, claim_id)
+  VALUES (gen_random_uuid(), 'hospital_cost', v_cost_ord, 'amount', v_claim_cost);
+
+  -- 4. NEGATIVE CONTROL. Reference content ABOUT a transplant is permitted —
+  --    HP-DR-002 §1 blocks the commercial engine, not the subject. If this
+  --    fails, a transplant patient is left with nothing at all.
+  INSERT INTO evidence.domain_attribute (id, entity_type, entity_id, attribute, claim_id)
+  VALUES (gen_random_uuid(), 'treatment', v_tx, 'description', v_claim_edu);
+
+  RAISE NOTICE 'HP-DR-002: transplant commercial block holds, reference content still permitted';
+END $$;
+
+-- The flag has no default, on purpose: a new treatment must state whether it
+-- involves a donated organ rather than inheriting a silent false. "Nobody
+-- thought about it" has to be a failed insert, not a quiet mis-classification.
+DO $$
+DECLARE v_blocked boolean := false;
+BEGIN
+  BEGIN
+    INSERT INTO domain.treatment (id, slug, name, kind)
+    VALUES (gen_random_uuid(), 'dr002-unstated', 'Treatment with no stated donor status', 'SURGERY');
+  EXCEPTION WHEN not_null_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'domain.treatment.involves_donated_organ_or_tissue accepted an insert that did not '
+    'state it — migration 028''s DROP DEFAULT has been undone';
+  RAISE NOTICE 'involves_donated_organ_or_tissue must be stated explicitly';
+END $$;
+
+
 ROLLBACK;

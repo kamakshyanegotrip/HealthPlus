@@ -229,10 +229,30 @@ export function assertNoProhibitedPhrases(text: string): void {
  * `severity >= WARNING` and then decides for itself what "commercial" covers is
  * how a booking widget ends up still on screen beside a safety block.
  */
+/**
+ * HP-DR-002 T2 — the transplant commercial surfaces.
+ *
+ * Not GENERATIVE_HEALTH: cited population-level reference content about
+ * transplantation is permitted and is the whole of what we may offer, so
+ * suppressing generation here would block the only thing left.
+ */
+const TRANSPLANT_SUPPRESSED: Surface[] = [
+  'PROVIDER_RECOMMENDATION',
+  'PRICING',
+  'BOOKING',
+  'PROMOTIONAL',
+];
+
 export function surfaceGate(args: {
   unavailability: ServiceUnavailability | null;
   severity: RedFlagSeverity;
   severityOrder: Record<RedFlagSeverity, number>;
+  /**
+   * HP-DR-002 §1. A property of the procedure being discussed, resolved from
+   * `domain.treatment.involves_donated_organ_or_tissue` — never inferred from
+   * the message, and never from anything the user asserts about a donor.
+   */
+  involvesDonatedOrganOrTissue?: boolean;
 }): { allows: (s: Surface) => boolean; suppressed: Surface[] } {
   const suppressed = new Set<Surface>();
   if (args.unavailability) {
@@ -246,5 +266,18 @@ export function surfaceGate(args: {
       suppressed.add('GENERATIVE_HEALTH');
     }
   }
+
+  // HP-DR-002 T2. Applied LAST and outside the severity branch, because it must
+  // hold when nothing has been flagged at all: a calm, well-informed question
+  // about liver transplant costs in Chennai raises no red flag and is exactly
+  // the request that must not be answered commercially. Every other rule in
+  // this function keys on severity; this one deliberately does not.
+  //
+  // It only ever ADDS. There is no path by which a transplant makes a surface
+  // permitted that would otherwise be suppressed.
+  if (args.involvesDonatedOrganOrTissue) {
+    for (const s of TRANSPLANT_SUPPRESSED) suppressed.add(s);
+  }
+
   return { allows: (s: Surface) => !suppressed.has(s), suppressed: [...suppressed] };
 }
