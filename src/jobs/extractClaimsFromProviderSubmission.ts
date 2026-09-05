@@ -246,11 +246,24 @@ interface ProviderSubmissionRow {
 
 interface ProviderOrgRow {
   id: string;
-  name: string;
-  // NOTE: column name assumed as `country` (char(2), FK domain.country.code)
-  // by analogy with domain.medical_tourism_package.destination_country in
-  // HP-SCHEMA-001. Confirm against the committed principal.provider_org DDL
-  // and adjust this one query if the real column is named differently.
+  // VERIFIED 5 Sep 2026 against the committed principal.provider_org DDL, which
+  // is (id, legal_name, country, status). The previous version of this
+  // interface said `name`, and the query below selected `name` — a column that
+  // does not exist. This job would have thrown on its second statement against
+  // the real schema, every time.
+  //
+  // The comment that used to sit here said the column names were "assumed ...
+  // confirm against the committed DDL". That was honest and it was right to
+  // flag; nothing then confirmed it. `country` was assumed correctly.
+  // `name` was not.
+  //
+  // What let it survive: this job had no CI until PR #3, and its test doubles
+  // `principal.provider_org` with a fake returning `{ id, name, country }` —
+  // so the fake encoded the same wrong assumption as the code, and the test
+  // passed for exactly the reason the code was broken. The fake is corrected
+  // too. Found by PREPAREing every SQL literal in the repository against the
+  // real schema (register item R10's survey), not by reading.
+  legal_name: string;
   country: string;
 }
 
@@ -396,7 +409,7 @@ export async function extractClaimsFromProviderSubmission(
 
     // ---- Step 2: load the provider org for publisher/jurisdiction ---------
     const orgResult = await client.query<ProviderOrgRow>(
-      `SELECT id, name, country FROM principal.provider_org WHERE id = $1`,
+      `SELECT id, legal_name, country FROM principal.provider_org WHERE id = $1`,
       [submission.provider_org_id],
     );
     const providerOrg = orgResult.rows[0];
@@ -483,8 +496,8 @@ export async function extractClaimsFromProviderSubmission(
           NULL, 'en', false, NULL, $9)`,
       [
         evidenceSourceId,
-        providerOrg.name,
-        `Provider submission ${submission.id} — ${providerOrg.name}`,
+        providerOrg.legal_name,
+        `Provider submission ${submission.id} — ${providerOrg.legal_name}`,
         `${portalBaseUrl}/submissions/${submission.id}`,
         submission.submitted_at,
         now,
