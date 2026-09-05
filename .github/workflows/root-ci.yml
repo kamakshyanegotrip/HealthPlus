@@ -1,0 +1,65 @@
+name: Root CI
+
+# GAP RESOLVED (register item CI-1, found while opening PR #2): nothing ran the
+# root package's tests. Both existing workflows are path-scoped —
+# migrations-ci to `migrations/**` and chat-pipeline-ci to `chat-pipeline/**` —
+# and the root package, which holds `src/safety/emissionValidators.ts` and the
+# provider-ingestion job, was covered by neither. Its `test` and `typecheck`
+# scripts existed and nothing invoked them.
+#
+# That mattered more than a missing job usually does: B6 ("§3 emission
+# validators + clause-named tests") is recorded as CLOSED in the Open Items
+# Register on the strength of thirty clause-named tests, and those thirty tests
+# had never run in CI. They pass — but nobody could have known that from the
+# repository.
+#
+# `npm test` at the root was also broken by scope rather than by content: with
+# no root vitest config, vitest walked into chat-pipeline/test and failed three
+# suites on an alias only that package defines. vitest.config.ts at the root
+# fixes the scope; this workflow runs what is left.
+#
+# No database and no network: both suites here are pure functions. The
+# ingestion job's DB-touching half is exercised by its own fakes, and the real
+# schema is covered by Migrations CI.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - '.github/workflows/root-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - '.github/workflows/root-ci.yml'
+
+jobs:
+  typecheck-and-unit:
+    name: Typecheck + unit tests (root package)
+    runs-on: ubuntu-latest
+    steps:
+      # v5 rather than v4 deliberately: v4 targets Node 20, which GitHub has
+      # deprecated and now force-runs on Node 24, warning on every job. The two
+      # older workflows still pin v4; bumping them is left as a separate change
+      # so that if v5 misbehaves it does so on the new job, not on the two that
+      # already work.
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - name: Typecheck (src/ only — see tsconfig.json's include)
+        run: npm run typecheck
+      - name: "Unit tests (pure functions, no DB/network) — includes B6's 30 clause-named §3 validator tests"
+        run: npm test
