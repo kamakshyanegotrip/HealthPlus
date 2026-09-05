@@ -34,10 +34,10 @@ name: Chat Pipeline CI
 on:
   push:
     branches: [main]
-    paths: ['chat-pipeline/**']
+    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
   pull_request:
     branches: [main]
-    paths: ['chat-pipeline/**']
+    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
 
 defaults:
   run:
@@ -48,8 +48,8 @@ jobs:
     name: Typecheck + unit tests + eval gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
@@ -98,8 +98,8 @@ jobs:
       SUPABASE_JWT_SECRET: 'ci-only-dummy-jwt-secret'
       PROMPT_VERSION_COMPOSE: 'compose-2026.08.1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
