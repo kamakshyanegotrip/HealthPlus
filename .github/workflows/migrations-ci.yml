@@ -1,6 +1,6 @@
 name: Migrations CI
 
-# Runs the REAL committed migrations (migrations/001..027) against a real
+# Runs the REAL committed migrations (migrations/001..028) against a real
 # Postgres 16 + pgvector, then asserts the schema contracts that the
 # chat-pipeline stub schema cannot express.
 #

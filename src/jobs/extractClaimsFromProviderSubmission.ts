@@ -65,6 +65,30 @@
  *   the live-surface "Part B" task imports from. This file never inlines or
  *   paraphrases Charter language; see that module's header comment.
  *
+ * HP-DR-002 — TRANSPLANT COMMERCIAL DATA
+ *   §2.4.2, as scoped by HP-DR-002, forbids the commercial engine from ever
+ *   applying to transplantation. This job does NOT enforce that, and the
+ *   reason is worth stating rather than leaving as an omission: it writes
+ *   `evidence.claim` and `evidence.claim_source` only. It never writes
+ *   `evidence.domain_attribute`, so at no point does it know which treatment
+ *   a candidate claim is about — and a keyword scan of the statement text
+ *   would be exactly the confidence-based decision §2.4.2's final sentence
+ *   rules out.
+ *
+ *   Enforcement lives at the bind step instead, in the database: migration
+ *   028's trigger on `evidence.domain_attribute` refuses to attach a COST or
+ *   PROVIDER_OUTCOME claim to a treatment flagged
+ *   `involves_donated_organ_or_tissue`, whichever code attempts it, including
+ *   code nobody has written yet. That is stronger than a check inside this
+ *   job, not weaker: the data never lands, for every writer.
+ *
+ *   WHEN THE ENTITY-BINDING STEP IS BUILT, it must catch that trigger's
+ *   exception and turn it into a `data_quality_flag` plus a REJECTED
+ *   submission — the same abstain-and-explain shape step 5 uses below — and
+ *   not let it surface as an unhandled error. A provider that submits
+ *   transplant pricing should get a clean rejection with a reason, and the
+ *   figure should never reach a claim binding at all.
+ *
  * TABLES READ
  *   domain.provider_submission, principal.provider_org, evidence.claim_kind_decay
  * TABLES WRITTEN

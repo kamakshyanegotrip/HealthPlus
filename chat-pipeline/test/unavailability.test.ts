@@ -116,3 +116,104 @@ describe('§6.5 display latency', () => {
     expect(displayLatencyMs(new Date(), null)).toBeNull();
   });
 });
+
+/**
+ * HP-DR-002 T5 — the transplant commercial block.
+ *
+ * The decision (HP-DR-002 §1) is that the commercial engine never applies to
+ * transplantation, for any donor pathway, and the load-bearing part is that it
+ * holds when NOTHING has been flagged. Every other rule in surfaceGate keys on
+ * red-flag severity; a calm, well-informed question about liver transplant
+ * costs raises no flag at all, and is precisely the request that must not be
+ * answered commercially. These tests exist so a future refactor that folds the
+ * transplant clause back into the severity branch fails loudly.
+ */
+describe('HP-DR-002 transplant commercial block (§2.4.2)', () => {
+  const gate = (
+    severity: Parameters<typeof surfaceGate>[0]['severity'],
+    involvesDonatedOrganOrTissue: boolean,
+  ) =>
+    surfaceGate({
+      unavailability: null,
+      severity,
+      severityOrder: SEVERITY_ORDER,
+      involvesDonatedOrganOrTissue,
+    });
+
+  it('test_hp_esc_2_4_2_commercial_blocked_at_normal_severity_with_no_red_flag', () => {
+    const g = gate('NORMAL', true);
+    expect(g.allows('PRICING')).toBe(false);
+    expect(g.allows('BOOKING')).toBe(false);
+    expect(g.allows('PROVIDER_RECOMMENDATION')).toBe(false);
+    expect(g.allows('PROMOTIONAL')).toBe(false);
+  });
+
+  it('test_hp_esc_2_4_2_reference_content_stays_permitted', () => {
+    // HP-DR-002 §1 permits cited population-level reference content, so the
+    // block must not take generation with it — that is the only thing we are
+    // still allowed to offer a transplant patient.
+    expect(gate('NORMAL', true).allows('GENERATIVE_HEALTH')).toBe(true);
+    expect(gate('NORMAL', true).allows('HUMAN_CONTACT')).toBe(true);
+    expect(gate('NORMAL', true).allows('NAVIGATION')).toBe(true);
+  });
+
+  it('test_hp_esc_2_4_2_block_holds_at_every_severity', () => {
+    for (const severity of ['NORMAL', 'MONITOR', 'WARNING', 'URGENT', 'CRITICAL', 'EMERGENCY'] as const) {
+      const g = gate(severity, true);
+      expect(g.allows('PRICING')).toBe(false);
+      expect(g.allows('BOOKING')).toBe(false);
+      expect(g.allows('PROVIDER_RECOMMENDATION')).toBe(false);
+      expect(g.allows('PROMOTIONAL')).toBe(false);
+    }
+  });
+
+  it('test_hp_dr_002_flag_only_ever_adds_suppression', () => {
+    // A transplant must never make a surface permitted that would otherwise be
+    // suppressed. Compare the two gates at every severity, both directions.
+    for (const severity of ['NORMAL', 'MONITOR', 'WARNING', 'URGENT', 'CRITICAL', 'EMERGENCY'] as const) {
+      const without = gate(severity, false);
+      const with_ = gate(severity, true);
+      for (const s of without.suppressed) {
+        expect(with_.allows(s)).toBe(false);
+      }
+    }
+  });
+
+  it('test_hp_dr_002_non_transplant_is_unaffected', () => {
+    // The negative control. If this ever fails, the block has stopped being
+    // conditional and is suppressing commerce across the whole product.
+    expect(gate('NORMAL', false).suppressed).toEqual([]);
+    expect(gate('NORMAL', false).allows('PRICING')).toBe(true);
+    // Omitting the argument entirely must behave exactly as false.
+    const omitted = surfaceGate({
+      unavailability: null,
+      severity: 'NORMAL',
+      severityOrder: SEVERITY_ORDER,
+    });
+    expect(omitted.suppressed).toEqual([]);
+  });
+
+  it('test_hp_dr_002_fail_closed_still_wins', () => {
+    // FAIL_CLOSED states its own contract explicitly (HP-JOB-004 §2.2a). The
+    // transplant flag must add to it, never replace it — GENERATIVE_HEALTH is
+    // suppressed on that path even though the transplant rule alone permits it.
+    const g = surfaceGate({
+      unavailability: {
+        copyVersion: 'x',
+        internalReason: 'test',
+        suppressed: ['GENERATIVE_HEALTH', 'PRICING', 'BOOKING', 'PROMOTIONAL', 'PROVIDER_RECOMMENDATION'],
+        permitted: ['ACCOUNT', 'EXISTING_ITINERARY', 'NAVIGATION', 'HUMAN_CONTACT'],
+        heading: 'h',
+        body: [],
+        emergencyNumber: null,
+        humanContact: { label: 'l', action: 'OPEN_HUMAN_CONTACT' },
+      },
+      severity: 'NORMAL',
+      severityOrder: SEVERITY_ORDER,
+      involvesDonatedOrganOrTissue: true,
+    });
+    expect(g.allows('GENERATIVE_HEALTH')).toBe(false);
+    expect(g.allows('PRICING')).toBe(false);
+  });
+});
+
