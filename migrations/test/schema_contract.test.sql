@@ -430,3 +430,395 @@ END $$;
 
 
 ROLLBACK;
+
+-- ############################################################################
+-- RF6 — CLINICIAN ALERT DELIVERY (migration 029)
+--
+-- The bug this closes: worker/side-effect-worker.mjs marked an
+-- EMERGENCY_CONCURRENT_NOTIFY job DONE after writing a console.log, and
+-- red_flag_event.clinician_notified_at was never written by anything. A
+-- response that paged nobody recorded exactly the same state as one that
+-- reached a clinician.
+--
+-- These assertions test the RULE, not the DDL: that the database refuses to
+-- record a delivery that did not happen. Every one of them fails if a future
+-- change makes "alerted" reachable without a person on the other end.
+-- ############################################################################
+
+BEGIN;
+
+-- Fixture: a clinician, a region, an audit and an EMERGENCY event.
+DO $$
+DECLARE
+  v_user     uuid := gen_random_uuid();
+  v_region   char(2);
+  v_tmpl     uuid := gen_random_uuid();
+  v_audit    uuid;
+  v_event    uuid := gen_random_uuid();
+  v_low      uuid := gen_random_uuid();
+  v_alert    uuid;
+  v_blocked  boolean;
+  v_state    text;
+  v_notified timestamptz;
+  v_reason   text;
+  v_n        int;
+BEGIN
+  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  ASSERT v_region IS NOT NULL, 'no region_registry rows — fixture cannot be built';
+
+  INSERT INTO principal.app_user (id, auth_subject, data_region)
+  VALUES (v_user, 'rf6-' || v_user::text, v_region);
+  INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
+  VALUES (v_user, 'RF6 fixture clinician', v_region);
+
+  -- URGENT+ events carry c_urgent_needs_template. A fixture template, not a
+  -- real one: this suite tests the alert path, not template governance.
+  INSERT INTO safety.safety_template
+    (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
+  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+
+  -- ---------------------------------------------------------------------
+  -- 1a. §4.1 levels 3-5 — raising is automatic. No application call.
+  --     The previous design enqueued a job from a fire-and-forget path, so
+  --     the alert existed only if that path ran. This asserts it now exists
+  --     because the event does.
+  -- ---------------------------------------------------------------------
+  INSERT INTO safety.red_flag_event
+    (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+     trigger_detail, template_id, template_version, action_taken,
+     commercial_suppressed, first_byte_at, template_displayed_at, data_region)
+  VALUES
+    (v_event, '\x00'::bytea, '\x00'::bytea, now(), 'CRITICAL',
+     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+
+  SELECT count(*) INTO v_n FROM safety.clinician_alert WHERE event_id = v_event;
+  ASSERT v_n = 1,
+    'a CRITICAL red_flag_event did not automatically raise a clinician_alert. '
+    'trg_raise_alert_for_event is missing or did not fire, and raising an alert '
+    'is once again something application code has to remember to do.';
+
+  -- ...and levels 0-2 must NOT raise one. §4.1 gives MONITOR and WARNING no
+  -- mandatory notification; raising alerts nobody owes an answer to is how a
+  -- real alert gets lost in noise.
+  INSERT INTO safety.red_flag_event
+    (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+     trigger_detail, action_taken,
+     commercial_suppressed, first_byte_at, template_displayed_at, data_region)
+  VALUES
+    (v_low, '\x02'::bytea, '\x02'::bytea, now(), 'MONITOR',
+     '{}'::jsonb, 'NONE', true, now(), now(), v_region);
+  SELECT count(*) INTO v_n FROM safety.clinician_alert WHERE event_id = v_low;
+  ASSERT v_n = 0,
+    format('a MONITOR event raised %s clinician alert(s). §4.1 levels 0-2 carry no '
+           'mandatory notification.', v_n);
+
+  RAISE NOTICE 'RF6: URGENT+ raises an alert automatically, MONITOR does not';
+END $$;
+
+ROLLBACK;
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- 1b. The coupling does not rest on that trigger alone. With auto-raise
+--     disabled, the DEFERRABLE constraint trigger must still refuse the event
+--     at commit. Two independent mechanisms: one creates the row, the other
+--     forbids the event without it.
+--
+--     Its own transaction because ALTER TABLE ... DISABLE TRIGGER cannot run
+--     while deferred trigger events are pending, and 1a leaves some.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+  v_user    uuid := gen_random_uuid();
+  v_region  char(2);
+  v_tmpl    uuid := gen_random_uuid();
+  v_blocked boolean := false;
+BEGIN
+  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  INSERT INTO principal.app_user (id, auth_subject, data_region)
+  VALUES (v_user, 'rf6-' || v_user::text, v_region);
+  INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
+  VALUES (v_user, 'RF6 backstop clinician', v_region);
+  INSERT INTO safety.safety_template
+    (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
+  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+
+  ALTER TABLE safety.red_flag_event DISABLE TRIGGER trg_raise_alert_for_event;
+
+  BEGIN
+    INSERT INTO safety.red_flag_event
+      (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+       trigger_detail, template_id, template_version, action_taken,
+       commercial_suppressed, first_byte_at, template_displayed_at, data_region)
+    VALUES
+      (gen_random_uuid(), '\\x03'::bytea, '\\x03'::bytea, now(), 'CRITICAL',
+       '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+    SET CONSTRAINTS safety.trg_event_requires_alert IMMEDIATE;
+  EXCEPTION WHEN raise_exception THEN
+    v_blocked := true;
+  END;
+
+  ASSERT v_blocked,
+    'HP-ESC 4.1: with auto-raise disabled, a CRITICAL red_flag_event was still '
+    'accepted with no clinician_alert row. The backstop constraint is gone, so a '
+    'single dropped trigger now silently returns the platform to alerting nobody.';
+  RAISE NOTICE 'RF6: the backstop constraint holds when auto-raise is disabled';
+END $$;
+
+ROLLBACK;
+
+BEGIN;
+
+DO $$
+DECLARE
+  v_user     uuid := gen_random_uuid();
+  v_region   char(2);
+  v_tmpl     uuid := gen_random_uuid();
+  v_event    uuid := gen_random_uuid();
+  v_alert    uuid;
+  v_blocked  boolean;
+  v_state    text;
+  v_notified timestamptz;
+  v_n        int;
+BEGIN
+  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  INSERT INTO principal.app_user (id, auth_subject, data_region)
+  VALUES (v_user, 'rf6-' || v_user::text, v_region);
+  INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
+  VALUES (v_user, 'RF6 fixture clinician', v_region);
+
+  -- URGENT+ events carry c_urgent_needs_template. A fixture template, not a
+  -- real one: this suite tests the alert path, not template governance.
+  INSERT INTO safety.safety_template
+    (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
+  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+
+  INSERT INTO safety.red_flag_event
+    (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+     trigger_detail, template_id, template_version, action_taken,
+     commercial_suppressed, first_byte_at, template_displayed_at, data_region)
+  VALUES
+    (v_event, '\x00'::bytea, '\x00'::bytea, now(), 'EMERGENCY',
+     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+
+  v_alert := safety.raise_alert(v_event);
+  ASSERT v_alert IS NOT NULL, 'safety.raise_alert returned NULL for an EMERGENCY event';
+
+  SELECT state INTO v_state FROM safety.clinician_alert WHERE id = v_alert;
+  ASSERT v_state = 'PENDING', format('new alert should be PENDING, was %s', v_state);
+
+  -- ---------------------------------------------------------------------
+  -- 2. THE SPINE. A non-delivering channel cannot produce a delivery.
+  --    LOG is the only channel this deployment has. If this assertion ever
+  --    fails, the platform can once again record "clinician notified" on the
+  --    strength of a log line.
+  -- ---------------------------------------------------------------------
+  v_blocked := false;
+  BEGIN
+    PERFORM safety.mark_alert_delivered(v_alert, 'LOG', v_user);
+  EXCEPTION WHEN raise_exception THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'safety.mark_alert_delivered accepted the LOG channel. A log line is not a page: '
+    'a channel with delivers = false must never be able to move an alert to DELIVERED.';
+
+  -- and the constraint holds even if the function is bypassed entirely
+  v_blocked := false;
+  BEGIN
+    UPDATE safety.clinician_alert
+       SET state = 'DELIVERED', channel = 'LOG', channel_delivers = false,
+           clinician_id = v_user, delivered_at = now()
+     WHERE id = v_alert;
+  EXCEPTION WHEN check_violation OR foreign_key_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'c_only_delivering_channel_delivers did not fire on a direct UPDATE. The rule must '
+    'live in the table, not only in the function that is supposed to be used.';
+
+  -- ...and the composite FK makes lying about the flag impossible too
+  v_blocked := false;
+  BEGIN
+    UPDATE safety.clinician_alert
+       SET state = 'DELIVERED', channel = 'LOG', channel_delivers = true,
+           clinician_id = v_user, delivered_at = now()
+     WHERE id = v_alert;
+  EXCEPTION WHEN check_violation OR foreign_key_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'the (channel, channel_delivers) composite FK accepted LOG paired with delivers = true. '
+    'channel_delivers is no longer a denormalisation the database proves.';
+
+  RAISE NOTICE 'RF6: a non-delivering channel cannot record a delivery (3 ways)';
+
+  -- ---------------------------------------------------------------------
+  -- 3. The honest outcome is available and requires a reason.
+  -- ---------------------------------------------------------------------
+  v_blocked := false;
+  BEGIN
+    PERFORM safety.mark_alert_undeliverable(v_alert, '');
+  EXCEPTION WHEN raise_exception THEN v_blocked := true;
+  END;
+  ASSERT v_blocked, 'mark_alert_undeliverable accepted an empty reason';
+
+  PERFORM safety.mark_alert_undeliverable(v_alert, 'NO_ROSTER_ENTRY');
+  SELECT state INTO v_state FROM safety.clinician_alert WHERE id = v_alert;
+  ASSERT v_state = 'UNDELIVERABLE', format('expected UNDELIVERABLE, got %s', v_state);
+
+  -- ---------------------------------------------------------------------
+  -- 4. §4.0.7 — clinician_notified_at is NOT stamped by a failed delivery.
+  --    This is the assertion that would have caught the original bug.
+  -- ---------------------------------------------------------------------
+  SELECT clinician_notified_at INTO v_notified
+    FROM safety.red_flag_event WHERE id = v_event;
+  ASSERT v_notified IS NULL,
+    'red_flag_event.clinician_notified_at was stamped for an UNDELIVERABLE alert. '
+    'The platform is again recording notifications that did not occur.';
+
+  -- ...and an undelivered alert cannot be acknowledged
+  v_blocked := false;
+  BEGIN
+    PERFORM safety.acknowledge_alert(v_alert, v_user);
+  EXCEPTION WHEN raise_exception THEN v_blocked := true;
+  END;
+  ASSERT v_blocked, 'acknowledge_alert accepted an alert that was never delivered';
+
+  -- ---------------------------------------------------------------------
+  -- 5. The state shows up where a human will see it.
+  -- ---------------------------------------------------------------------
+  SELECT count(*) INTO v_n FROM safety.v_alerts_reaching_nobody WHERE id = v_alert;
+  ASSERT v_n = 1,
+    'an UNDELIVERABLE alert does not appear in safety.v_alerts_reaching_nobody — '
+    'the one view whose non-emptiness is the platform admitting it reached no one';
+
+  RAISE NOTICE 'RF6: an undelivered alert stamps nothing and surfaces in the metric view';
+END $$;
+
+ROLLBACK;
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- 6. POSITIVE CONTROL. With a roster entry on a delivering channel, the whole
+--    path works and DOES stamp §4.0.7's clinician identity. Without this the
+--    suite above would pass just as well if delivery were impossible outright,
+--    which is not the goal — the goal is that delivery is possible and
+--    truthful.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+  v_user     uuid := gen_random_uuid();
+  v_region   char(2);
+  v_tmpl     uuid := gen_random_uuid();
+  v_event    uuid := gen_random_uuid();
+  v_alert    uuid;
+  v_oncall   record;
+  v_notified timestamptz;
+  v_who      uuid;
+  v_state    text;
+  v_n        int;
+BEGIN
+  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  INSERT INTO principal.app_user (id, auth_subject, data_region)
+  VALUES (v_user, 'rf6-' || v_user::text, v_region);
+  INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
+  VALUES (v_user, 'RF6 on-call', v_region);
+
+  INSERT INTO safety.safety_template
+    (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
+  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+
+  INSERT INTO safety.on_call_roster
+    (id, clinician_id, data_region, min_severity, channel, address, effective_from)
+  VALUES
+    (gen_random_uuid(), v_user, v_region, 'URGENT', 'SMS', '+10000000000', now() - interval '1 day');
+
+  -- the roster resolves, and it resolves to a delivering channel
+  SELECT * INTO v_oncall
+    FROM safety.resolve_on_call(v_region, 'EMERGENCY'::red_flag_severity, now()) LIMIT 1;
+  ASSERT v_oncall.clinician_id = v_user, 'resolve_on_call did not find the roster entry';
+
+  INSERT INTO safety.red_flag_event
+    (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
+     trigger_detail, template_id, template_version, action_taken,
+     commercial_suppressed, first_byte_at, template_displayed_at, data_region)
+  VALUES
+    (v_event, '\x01'::bytea, '\x01'::bytea, now(), 'EMERGENCY',
+     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+
+  v_alert := safety.raise_alert(v_event);
+  PERFORM safety.mark_alert_delivered(v_alert, v_oncall.channel, v_oncall.clinician_id);
+
+  SELECT clinician_notified_at, clinician_id INTO v_notified, v_who
+    FROM safety.red_flag_event WHERE id = v_event;
+  ASSERT v_notified IS NOT NULL,
+    'a real delivery did NOT stamp red_flag_event.clinician_notified_at — RF6 has '
+    'traded a false positive for a false negative';
+  ASSERT v_who = v_user, '§4.0.7 clinician identity was not recorded on delivery';
+
+  PERFORM safety.acknowledge_alert(v_alert, v_user);
+  SELECT state INTO v_state FROM safety.clinician_alert WHERE id = v_alert;
+  ASSERT v_state = 'ACKNOWLEDGED', format('expected ACKNOWLEDGED, got %s', v_state);
+
+  -- and now it is NOT in the reaching-nobody view
+  SELECT count(*) INTO v_n FROM safety.v_alerts_reaching_nobody WHERE id = v_alert;
+  ASSERT v_n = 0,
+    'an acknowledged, delivered alert still appears in v_alerts_reaching_nobody';
+
+  RAISE NOTICE 'RF6: a real delivery on a delivering channel stamps §4.0.7 and clears the view';
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 7. The SLA is reference data and is NOT adopted. Same discipline as
+--    red_flag_rule.clinically_adopted / AMB-17: these numbers came from
+--    CGP-001 §8.2, which calls them proposals. If this ever passes silently
+--    with clinically_adopted = true, someone adopted an SLA without a
+--    clinician, which is the §0.6 failure mode.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE n_adopted int; n_rows int;
+BEGIN
+  SELECT count(*) FILTER (WHERE clinically_adopted), count(*)
+    INTO n_adopted, n_rows FROM safety.alert_sla;
+  ASSERT n_rows = 3, format('expected SLA rows for URGENT/CRITICAL/EMERGENCY, found %s', n_rows);
+  ASSERT n_adopted = 0,
+    format('%s alert SLA row(s) are marked clinically_adopted with no clinical lead '
+           'appointed. Charter §0.6 / AMB-17: adoption requires a named clinician.', n_adopted);
+  RAISE NOTICE 'RF6: alert SLAs are present and correctly NOT adopted';
+END $$;
+
+-- ---------------------------------------------------------------------------
+-- 8. Grants. The notification columns must be un-writable by every application
+--    role, so mark_alert_delivered() is the only path. HP-RECON-001 §2b: this
+--    is checked at PLAN time, so a stray grant would not merely widen access,
+--    it would let a whole UPDATE statement through.
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE missing text[] := '{}'; r text; c text;
+BEGIN
+  FOREACH r IN ARRAY ARRAY['alert_role','redflag_role','hp_app'] LOOP
+    FOREACH c IN ARRAY ARRAY['clinician_notified_at','clinician_id'] LOOP
+      IF has_column_privilege(r, 'safety.red_flag_event', c, 'UPDATE') THEN
+        missing := missing || (r || ' CAN UPDATE red_flag_event.' || c);
+      END IF;
+    END LOOP;
+    IF has_table_privilege(r, 'safety.clinician_alert', 'UPDATE')
+       OR has_table_privilege(r, 'safety.clinician_alert', 'INSERT') THEN
+      missing := missing || (r || ' HAS DIRECT DML ON clinician_alert');
+    END IF;
+  END LOOP;
+
+  -- the read side must work, or the worker cannot see its own queue
+  IF NOT has_table_privilege('alert_role', 'safety.clinician_alert', 'SELECT') THEN
+    missing := missing || 'alert_role CANNOT SELECT clinician_alert'::text;
+  END IF;
+  IF NOT has_function_privilege('alert_role', 'safety.mark_alert_delivered(uuid, text, uuid)', 'EXECUTE') THEN
+    missing := missing || 'alert_role CANNOT EXECUTE mark_alert_delivered'::text;
+  END IF;
+
+  ASSERT cardinality(missing) = 0,
+    format('RF6 grant contract violated: %s', array_to_string(missing, '; '));
+  RAISE NOTICE 'RF6: notification columns are writable only through the definer function';
+END $$;
+
+ROLLBACK;

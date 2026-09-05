@@ -73,7 +73,7 @@ jobs:
 
       # Applied in filename order, which is the order they must run in. Any
       # failure stops the job at the first bad file rather than cascading.
-      - name: Apply migrations 001..027
+      - name: Apply every migration in migrations/ (filename order)
         run: |
           set -euo pipefail
           for f in $(ls migrations/*.sql | sort); do
@@ -104,9 +104,27 @@ jobs:
       - name: "SQL query contract — every SQL literal resolves against this schema (CI-3)"
         run: node migrations/test/query_contract.mjs
 
+      # RF6. The alert worker's own path, run against the real schema with a
+      # real EMERGENCY event. Two runs, because both outcomes matter and only
+      # one of them had ever been exercised:
+      #
+      #   1. no roster  -> UNDELIVERABLE, exit 2. This is the platform's
+      #      current honest state and the run asserts it is REPORTED, not
+      #      swallowed. The predecessor to this worker logged and exited 0.
+      #   2. roster + a working adapter -> DELIVERED, exit 0, and
+      #      red_flag_event.clinician_notified_at actually stamped.
+      #
+      # If (2) ever stops stamping, RF6 has traded a false positive for a false
+      # negative and a real page would go unrecorded.
+      - name: "RF6 - clinician alert delivery, both outcomes (worker + schema)"
+        run: |
+          set -euo pipefail
+          npm --prefix chat-pipeline install pg --no-save --silent
+          bash migrations/test/rf6_alert_delivery.sh
+
       # Cheap regression guard on the numbering question HP-JOB-002's Ledger
-      # left open and this repo answered: migrations run to 027, and nothing
-      # should silently reintroduce a 028+ gap or a duplicate prefix.
+      # left open and this repo answered: nothing should silently reintroduce a
+      # gap or a duplicate prefix as the sequence grows.
       - name: Migration numbering is contiguous and unique
         run: |
           set -euo pipefail
