@@ -3,63 +3,63 @@
   "source": "HP-RECON-002 — the R10 cutover survey",
   "entries": [
     {
-      "id": "PLACEHOLDER",
+      "id": "8f69eadcb2fe",
       "file": "chat-pipeline/src/lib/pipeline/auditLog.ts",
       "error": "relation \"response_audit\" does not exist",
-      "why": "The real schema files this as obs.response_audit; the stub keeps it unqualified in public. The query is correct apart from the prefix. It cannot simply be qualified today: the stub has no obs.response_audit at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs.",
+      "why": "The real schema files this under obs.response_audit; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no obs.response_audit at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs.",
       "item": "R10d, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "ac2d2c9c5f3c",
       "file": "chat-pipeline/src/lib/pipeline/auditLog.ts",
       "error": "relation \"response_content\" does not exist",
-      "why": "As above. Real location is obs.response_content.",
+      "why": "The real schema files this under obs.response_content; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no obs.response_content at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs.",
       "item": "R10d, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
-      "file": "chat-pipeline/src/lib/pipeline/patientProfile.ts",
-      "error": "relation \"patient_profile\" does not exist",
-      "why": "As above. Real location is principal.patient_profile. app_user, patient_attribute and subject_key are likewise principal.*.",
-      "item": "R10d, which rides with the cutover"
-    },
-    {
-      "id": "PLACEHOLDER",
+      "id": "ef4942a22352",
       "file": "chat-pipeline/src/lib/pipeline/knowledgeLookup.ts",
       "error": "function claim_search(unknown, unknown) does not exist",
-      "why": "THE BIG ONE. claim_search does not exist in the real schema and cannot be ported: the stub retrieves on evidence.claim.domain_table, .text, .search_tsv and .embedding, none of which exist in the real schema. Real retrieval is chunk-grained in evidence.retrieval_chunk, so this is a change of grain rather than a rename — claims are the citable unit, chunks the retrievable one. Getting the resolution wrong is a §3.9.2 fabrication-class bug, which is why it needs a decision before code.",
+      "why": "THE BIG ONE. claim_search does not exist in the real schema and cannot be ported: the stub retrieves on evidence.claim.domain_table, .text, .search_tsv and .embedding, none of which exist there. Real retrieval is chunk-grained in evidence.retrieval_chunk, so this is a change of grain rather than a rename — claims are the citable unit, chunks the retrievable one. Getting the resolution wrong is a §3.9.2 fabrication-class bug, which is why it needs a decision before code.",
       "item": "R10c, gated on HP-DR-003"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "19a3fe957d59",
+      "file": "chat-pipeline/src/lib/pipeline/patientProfile.ts",
+      "error": "relation \"patient_profile\" does not exist",
+      "why": "The real schema files this under principal.patient_profile; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no principal.patient_profile at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs. app_user, patient_attribute and subject_key are likewise principal.*.",
+      "item": "R10d, which rides with the cutover"
+    },
+    {
+      "id": "94d08cf05f38",
       "file": "chat-pipeline/src/lib/pipeline/sideEffectDispatcher.ts",
       "error": "relation \"side_effect_job\" does not exist",
       "why": "side_effect_job is a stub invention. The real schema has obs.review_queue_item, which is strictly better — FKs to principal.clinician and safety.clinical_domain, a c_no_implicit_approval CHECK, and a trigger enforcing §2.3.4c (a clinician may not claim a review outside their registered domain). The stub replaced a safety control with a generic queue that enforces none of it. Fixing this is a reroute, not a new table.",
       "item": "R10b, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "38a4b6f5a32d",
       "file": "chat-pipeline/worker/side-effect-worker.mjs",
       "error": "relation \"side_effect_job\" does not exist",
-      "why": "Consumer side of the same stub invention — the claim/lease query. Reroutes to obs.review_queue_item with the dispatcher.",
+      "why": "Consumer side of the same stub invention — the claim/lease query. Reroutes with the dispatcher.",
       "item": "R10b, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "dedf79dc6009",
       "file": "chat-pipeline/worker/side-effect-worker.mjs",
       "error": "relation \"side_effect_job\" does not exist",
       "why": "Consumer side of the same stub invention — the DONE transition.",
       "item": "R10b, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "461abc93b81b",
       "file": "chat-pipeline/worker/side-effect-worker.mjs",
       "error": "relation \"side_effect_job\" does not exist",
       "why": "Consumer side of the same stub invention — the FAILED transition.",
       "item": "R10b, which rides with the cutover"
     },
     {
-      "id": "PLACEHOLDER",
+      "id": "69a3fd01eee4",
       "file": "chat-pipeline/worker/side-effect-worker.mjs",
       "error": "relation \"side_effect_job\" does not exist",
       "why": "Consumer side of the same stub invention — the requeue transition.",

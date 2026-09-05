@@ -38,14 +38,23 @@
  * query_contract_baseline.json with a reason and the R10 item that will fix
  * each one.
  *
- * The check fails on TWO conditions, and the second is the important one:
+ * The check fails on THREE conditions, and only the first is about the code:
  *
  *   1. A query fails that is not in the baseline  -> a new bug. Fix it.
  *   2. A baselined query now PASSES               -> you fixed it. Remove the
  *                                                    baseline entry.
+ *   3. A baseline entry matches no query at all   -> the query was deleted or
+ *                                                    its text changed. Remove
+ *                                                    the entry.
  *
- * Rule 2 is what stops the baseline becoming a permanent excuse list. It can
- * only shrink, and it cannot go stale without turning the build red.
+ * Rules 2 and 3 are what stop the baseline becoming a permanent excuse list. It
+ * can only shrink, and it cannot go stale without turning the build red. Rule 3
+ * exists because rule 2 can only inspect queries that still exist, so an entry
+ * whose query vanished would otherwise live forever, padding the "of N" count
+ * so that decay reads as coverage.
+ *
+ * The run also aborts if it cannot reach a database, rather than reporting the
+ * resulting connection errors as if they were schema failures.
  *
  * USAGE
  *   PGDATABASE=hp_test node migrations/test/query_contract.mjs
@@ -139,6 +148,24 @@ function probe(sql, n) {
   }
 }
 
+// Preflight. Without this, an unreachable database makes psql fail on every
+// query with a connection error, `probe` dutifully records that string as the
+// query's "error", and the run reports thirty schema failures that are nothing
+// of the kind. With a large enough baseline it could even report them all as
+// known-failing and exit green — a check that passes hardest when it is not
+// running at all. Prove the connection first, and treat its absence as an
+// infrastructure failure rather than as evidence about the schema.
+try {
+  execFileSync('psql', ['-v', 'ON_ERROR_STOP=1', '-qtAc', 'SELECT 1'],
+    { stdio: ['ignore', 'ignore', 'pipe'] });
+} catch (err) {
+  console.error('Cannot reach a database to probe against.');
+  console.error(String(err.stderr || err.message).trim().split('\n')[0]);
+  console.error('\nThis check PREPAREs each query against a live schema; it cannot run without one.');
+  console.error('Point PGHOST/PGUSER/PGDATABASE at a database with migrations applied.');
+  process.exit(1);
+}
+
 const queries = extract();
 const results = queries.map((q, i) => ({
   ...q,
@@ -158,6 +185,21 @@ if (process.argv.includes('--write-baseline')) {
 
 let baseline = { entries: [] };
 try { baseline = JSON.parse(readFileSync(BASELINE, 'utf8')); } catch { /* first run */ }
+
+// A Map keyed by id silently collapses duplicates, and a collapsed baseline
+// under-reports what it covers rather than erroring. That happened once, on
+// this file's own first CI run: nine hand-written entries all carried the
+// placeholder id, the Map kept one, and the run reported "0 of 1" known
+// failures while nine real ones went unbaselined. The gate did its job and
+// went red — but for a confusing reason. Fail on the real cause instead.
+const dupes = baseline.entries
+  .map((e) => e.id)
+  .filter((id, i, all) => all.indexOf(id) !== i);
+if (dupes.length) {
+  console.error(`Baseline has duplicate ids: ${[...new Set(dupes)].join(', ')}`);
+  console.error('Each entry must carry the id of the query it excuses. Regenerate with --write-baseline.');
+  process.exit(1);
+}
 const known = new Map(baseline.entries.map((e) => [e.id, e]));
 
 const failing = results.filter((r) => r.error);
@@ -182,6 +224,21 @@ if (unexpectedFailures.length) {
   console.error(`${BASELINE} with a reason and the register item that will close it.`);
 }
 
+// An entry whose id matches no extracted query is an orphan: the query it
+// excused was deleted, or edited so its text (and therefore its id) changed.
+// `fixedButStillBaselined` cannot see these, because it only looks at queries
+// that still exist. Left alone they are worse than useless — they inflate the
+// "of N" denominator so a rotting baseline reads as coverage, and if the query
+// ever comes back in its old form the entry silently excuses it again.
+const orphans = baseline.entries.filter((e) => !results.some((r) => r.id === e.id));
+
+if (orphans.length) {
+  console.error(`\n${orphans.length} BASELINE ENTRY(S) MATCH NO QUERY IN THE SOURCE TREE:\n`);
+  for (const e of orphans) console.error(`  ${e.id}  was ${e.file}  (${e.item})`);
+  console.error('\nThe query was deleted or its text changed. Remove the entry; if the query');
+  console.error('still exists and still fails, it will reappear as an unbaselined failure.');
+}
+
 if (fixedButStillBaselined.length) {
   console.error(`\n${fixedButStillBaselined.length} BASELINED QUERY(S) NOW RESOLVE. Remove them from the baseline:\n`);
   for (const r of fixedButStillBaselined) console.error(`  ${r.id}  ${r.file}:${r.line}`);
@@ -189,5 +246,5 @@ if (fixedButStillBaselined.length) {
   console.error('real regression at that spot pass unnoticed.');
 }
 
-if (unexpectedFailures.length || fixedButStillBaselined.length) process.exit(1);
+if (unexpectedFailures.length || fixedButStillBaselined.length || orphans.length) process.exit(1);
 console.log('\nQUERY CONTRACT OK.');
