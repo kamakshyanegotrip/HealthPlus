@@ -83,7 +83,11 @@ function providerSubmissionHandler(payload: unknown): [string, QueryHandler] {
 
 const providerOrgHandler: [string, QueryHandler] = [
   'FROM principal.provider_org',
-  () => ({ rows: [{ id: PROVIDER_ORG_ID, name: 'Apollo Test Hospital', country: 'IN' }] }),
+  // `legal_name`, not `name` — the real principal.provider_org DDL is
+  // (id, legal_name, country, status). This fake previously returned `name`,
+  // matching the bug in the code rather than the schema, which is how a
+  // passing test coexisted with a query that could never run.
+  () => ({ rows: [{ id: PROVIDER_ORG_ID, legal_name: 'Apollo Test Hospital', country: 'IN' }] }),
 ];
 
 const costDecayHandler: [string, QueryHandler] = [
