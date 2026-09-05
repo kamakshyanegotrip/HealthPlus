@@ -66,7 +66,7 @@ jobs:
       PGDATABASE: healthplus
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
@@ -85,6 +85,24 @@ jobs:
       # the stub schema is structurally incapable of representing.
       - name: Schema contract tests
         run: psql -v ON_ERROR_STOP=1 -f migrations/test/schema_contract.test.sql
+
+      # CI-3. Four of the five schema bugs found in the first week of September
+      # 2026 were found by executing something against the real schema rather
+      # than reading it; the fifth (PR #4) was a query naming a column that does
+      # not exist, whose unit test could not catch it because the test's fake
+      # encoded the same wrong assumption as the code. This step asks the
+      # database instead of a fake. It needs no fixtures and no rows — PREPARE
+      # resolves names and types without executing anything.
+      #
+      # Nine queries are known not to resolve today (the stub-vs-real
+      # divergence, HP-RECON-002) and are baselined with a reason apiece. The
+      # gate fails on a NEW failure, and also when a BASELINED query starts
+      # passing — so the baseline can only shrink, and cannot go stale quietly.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: "SQL query contract — every SQL literal resolves against this schema (CI-3)"
+        run: node migrations/test/query_contract.mjs
 
       # Cheap regression guard on the numbering question HP-JOB-002's Ledger
       # left open and this repo answered: migrations run to 027, and nothing
