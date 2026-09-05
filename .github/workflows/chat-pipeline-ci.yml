@@ -34,10 +34,10 @@ name: Chat Pipeline CI
 on:
   push:
     branches: [main]
-    paths: ['chat-pipeline/**']
+    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
   pull_request:
     branches: [main]
-    paths: ['chat-pipeline/**']
+    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
 
 defaults:
   run:
