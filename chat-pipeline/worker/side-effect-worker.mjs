@@ -120,11 +120,48 @@ async function handlePostHocSampleReview(job) {
 }
 
 async function handleEmergencyConcurrentNotify(job) {
-  // A real integration would call a paging API (PagerDuty/Opsgenie-style)
-  // or send an SMS/push — §4.0.5 requires this to be concurrent with
-  // display, never gating it, which is exactly why sideEffectDispatcher.ts
-  // never awaits this call from the request path.
-  console.log('[EMERGENCY_CONCURRENT_NOTIFY] would page on-call for audit', job.payload.auditId, 'severity', job.payload.severity);
+  // SUPERSEDED BY RF6 (migration 029 + worker/alert-worker.mjs).
+  //
+  // This handler used to be:
+  //
+  //     console.log('[EMERGENCY_CONCURRENT_NOTIFY] would page on-call ...')
+  //
+  // and then the job was marked DONE. That is the defect RF6 closed: a
+  // response that paged nobody recorded the same state as one that reached a
+  // clinician in ten seconds, and red_flag_event.clinician_notified_at — a
+  // column that has existed since migration 012 — was never written by
+  // anything at all.
+  //
+  // Notification is no longer this worker's business, and deliberately no
+  // longer any worker's business to REMEMBER: migration 029's AFTER INSERT
+  // trigger raises a safety.clinician_alert row inside the red_flag_event's
+  // own transaction, so the alert exists whether or not this job is ever
+  // enqueued, delivered or processed. alert-worker.mjs drains it and is the
+  // only thing that can mark it delivered.
+  //
+  // This handler is kept, and does nothing but assert that invariant, because
+  // the producer (sideEffectDispatcher.ts) still enqueues the job and an
+  // unrecognised kind throws. If the alert is missing, something has removed
+  // the trigger and the job SHOULD fail — a job that quietly succeeds here is
+  // exactly what went wrong the first time.
+  const { rows } = await pool.query(
+    `SELECT a.id, a.state
+       FROM safety.clinician_alert a
+       JOIN safety.red_flag_event e ON e.id = a.event_id
+      WHERE e.audit_id = $1`,
+    [job.payload.auditId],
+  );
+  if (rows.length === 0) {
+    throw new Error(
+      `EMERGENCY_CONCURRENT_NOTIFY: audit ${job.payload.auditId} was ${job.payload.severity} ` +
+      `but no safety.clinician_alert exists for it. Migration 029's ` +
+      `trg_raise_alert_for_event has not fired — nobody is being alerted.`,
+    );
+  }
+  console.log(
+    `[EMERGENCY_CONCURRENT_NOTIFY] audit ${job.payload.auditId} (${job.payload.severity}): ` +
+    `alert ${rows[0].id} is ${rows[0].state}; delivery is alert-worker.mjs's job.`,
+  );
 }
 
 const HANDLERS = {
