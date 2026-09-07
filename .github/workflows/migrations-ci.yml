@@ -162,6 +162,27 @@ jobs:
           npm --prefix chat-pipeline install tsx pg --no-save --silent
           bash migrations/test/rf4_facility.sh
 
+      # SEC-1. The region boundary, run the way the APPLICATION connects rather
+      # than the way a test finds convenient.
+      #
+      # Migration 031's region policies were verified by a script that ran
+      # `SET app.data_region` by hand. The application sets `request.jwt.claims`
+      # and nothing else, and no policy in this schema reads that GUC - so
+      # every region policy compared a real value to NULL and the 4.0.7 write
+      # the pipeline performs on every flagged message was refused.
+      #
+      # Sections 1-4 check the schema half (the 4.0.8 floor's own boundary, and
+      # the composite FK that survives a policy edit). Section 5 is the one that
+      # ties the halves together: it imports the REAL exported db() and asserts
+      # the write is accepted under its own region and REFUSED under another's.
+      # If db.ts stops putting the region on the connection, or hardcodes one,
+      # this step goes red - both proven by negative control.
+      - name: "SEC-1 - region context and the 4.0.8 floor boundary (app connection + schema)"
+        run: |
+          set -euo pipefail
+          npm --prefix chat-pipeline install tsx pg --no-save --silent
+          bash migrations/test/sec1_region_context.sh
+
       # R13. The GRANT / RLS contract. R12 audited safety.* only; this is the
       # generalisation, and writing it found the class the earlier two GRANT
       # bugs were instances of: a privilege that CANNOT BE EXERCISED reads

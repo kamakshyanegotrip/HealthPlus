@@ -455,18 +455,26 @@ export async function recordRedFlagEvent(
   // value — clearing means "this session is no longer flagged," not "never
   // flag it below X again."
   await db().query(
+    // SEC-1: data_region is written on BOTH branches. The composite FK
+    // `c_floor_region_is_its_event_region` (migration 032) makes a floor whose
+    // region differs from its setting event's region impossible, so the
+    // ON CONFLICT branch must move the region along with set_by_event_id — a
+    // session that somehow acquired a floor in one region and is now flagged
+    // in another is a contradiction the database will refuse rather than
+    // silently keep half of.
     `INSERT INTO safety.session_severity_floor
-       (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by)
-     VALUES ($1, $2, $3, now(), NULL, NULL)
+       (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by, data_region)
+     VALUES ($1, $2, $3, now(), NULL, NULL, $4)
      ON CONFLICT (session_pseudonym) DO UPDATE SET
        floor_severity = EXCLUDED.floor_severity,
        set_by_event_id = EXCLUDED.set_by_event_id,
        set_at = now(),
        cleared_at = NULL,
-       cleared_by = NULL
+       cleared_by = NULL,
+       data_region = EXCLUDED.data_region
      WHERE safety.session_severity_floor.cleared_at IS NOT NULL
         OR EXCLUDED.floor_severity > safety.session_severity_floor.floor_severity`,
-    [sessionPseudo, result.severity, eventId],
+    [sessionPseudo, result.severity, eventId, ctx.dataRegion],
   );
 
   return eventId;
