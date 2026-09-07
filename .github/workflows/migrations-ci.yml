@@ -122,6 +122,28 @@ jobs:
           npm --prefix chat-pipeline install pg --no-save --silent
           bash migrations/test/rf6_alert_delivery.sh
 
+      # J3-4. The six §6.5 safety metrics, computed against the real schema.
+      # Two runs' worth of assertions in one script:
+      #
+      #   * the four computable metrics produce the numbers a hand calculation
+      #     gives, from real rows in response_audit / fabrication_block /
+      #     abstention_event / review_queue_item / red_flag_log;
+      #   * a quiet day (traffic, zero events) is a COMPUTED 0.0, not a
+      #     missing row - §3.0.4 makes abstention a positive metric, and a
+      #     positive metric that vanishes at zero cannot do its job;
+      #   * red_flag_recall and fabrication_rate_adversarial are recorded
+      #     UNCOMPUTABLE with a reason, and the §6.4 release gate BLOCKS.
+      #
+      # The job exits 2 while any release-gating metric is unmeasurable, which
+      # is every run until CL9 produces a clinician-labelled gold set. The
+      # script asserts that exit code: a 0 here would be the platform claiming
+      # its red-flag recall is known.
+      - name: "J3-4 - §6.5 safety metrics computed against the real schema"
+        run: |
+          set -euo pipefail
+          npm install pg --no-save --silent
+          bash migrations/test/j34_metrics.sh
+
       # Cheap regression guard on the numbering question HP-JOB-002's Ledger
       # left open and this repo answered: nothing should silently reintroduce a
       # gap or a duplicate prefix as the sequence grows.

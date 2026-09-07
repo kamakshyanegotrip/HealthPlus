@@ -453,6 +453,7 @@ DECLARE
   v_user     uuid := gen_random_uuid();
   v_region   char(2);
   v_tmpl     uuid := gen_random_uuid();
+  v_tv       int;
   v_audit    uuid;
   v_event    uuid := gen_random_uuid();
   v_low      uuid := gen_random_uuid();
@@ -473,9 +474,15 @@ BEGIN
 
   -- URGENT+ events carry c_urgent_needs_template. A fixture template, not a
   -- real one: this suite tests the alert path, not template governance.
+  -- Next free version, not a hardcoded 1: this suite must be runnable against a
+  -- database that already holds templates, or it is only ever run on empty CI
+  -- databases — which is how a test stops being run at all.
+  SELECT coalesce(max(version), 0) + 1 INTO v_tv
+    FROM safety.safety_template
+   WHERE severity = 'EMERGENCY' AND jurisdiction = v_region AND language = 'en';
   INSERT INTO safety.safety_template
     (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
-  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+  VALUES (v_tmpl, v_tv, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
 
   -- ---------------------------------------------------------------------
   -- 1a. §4.1 levels 3-5 — raising is automatic. No application call.
@@ -489,7 +496,7 @@ BEGIN
      commercial_suppressed, first_byte_at, template_displayed_at, data_region)
   VALUES
     (v_event, '\x00'::bytea, '\x00'::bytea, now(), 'CRITICAL',
-     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+     '{}'::jsonb, v_tmpl, v_tv, 'TEMPLATE', true, now(), now(), v_region);
 
   SELECT count(*) INTO v_n FROM safety.clinician_alert WHERE event_id = v_event;
   ASSERT v_n = 1,
@@ -533,6 +540,7 @@ DECLARE
   v_user    uuid := gen_random_uuid();
   v_region  char(2);
   v_tmpl    uuid := gen_random_uuid();
+  v_tv      int;
   v_blocked boolean := false;
 BEGIN
   SELECT code INTO v_region FROM public.region_registry LIMIT 1;
@@ -540,9 +548,15 @@ BEGIN
   VALUES (v_user, 'rf6-' || v_user::text, v_region);
   INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
   VALUES (v_user, 'RF6 backstop clinician', v_region);
+  -- Next free version, not a hardcoded 1: this suite must be runnable against a
+  -- database that already holds templates, or it is only ever run on empty CI
+  -- databases — which is how a test stops being run at all.
+  SELECT coalesce(max(version), 0) + 1 INTO v_tv
+    FROM safety.safety_template
+   WHERE severity = 'EMERGENCY' AND jurisdiction = v_region AND language = 'en';
   INSERT INTO safety.safety_template
     (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
-  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+  VALUES (v_tmpl, v_tv, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
 
   ALTER TABLE safety.red_flag_event DISABLE TRIGGER trg_raise_alert_for_event;
 
@@ -553,7 +567,7 @@ BEGIN
        commercial_suppressed, first_byte_at, template_displayed_at, data_region)
     VALUES
       (gen_random_uuid(), '\\x03'::bytea, '\\x03'::bytea, now(), 'CRITICAL',
-       '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+       '{}'::jsonb, v_tmpl, v_tv, 'TEMPLATE', true, now(), now(), v_region);
     SET CONSTRAINTS safety.trg_event_requires_alert IMMEDIATE;
   EXCEPTION WHEN raise_exception THEN
     v_blocked := true;
@@ -575,6 +589,7 @@ DECLARE
   v_user     uuid := gen_random_uuid();
   v_region   char(2);
   v_tmpl     uuid := gen_random_uuid();
+  v_tv       int;
   v_event    uuid := gen_random_uuid();
   v_alert    uuid;
   v_blocked  boolean;
@@ -590,9 +605,15 @@ BEGIN
 
   -- URGENT+ events carry c_urgent_needs_template. A fixture template, not a
   -- real one: this suite tests the alert path, not template governance.
+  -- Next free version, not a hardcoded 1: this suite must be runnable against a
+  -- database that already holds templates, or it is only ever run on empty CI
+  -- databases — which is how a test stops being run at all.
+  SELECT coalesce(max(version), 0) + 1 INTO v_tv
+    FROM safety.safety_template
+   WHERE severity = 'EMERGENCY' AND jurisdiction = v_region AND language = 'en';
   INSERT INTO safety.safety_template
     (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
-  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+  VALUES (v_tmpl, v_tv, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
 
   INSERT INTO safety.red_flag_event
     (id, subject_pseudonym, session_pseudonym, occurred_at, severity,
@@ -600,7 +621,7 @@ BEGIN
      commercial_suppressed, first_byte_at, template_displayed_at, data_region)
   VALUES
     (v_event, '\x00'::bytea, '\x00'::bytea, now(), 'EMERGENCY',
-     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+     '{}'::jsonb, v_tmpl, v_tv, 'TEMPLATE', true, now(), now(), v_region);
 
   v_alert := safety.raise_alert(v_event);
   ASSERT v_alert IS NOT NULL, 'safety.raise_alert returned NULL for an EMERGENCY event';
@@ -710,6 +731,7 @@ DECLARE
   v_user     uuid := gen_random_uuid();
   v_region   char(2);
   v_tmpl     uuid := gen_random_uuid();
+  v_tv       int;
   v_event    uuid := gen_random_uuid();
   v_alert    uuid;
   v_oncall   record;
@@ -724,9 +746,15 @@ BEGIN
   INSERT INTO principal.clinician (user_id, full_name, primary_jurisdiction)
   VALUES (v_user, 'RF6 on-call', v_region);
 
+  -- Next free version, not a hardcoded 1: this suite must be runnable against a
+  -- database that already holds templates, or it is only ever run on empty CI
+  -- databases — which is how a test stops being run at all.
+  SELECT coalesce(max(version), 0) + 1 INTO v_tv
+    FROM safety.safety_template
+   WHERE severity = 'EMERGENCY' AND jurisdiction = v_region AND language = 'en';
   INSERT INTO safety.safety_template
     (id, version, severity, jurisdiction, language, body, slots, approved_by, approved_at)
-  VALUES (v_tmpl, 1, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
+  VALUES (v_tmpl, v_tv, 'EMERGENCY', v_region, 'en', 'RF6 fixture body', '{}'::jsonb, v_user, now());
 
   INSERT INTO safety.on_call_roster
     (id, clinician_id, data_region, min_severity, channel, address, effective_from)
@@ -744,7 +772,7 @@ BEGIN
      commercial_suppressed, first_byte_at, template_displayed_at, data_region)
   VALUES
     (v_event, '\x01'::bytea, '\x01'::bytea, now(), 'EMERGENCY',
-     '{}'::jsonb, v_tmpl, 1, 'TEMPLATE', true, now(), now(), v_region);
+     '{}'::jsonb, v_tmpl, v_tv, 'TEMPLATE', true, now(), now(), v_region);
 
   v_alert := safety.raise_alert(v_event);
   PERFORM safety.mark_alert_delivered(v_alert, v_oncall.channel, v_oncall.clinician_id);
@@ -819,6 +847,130 @@ BEGIN
   ASSERT cardinality(missing) = 0,
     format('RF6 grant contract violated: %s', array_to_string(missing, '; '));
   RAISE NOTICE 'RF6: notification columns are writable only through the definer function';
+END $$;
+
+ROLLBACK;
+
+-- ############################################################################
+-- J3-4 — §6.5 SAFETY METRICS (migration 030)
+--
+-- The job (src/jobs/computeSafetyMetrics.mjs) is exercised end to end by
+-- migrations/test/j34_metrics.sh. These are the rules the database holds
+-- regardless of what any job does.
+--
+-- The one that matters: red-flag recall gates a release under §6.4 and cannot
+-- be measured without a clinician-labelled gold set (CL9/AMB-22). A schema
+-- that lets it be recorded as a number lets someone record 1.0.
+-- ############################################################################
+
+BEGIN;
+
+DO $$
+DECLARE
+  v_blocked boolean;
+  n int;
+BEGIN
+  -- ---------------------------------------------------------------------
+  -- 1. All six §6.5 metrics are registered, and exactly two are blocked.
+  -- ---------------------------------------------------------------------
+  SELECT count(*) INTO n FROM obs.safety_metric;
+  ASSERT n = 6, format('§6.5 names six primary safety metrics; the registry holds %s', n);
+
+  SELECT count(*) INTO n FROM obs.safety_metric WHERE blocked_on IS NOT NULL;
+  ASSERT n = 2,
+    format('expected exactly 2 unmeasurable metrics (recall, adversarial fabrication); found %s. '
+           'If this dropped to 0 without CL9 landing, something declared a metric measurable '
+           'that is not.', n);
+
+  SELECT count(*) INTO n FROM obs.safety_metric WHERE is_release_gate AND blocked_on IS NOT NULL;
+  ASSERT n = 2,
+    'the two release-gating metrics should be exactly the two that cannot be measured';
+
+  -- ---------------------------------------------------------------------
+  -- 2. §3.0.4 — abstention may never be declared a cost.
+  --    "no metric may reward completeness over abstention"
+  -- ---------------------------------------------------------------------
+  v_blocked := false;
+  BEGIN
+    UPDATE obs.safety_metric SET direction = 'LOWER_IS_BETTER' WHERE metric_key = 'abstention_rate';
+  EXCEPTION WHEN check_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'HP-ESC 3.0.4: abstention_rate was accepted as LOWER_IS_BETTER. A system that '
+    'measures honest refusal as a cost will be tuned toward answering when it should '
+    'not, which is the failure §3 exists to prevent.';
+
+  -- ---------------------------------------------------------------------
+  -- 3. A metric the registry says is blocked cannot be recorded COMPUTED —
+  --    not by the job, not by anyone holding EXECUTE on the writer.
+  -- ---------------------------------------------------------------------
+  v_blocked := false;
+  BEGIN
+    PERFORM obs.record_metric_sample(
+      'red_flag_recall', NULL, now() - interval '1 day', now(),
+      99, 100, 0.99, 'COMPUTED'::metric_status, 'test', NULL, NULL);
+  EXCEPTION WHEN raise_exception THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'obs.record_metric_sample accepted a COMPUTED red_flag_recall. There is no '
+    'clinician-labelled gold set (CL9/AMB-22), so any recall figure is invented — '
+    'and 0.99 is the most dangerous number this system can display.';
+
+  -- ---------------------------------------------------------------------
+  -- 4. status and value are coupled, in both directions.
+  -- ---------------------------------------------------------------------
+  v_blocked := false;
+  BEGIN
+    INSERT INTO obs.safety_metric_sample
+      (id, metric_key, window_start, window_end, value, status, method_version,
+       uncomputable_reason, computed_at)
+    VALUES (gen_random_uuid(), 'red_flag_recall', now() - interval '1 day', now(),
+            1.0, 'UNCOMPUTABLE', 'test', 'no gold set', now());
+  EXCEPTION WHEN check_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'an UNCOMPUTABLE sample was accepted carrying a value. UNCOMPUTABLE means the '
+    'number is unknown; a number attached to it is worse than no row at all.';
+
+  v_blocked := false;
+  BEGIN
+    INSERT INTO obs.safety_metric_sample
+      (id, metric_key, window_start, window_end, value, status, method_version, computed_at)
+    VALUES (gen_random_uuid(), 'abstention_rate', now() - interval '1 day', now(),
+            NULL, 'COMPUTED', 'test', now());
+  EXCEPTION WHEN check_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked, 'a COMPUTED sample was accepted with no value';
+
+  -- A ratio computed over nothing is not zero.
+  v_blocked := false;
+  BEGIN
+    INSERT INTO obs.safety_metric_sample
+      (id, metric_key, window_start, window_end, numerator, denominator, value,
+       status, method_version, computed_at)
+    VALUES (gen_random_uuid(), 'abstention_rate', now() - interval '1 day', now(),
+            0, 0, 0.0, 'COMPUTED', 'test', now());
+  EXCEPTION WHEN check_violation THEN v_blocked := true;
+  END;
+  ASSERT v_blocked,
+    'a COMPUTED sample was accepted with denominator 0. An empty window reported as '
+    '0.0 becomes a headline figure for a measurement that never happened.';
+
+  -- ---------------------------------------------------------------------
+  -- 5. §6.4 — the release gate is fail-closed. With no samples at all, both
+  --    gating metrics must BLOCK. A gate that only blocks on a MEASURED
+  --    regression passes hardest when it knows least.
+  -- ---------------------------------------------------------------------
+  SELECT count(*) INTO n FROM obs.v_release_gate WHERE verdict = 'PASS';
+  ASSERT n = 0,
+    format('%s release-gating metric(s) report PASS with no gold set and no adversarial '
+           'suite. §6.4 makes a recall regression a release blocker; an unmeasured '
+           'recall must block, not pass.', n);
+
+  SELECT count(*) INTO n FROM obs.v_release_gate WHERE verdict = 'BLOCK';
+  ASSERT n = 2, format('expected both gating metrics to BLOCK; %s did', n);
+
+  RAISE NOTICE 'J3-4: six metrics registered, abstention is not a cost, recall cannot be invented, gate fails closed';
 END $$;
 
 ROLLBACK;
