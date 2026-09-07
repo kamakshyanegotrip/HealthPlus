@@ -47,7 +47,34 @@ export interface TemplateSelection {
   fallbackReason: string | null;
   /** The severity actually resolved — may be higher than the one requested. */
   resolvedSeverity: RedFlagSeverity;
+  /**
+   * RF4. The body with its §4.3.2 slots filled, when a `prepare` hook was
+   * supplied. Null when no hook was given, in which case the caller uses
+   * `template.body` unchanged — which is every caller that has no slots to
+   * fill.
+   */
+  renderedText: string | null;
+  /** RF4. What each declared slot resolved to, for TEMPLATE_RENDERED. */
+  renderedDetail: unknown;
+  /** Rungs skipped because they could not be rendered. Empty is the norm. */
+  unrenderableRungs: string[];
 }
+
+/**
+ * RF4. Called at each rung before the row is accepted.
+ *
+ * A template whose slots cannot be filled is, for the ladder's purposes, not
+ * available — the same status a machine-translated row has. Returning `ok:
+ * false` makes the ladder climb past it, which is §4.0.9's direction: toward
+ * a higher severity, never toward generative output and never toward showing
+ * a person a placeholder.
+ *
+ * Single-pass on purpose: the hook returns the rendered text, so an accepted
+ * rung is not rendered a second time.
+ */
+export type PrepareTemplate = (
+  row: SafetyTemplateRow,
+) => Promise<{ ok: true; text: string; detail?: unknown } | { ok: false; reason: string }>;
 
 const SEVERITIES: RedFlagSeverity[] = ['NORMAL', 'MONITOR', 'WARNING', 'URGENT', 'CRITICAL', 'EMERGENCY'];
 
@@ -64,8 +91,10 @@ export async function selectTemplate(
   jurisdiction: string,
   language: string,
   lookup: (a: { severity: RedFlagSeverity; jurisdiction: string; language: string }) => Promise<SafetyTemplateRow | null>,
+  prepare?: PrepareTemplate,
 ): Promise<TemplateSelection | null> {
   const start = SEVERITY_ORDER[requested];
+  const unrenderableRungs: string[] = [];
 
   for (let i = start; i < SEVERITIES.length; i++) {
     const level = SEVERITIES[i]!;
@@ -84,6 +113,19 @@ export async function selectTemplate(
       // §4.3.4 is absolute — skip, do not render, even if it is the only row.
       if (found.machine_translated) continue;
 
+      // RF4: and skip it just as absolutely if its slots cannot be filled.
+      let renderedText: string | null = null;
+      let renderedDetail: unknown = null;
+      if (prepare) {
+        const p = await prepare(found);
+        if (!p.ok) {
+          unrenderableRungs.push(`${level}/${rung.jurisdiction}/${rung.language}: ${p.reason}`);
+          continue;
+        }
+        renderedText = p.text;
+        renderedDetail = p.detail ?? null;
+      }
+
       const isFallback = escalated || rung.reason !== 'exact match' || found.is_fallback;
       return {
         template: found,
@@ -94,6 +136,9 @@ export async function selectTemplate(
             ? `§4.0.9: no ${requested} template; escalated to ${level} (${rung.reason})`
             : rung.reason
           : null,
+        renderedText,
+        renderedDetail,
+        unrenderableRungs,
       };
     }
   }
@@ -147,9 +192,10 @@ export async function resolveTemplateForSeverity(
   jurisdiction: string,
   language: string,
   lookup = lookupTemplate,
+  prepare?: PrepareTemplate,
 ): Promise<TemplateSelection | null> {
   if (SEVERITY_ORDER[severity] < SEVERITY_ORDER['WARNING']) return null;
-  const selection = await selectTemplate(severity, jurisdiction, language, lookup);
+  const selection = await selectTemplate(severity, jurisdiction, language, lookup, prepare);
   if (!selection) {
     throw new NoApprovedTemplateError(
       `no approved safety template at or above ${severity} for ${jurisdiction}/${language}`,

@@ -144,6 +144,24 @@ jobs:
           npm install pg --no-save --silent
           bash migrations/test/j34_metrics.sh
 
+      # RF4. The nearest-ED lookup, run against the real schema.
+      #
+      # The unit tests (test/templateSlots.test.ts) cover the renderer and
+      # inject a fake for the facility lookup, so they say nothing about the
+      # SQL - a negative control confirmed that deleting
+      # `AND has_emergency_department` broke no test that existed. That is
+      # PR #4's bug shape: a fake that encodes the same assumption as the code.
+      #
+      # So this runs the ACTUAL exported function against real rows, with three
+      # traps that each WIN the ranking if their guard is dropped: a clinic
+      # with no emergency department, an inactive facility, and a facility in
+      # the wrong city.
+      - name: "RF4 - nearest-ED lookup against the real schema"
+        run: |
+          set -euo pipefail
+          npm --prefix chat-pipeline install tsx pg --no-save --silent
+          bash migrations/test/rf4_facility.sh
+
       # R13. The GRANT / RLS contract. R12 audited safety.* only; this is the
       # generalisation, and writing it found the class the earlier two GRANT
       # bugs were instances of: a privilege that CANNOT BE EXERCISED reads
