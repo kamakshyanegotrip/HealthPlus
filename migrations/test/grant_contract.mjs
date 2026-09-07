@@ -203,6 +203,52 @@ const RULES = [
          AND privilege_type IN ('DELETE','TRUNCATE')`,
   },
   {
+    id: 'H-trigger-executable',
+    title: 'A writer must be able to execute every trigger its write fires',
+    why:
+      'The fourth way a grant can be real and still not work, after A, B and C. ' +
+      'An INVOKER trigger function runs with the caller\'s privileges, so a write ' +
+      'that passes the GRANT and the RLS policy can still fail inside a trigger that ' +
+      'reads a table the caller cannot see. Found the hard way: RF6\'s own backstop, ' +
+      'safety.event_requires_alert(), read safety.clinician_alert as INVOKER — the ' +
+      'check meant to guarantee an emergency is never silently unalerted was blocking ' +
+      'every emergency from being recorded at all. Fixed in migration 031 §2b.',
+    sql: `
+      WITH writers AS (
+        SELECT DISTINCT g.grantee AS role, c.oid AS tbl
+          FROM information_schema.role_table_grants g
+          JOIN pg_class c ON c.relname = g.table_name
+          JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = g.table_schema
+         WHERE g.grantee IN ${APP_ROLES}
+           AND g.privilege_type IN ('INSERT','UPDATE','DELETE')
+      ), trig AS (
+        SELECT w.role, p.proname, p.prosrc, n.nspname||'.'||c.relname AS on_table
+          FROM writers w
+          JOIN pg_trigger t ON t.tgrelid = w.tbl AND NOT t.tgisinternal
+          JOIN pg_proc p ON p.oid = t.tgfoid
+          JOIN pg_class c ON c.oid = w.tbl
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE NOT p.prosecdef
+      ), refs AS (
+        SELECT trig.role, trig.proname, trig.on_table,
+               (regexp_matches(trig.prosrc,
+                 '(safety|obs|principal|evidence|domain|commercial)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
+                 'g'))[1] AS sch,
+               (regexp_matches(trig.prosrc,
+                 '(safety|obs|principal|evidence|domain|commercial)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
+                 'g'))[2] AS rel
+          FROM trig
+      )
+      SELECT DISTINCT refs.role AS role,
+             refs.on_table||' -> '||refs.proname||'()' AS object,
+             'cannot read '||refs.sch||'.'||refs.rel AS detail
+        FROM refs
+        JOIN pg_class rc ON rc.relname = refs.rel
+        JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname = refs.sch
+       WHERE rc.relkind IN ('r','v','m')
+         AND NOT has_table_privilege(refs.role, rc.oid, 'SELECT')`,
+  },
+  {
     id: 'G-public-holds-nothing',
     title: 'PUBLIC holds no table privilege in any application schema',
     why:
