@@ -7,6 +7,8 @@ import { classifyCategory, reconcileAfterRetrieval } from '@/lib/pipeline/catego
 import { CLINICAL_DECISION_REFUSAL } from '@/lib/prompts/annexB';
 import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken, getSessionFloor, applySessionFloor, recordRedFlagLog } from '@/lib/pipeline/redFlagEngine';
 import { resolveTemplateForSeverity } from '@/lib/pipeline/templateResolution';
+import { makePrepareTemplate } from '@/lib/pipeline/templateSlots';
+import { resolveEmergencyNumber } from '@/lib/pipeline/unavailability';
 import { lookupPatientProfile } from '@/lib/pipeline/patientProfile';
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
@@ -237,14 +239,21 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     // hard-fail red_flag_event's c_urgent_needs_template — but the resolution
     // is now by (severity, jurisdiction, language) rather than by an FK the
     // real schema does not have.
+    // RF4: same prepare hook as the primary resolution in redFlagEngine, so a
+    // floor raise cannot land on a template whose slots do not fill. Without
+    // it this path would be the one place a placeholder could still reach a
+    // user — and it is the path that only runs when a session has already been
+    // escalated, which is the worst place to leave a gap.
     const floorSelection = await resolveTemplateForSeverity(
       flooredSeverity,
       ctx.statedCountry ?? ctx.dataRegion,
       ctx.language ?? 'en',
+      undefined,
+      makePrepareTemplate(ctx, ctx.language ?? 'en', resolveEmergencyNumber),
     ).catch(() => null);
     redFlag.templateId = floorSelection?.template.id ?? null;
     redFlag.templateVersion = floorSelection?.template.version ?? null;
-    redFlag.templateBody = floorSelection?.template.body ?? null;
+    redFlag.templateBody = floorSelection?.renderedText ?? floorSelection?.template.body ?? null;
     redFlag.triggerDetail = { ...redFlag.triggerDetail, sessionFloorApplied: true, sessionFloorSeverity: flooredSeverity };
     redFlag.severity = flooredSeverity;
   }

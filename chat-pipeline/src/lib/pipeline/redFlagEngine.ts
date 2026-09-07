@@ -5,7 +5,8 @@ import { MODELS } from '../pricing';
 import { loadPrompt } from '../prompts/registry';
 import { subjectPseudonym, sessionPseudonym } from '../pseudonymize';
 import type { PipelineContext, RedFlagResult, RedFlagSeverity } from '../types';
-import { buildUnavailability, type ServiceUnavailability } from './unavailability';
+import { buildUnavailability, resolveEmergencyNumber, type ServiceUnavailability } from './unavailability';
+import { makePrepareTemplate } from './templateSlots';
 import { parseRulePattern, matchPattern, MalformedRulePatternError, type PatternInput } from './rulePattern';
 import { resolveTemplateForSeverity, NoApprovedTemplateError } from './templateResolution';
 import { SEVERITY_ORDER } from '../types';
@@ -268,13 +269,26 @@ export async function scanRedFlags(ctx: PipelineContext): Promise<RedFlagResult>
   let templateVersion: number | null = null;
   let templateBody: string | null = null;
   let templateFallbackReason: string | null = null;
+  let templateSlotDetail: unknown = null;
   try {
-    const selection = await resolveTemplateForSeverity(applied, jurisdiction, language);
+    // RF4: the ladder now also fills §4.3.2's declared slots, and treats a
+    // template whose slots cannot be filled as unavailable — climbing past it
+    // exactly as it climbs past a machine-translated row. `templateBody` is
+    // the RENDERED text from here on; nothing downstream should ever see the
+    // raw body with placeholders in it.
+    const selection = await resolveTemplateForSeverity(
+      applied,
+      jurisdiction,
+      language,
+      undefined,
+      makePrepareTemplate(ctx, language, resolveEmergencyNumber),
+    );
     if (selection) {
       templateId = selection.template.id;
       templateVersion = selection.template.version;
-      templateBody = selection.template.body;
+      templateBody = selection.renderedText ?? selection.template.body;
       templateFallbackReason = selection.fallbackReason;
+      templateSlotDetail = selection.renderedDetail;
     }
   } catch (err) {
     // §4.0.9: a severity that requires a template, with no approved template
@@ -308,6 +322,10 @@ export async function scanRedFlags(ctx: PipelineContext): Promise<RedFlagResult>
       matchedRuleIds: base.matched.map((m) => m.row.id),
       matches: base.matched.map((m) => ({ ruleId: m.row.id, severity: m.row.severity, detail: m.detail })),
       ...(templateFallbackReason ? { templateFallbackReason } : {}),
+      // RF4 / §3.12.1: which maintained row produced any routing detail the
+      // person was told to act on. An audit that cannot name the source row
+      // cannot demonstrate the sentence was not generated.
+      ...(templateSlotDetail ? { templateSlots: templateSlotDetail } : {}),
     },
     proposedSeverityByModel: proposed,
     templateId,
