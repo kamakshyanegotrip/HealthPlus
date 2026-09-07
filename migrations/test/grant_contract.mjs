@@ -262,6 +262,58 @@ const RULES = [
        WHERE grantee = 'PUBLIC'
          AND table_schema NOT IN ('pg_catalog','information_schema')`,
   },
+  {
+    id: 'I-pseudonym-readable-unbounded',
+    title: 'A role that can read a table of pseudonyms reads it through a row boundary',
+    why:
+      'Rules A–H all start from a GRANT and ask whether it can be EXERCISED. None asks ' +
+      'the opposite question — whether a grant that works has any row boundary behind ' +
+      'it — and a table with RLS switched off produces no finding anywhere, because ' +
+      'there is no policy to be missing. Rule B covers grant + RLS on + no policy; this ' +
+      'covers grant + RLS off, and together they close the grid. ' +
+      'That gap is how SEC-1 sat here since migration 012: safety.session_severity_floor ' +
+      'holds a per-session §4.0.8 safety floor, is derived from the region-scoped ' +
+      'red_flag_event, and had no data_region, no RLS and no policy — so an IN-region ' +
+      'role could read, raise and clear an EU session\'s floor. All three proven by ' +
+      'execution, and all three fixed in migration 032. ' +
+      'A pseudonym is a person. HP-ADR-004 §2 / ADR-003 §2.1 say a region cannot see ' +
+      'another region\'s people. A policy whose USING is literally `true` counts as no ' +
+      'boundary, because it is one — safety.red_flag_rule and emergency_facility_reference ' +
+      'are reference data and correctly have such policies, but they hold no pseudonym ' +
+      'and so never reach this rule. ' +
+      'A table nothing can read is NOT reported: an absent grant is a boundary too, and ' +
+      'the moment a grant appears this rule fires.',
+    sql: `
+      WITH holds_pseudonym AS (
+        SELECT c.oid, n.nspname, c.relname, c.relrowsecurity
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+         WHERE c.relkind = 'r'
+           AND n.nspname IN ('safety','obs','principal','evidence','domain','public')
+           AND a.attname IN ('subject_pseudonym','session_pseudonym','subject_id','subject_ref')
+         GROUP BY c.oid, n.nspname, c.relname, c.relrowsecurity
+      ), readers AS (
+        SELECT DISTINCT grantee, table_schema, table_name
+          FROM information_schema.role_table_grants
+         WHERE grantee IN ${APP_ROLES} AND privilege_type = 'SELECT'
+      )
+      SELECT r.grantee AS role,
+             t.nspname||'.'||t.relname AS object,
+             CASE WHEN NOT t.relrowsecurity
+                  THEN 'can SELECT; RLS is off, so every row is visible'
+                  ELSE 'can SELECT through a policy whose USING is true' END AS detail
+        FROM holds_pseudonym t
+        JOIN readers r ON r.table_schema = t.nspname AND r.table_name = t.relname
+       WHERE NOT t.relrowsecurity
+          OR EXISTS (
+               SELECT 1 FROM pg_policy p
+                WHERE p.polrelid = t.oid
+                  AND p.polpermissive
+                  AND p.polcmd IN ('r','*')
+                  AND pg_get_expr(p.polqual, p.polrelid) = 'true'
+                  AND (p.polroles = '{0}' OR r.grantee::regrole::oid = ANY(p.polroles)))`,
+  },
 ];
 
 const key = (ruleId, r) => `${ruleId}|${r.role}|${r.object}|${r.detail}`;

@@ -119,7 +119,9 @@ Stub: `(code, name)`. Real: `(code, legal_basis, primary_regime, active_from, ac
 
 ## C. Confirmed correct
 
-`claim_policy`, `fabrication_block`, `response_audit_event`, `response_category_state`, `response_content` and `session_severity_floor` match the real migrations column-for-column. The `response_audit_event` hash chain — the C-30 correction from HP-RB-001 — is faithful, which is the single most important thing on this list to have got right.
+`claim_policy`, `fabrication_block`, `response_audit_event`, `response_category_state`, `response_content` and `session_severity_floor` match the real migrations column-for-column.
+
+**One deliberate divergence, added by SEC-1 / migration 032.** `session_severity_floor` still matches column-for-column — the stub gained `data_region` and the composite FK `c_floor_region_is_its_event_region` at the same time the real schema did, because this table is written on every flagged message and a double that cannot accept the real write is not a double. What the stub does NOT mirror is the ROW-LEVEL SECURITY migration 032 puts on that table. That is on purpose: this stub's callers are claims-less (`db().query()`, no per-request GUC), which is exactly the configuration HP-SEC-001 v4.2 found breaks all three of them, and the stub is a test double for the pipeline's own tests, not the security boundary. The boundary is verified against the real schema by `migrations/test/sec1_region_context.sh`, whose section 5 connects through the real exported `db()`. The `response_audit_event` hash chain — the C-30 correction from HP-RB-001 — is faithful, which is the single most important thing on this list to have got right.
 
 `red_flag_log` and `emergency_facility_reference` (added by migration 027) differ only in the stub dropping `ai_call_id`, the two floor columns, and the geo/source columns — deliberate, since the stub has no `obs.ai_call` FK target for some of them.
 

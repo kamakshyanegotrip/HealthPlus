@@ -1,5 +1,5 @@
 {
-  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run: rules A, B and H are now clean. The four that remain are one decision, not four bugs.",
+  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run: rules A, B and H are clean. Migration 032 closed the one rule-I finding that was a live boundary defect (safety.session_severity_floor). The four C entries are one decision, not four bugs. The three I entries are one question, not three bugs: HP-ADR-004 §2 seeds exactly one region, so none of them can leak today; each becomes a real boundary the day a second region is added under Migration Pack §2.2, which is the moment they must be settled and the last cheap moment to do it.",
   "entries": [
     {
       "key": "C-role-reachable|alert_role|(role)|NOLOGIN and no members",
@@ -7,8 +7,8 @@
       "role": "alert_role",
       "object": "(role)",
       "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise \u2014 see HP-JOB-007 \u00a75. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn \u2014 the connection-model decision. HP-JOB-007 \u00a75. Yours, not engineering's."
+      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
+      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
     },
     {
       "key": "C-role-reachable|confirmation_ui_role|(role)|NOLOGIN and no members",
@@ -16,8 +16,8 @@
       "role": "confirmation_ui_role",
       "object": "(role)",
       "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise \u2014 see HP-JOB-007 \u00a75. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn \u2014 the connection-model decision. HP-JOB-007 \u00a75. Yours, not engineering's."
+      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
+      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
     },
     {
       "key": "C-role-reachable|metrics_role|(role)|NOLOGIN and no members",
@@ -25,8 +25,8 @@
       "role": "metrics_role",
       "object": "(role)",
       "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise \u2014 see HP-JOB-007 \u00a75. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn \u2014 the connection-model decision. HP-JOB-007 \u00a75. Yours, not engineering's."
+      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
+      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
     },
     {
       "key": "C-role-reachable|redflag_role|(role)|NOLOGIN and no members",
@@ -34,8 +34,35 @@
       "role": "redflag_role",
       "object": "(role)",
       "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise \u2014 see HP-JOB-007 \u00a75. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn \u2014 the connection-model decision. HP-JOB-007 \u00a75. Yours, not engineering's."
+      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
+      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
+    },
+    {
+      "key": "I-pseudonym-readable-unbounded|metrics_role|obs.response_audit|can SELECT; RLS is off, so every row is visible",
+      "rule": "I-pseudonym-readable-unbounded",
+      "role": "metrics_role",
+      "object": "obs.response_audit",
+      "detail": "can SELECT; RLS is off, so every row is visible",
+      "why": "obs.response_audit has no data_region column, so there is nothing for a policy to bound on. HP-ADR-004 §2 seeds exactly one region ('IN'; 'DE' is deliberately not seeded), so today this table cannot hold a row from a region metrics_role should not see — the boundary is the deployment, not the schema. That stops being true the day a second region is added, and adding the column later is more expensive than adding it now, which is why this is an item rather than a shrug.",
+      "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
+    },
+    {
+      "key": "I-pseudonym-readable-unbounded|hp_app|public.response_audit_event|can SELECT; RLS is off, so every row is visible",
+      "rule": "I-pseudonym-readable-unbounded",
+      "role": "hp_app",
+      "object": "public.response_audit_event",
+      "detail": "can SELECT; RLS is off, so every row is visible",
+      "why": "public.response_audit_event has no data_region column, for the same reason as obs.response_audit and one more: it is HP-RB-001's hash-chained immutable audit log, so adding a column changes what every row_hash covers. That is a migration with a chain rewrite in it, not a column addition, and it does not belong inside SEC-1. Immutability and the narrow grants (INSERT/SELECT only, no UPDATE/DELETE/TRUNCATE, plus forbid_mutation()) are real controls and are unaffected — what is missing is a REGION boundary, not a write boundary.",
+      "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
+    },
+    {
+      "key": "I-pseudonym-readable-unbounded|hp_reader|public.response_audit_event|can SELECT; RLS is off, so every row is visible",
+      "rule": "I-pseudonym-readable-unbounded",
+      "role": "hp_reader",
+      "object": "public.response_audit_event",
+      "detail": "can SELECT; RLS is off, so every row is visible",
+      "why": "public.response_audit_event has no data_region column, for the same reason as obs.response_audit and one more: it is HP-RB-001's hash-chained immutable audit log, so adding a column changes what every row_hash covers. That is a migration with a chain rewrite in it, not a column addition, and it does not belong inside SEC-1. Immutability and the narrow grants (INSERT/SELECT only, no UPDATE/DELETE/TRUNCATE, plus forbid_mutation()) are real controls and are unaffected — what is missing is a REGION boundary, not a write boundary.",
+      "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
     }
   ]
 }

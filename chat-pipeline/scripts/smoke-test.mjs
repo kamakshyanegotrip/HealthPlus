@@ -27,6 +27,12 @@ const USER_ID_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 const HOSPITAL_PUBLISHED = 'cccccccc-1111-1111-1111-111111111111';
 const HOSPITAL_DRAFT = 'cccccccc-2222-2222-2222-222222222222';
 const AUDIT_ID = '99999999-9999-9999-9999-999999999999';
+// SEC-1 / migration 032: session_severity_floor now carries data_region, and a
+// COMPOSITE FK makes a floor whose region differs from its setting event's
+// impossible. Every floor upsert below therefore has to name the same region
+// the red_flag_event it points at was written with, which is 'IN' throughout
+// this file (HP-ADR-004 §2 seeds exactly one region).
+const DATA_REGION = 'IN';
 let failures = 0;
 
 async function check(name, fn) {
@@ -640,14 +646,14 @@ async function main() {
   await check('redFlagEngine: session_severity_floor upsert (raise) mirrors recordRedFlagEvent\'s own logic', async () => {
     await pool.query(
       `INSERT INTO safety.session_severity_floor
-         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by)
-       VALUES ($1, $2, $3, now(), NULL, NULL)
+         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by, data_region)
+       VALUES ($1, $2, $3, now(), NULL, NULL, $4)
        ON CONFLICT (session_pseudonym) DO UPDATE SET
          floor_severity = EXCLUDED.floor_severity, set_by_event_id = EXCLUDED.set_by_event_id,
-         set_at = now(), cleared_at = NULL, cleared_by = NULL
+         set_at = now(), cleared_at = NULL, cleared_by = NULL, data_region = EXCLUDED.data_region
        WHERE safety.session_severity_floor.cleared_at IS NOT NULL
           OR EXCLUDED.floor_severity > safety.session_severity_floor.floor_severity`,
-      [SESSION_PSEUDO, 'URGENT', firstRedFlagEventId],
+      [SESSION_PSEUDO, 'URGENT', firstRedFlagEventId, DATA_REGION],
     );
     const { rows } = await pool.query(`SELECT floor_severity FROM safety.session_severity_floor WHERE session_pseudonym = $1`, [SESSION_PSEUDO]);
     if (rows.length !== 1 || rows[0].floor_severity !== 'URGENT') throw new Error(`expected floor_severity=URGENT, got ${JSON.stringify(rows)}`);
@@ -657,14 +663,14 @@ async function main() {
   await check('safety.session_severity_floor: a LOWER severity does not lower an active floor (sticky upward)', async () => {
     await pool.query(
       `INSERT INTO safety.session_severity_floor
-         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by)
-       VALUES ($1, $2, $3, now(), NULL, NULL)
+         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by, data_region)
+       VALUES ($1, $2, $3, now(), NULL, NULL, $4)
        ON CONFLICT (session_pseudonym) DO UPDATE SET
          floor_severity = EXCLUDED.floor_severity, set_by_event_id = EXCLUDED.set_by_event_id,
-         set_at = now(), cleared_at = NULL, cleared_by = NULL
+         set_at = now(), cleared_at = NULL, cleared_by = NULL, data_region = EXCLUDED.data_region
        WHERE safety.session_severity_floor.cleared_at IS NOT NULL
           OR EXCLUDED.floor_severity > safety.session_severity_floor.floor_severity`,
-      [SESSION_PSEUDO, 'MONITOR', firstRedFlagEventId],
+      [SESSION_PSEUDO, 'MONITOR', firstRedFlagEventId, DATA_REGION],
     );
     const { rows } = await pool.query(`SELECT floor_severity FROM safety.session_severity_floor WHERE session_pseudonym = $1`, [SESSION_PSEUDO]);
     if (rows[0].floor_severity !== 'URGENT') throw new Error(`expected floor to stay at URGENT, got ${rows[0].floor_severity}`);
@@ -687,14 +693,14 @@ async function main() {
     await pool.query(`UPDATE safety.session_severity_floor SET cleared_at = now(), cleared_by = $2 WHERE session_pseudonym = $1`, [SESSION_PSEUDO, USER_ID]);
     await pool.query(
       `INSERT INTO safety.session_severity_floor
-         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by)
-       VALUES ($1, $2, $3, now(), NULL, NULL)
+         (session_pseudonym, floor_severity, set_by_event_id, set_at, cleared_at, cleared_by, data_region)
+       VALUES ($1, $2, $3, now(), NULL, NULL, $4)
        ON CONFLICT (session_pseudonym) DO UPDATE SET
          floor_severity = EXCLUDED.floor_severity, set_by_event_id = EXCLUDED.set_by_event_id,
-         set_at = now(), cleared_at = NULL, cleared_by = NULL
+         set_at = now(), cleared_at = NULL, cleared_by = NULL, data_region = EXCLUDED.data_region
        WHERE safety.session_severity_floor.cleared_at IS NOT NULL
           OR EXCLUDED.floor_severity > safety.session_severity_floor.floor_severity`,
-      [SESSION_PSEUDO, 'MONITOR', firstRedFlagEventId],
+      [SESSION_PSEUDO, 'MONITOR', firstRedFlagEventId, DATA_REGION],
     );
     const { rows } = await pool.query(`SELECT floor_severity, cleared_at FROM safety.session_severity_floor WHERE session_pseudonym = $1`, [SESSION_PSEUDO]);
     if (rows[0].floor_severity !== 'MONITOR' || rows[0].cleared_at !== null) throw new Error(`expected a fresh MONITOR floor, got ${JSON.stringify(rows[0])}`);
