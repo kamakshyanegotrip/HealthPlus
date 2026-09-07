@@ -443,6 +443,11 @@ CREATE TABLE safety.red_flag_event (
   -- §4.0.2: MONITOR is the floor for persistence.
   FOREIGN KEY (rule_id, rule_version)         REFERENCES safety.red_flag_rule(id, version),
   FOREIGN KEY (template_id, template_version) REFERENCES safety.safety_template(id, version),
+  -- SEC-1: redundant against the primary key on (id) alone, and that is the
+  -- point - it gives session_severity_floor's composite FK something to
+  -- reference, which is what makes that table's denormalised data_region
+  -- provably equal to this row's rather than equal by convention.
+  CONSTRAINT u_rfe_id_region UNIQUE (id, data_region),
   CONSTRAINT c_event_at_least_monitor CHECK (severity >= 'MONITOR'),
   -- §4.1: at URGENT and above a pre-approved template is the only permitted output.
   CONSTRAINT c_urgent_needs_template CHECK (severity < 'URGENT' OR template_id IS NOT NULL),
@@ -474,6 +479,22 @@ GRANT SELECT, INSERT ON safety.red_flag_event TO hp_app, hp_reader;
 -- `clearSessionSeverityFloor` exists and is tested but not called from
 -- anywhere yet — there is no clinician-facing review tool in this repo for
 -- it to be wired to; see README "What's still a documented placeholder".
+--
+-- SEC-1 / migration 032: `data_region` and the COMPOSITE FK below are not a
+-- stub invention - they mirror what the shipping schema now enforces, and
+-- they are here because this table is written on every flagged message and a
+-- double that cannot accept the real write is not a double. Executing against
+-- the real schema found that this table had no region at all: an IN-region
+-- role could read, raise and clear an EU session's §4.0.8 floor. The
+-- composite FK makes a floor whose region differs from its setting event's
+-- impossible rather than merely unexpected.
+--
+-- STAND-IN difference, stated rather than silently absent: migration 032 also
+-- puts ROW-LEVEL SECURITY on this table. That is deliberately NOT mirrored
+-- here. This stub's callers are claims-less (`db().query()`, no per-request
+-- GUC), which is exactly the configuration HP-SEC-001 v4.2 found breaks all
+-- three of them, and the stub is a test double for the pipeline's own tests,
+-- not the security boundary. Migration 032 is the one that ships.
 CREATE TABLE safety.session_severity_floor (
   session_pseudonym bytea PRIMARY KEY,
   floor_severity     red_flag_severity NOT NULL,
@@ -481,7 +502,11 @@ CREATE TABLE safety.session_severity_floor (
   set_at             timestamptz NOT NULL,
   cleared_at         timestamptz,
   cleared_by         uuid, -- STAND-IN: no principal.clinician table in this stub
-  CONSTRAINT c_clear_attributed CHECK (cleared_at IS NULL OR cleared_by IS NOT NULL)
+  data_region        char(2) NOT NULL REFERENCES public.region_registry(code),
+  CONSTRAINT c_clear_attributed CHECK (cleared_at IS NULL OR cleared_by IS NOT NULL),
+  CONSTRAINT c_floor_region_is_its_event_region
+    FOREIGN KEY (set_by_event_id, data_region)
+    REFERENCES safety.red_flag_event (id, data_region)
 );
 
 GRANT SELECT, INSERT, UPDATE ON safety.session_severity_floor TO hp_app;
