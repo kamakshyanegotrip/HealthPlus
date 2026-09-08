@@ -270,6 +270,43 @@ const RULES = [
          AND NOT has_schema_privilege(g.grantee, g.routine_schema, 'USAGE')`,
   },
   {
+    id: 'L-definer-not-public',
+    title: 'No SECURITY DEFINER function grants EXECUTE to PUBLIC',
+    why:
+      'Rule K asks whether an EXECUTE grant can be REACHED. This asks the opposite and ' +
+      'more dangerous question: whether a function that named a role is in fact callable ' +
+      'by every role. A function\'s DEFAULT ACL is EXECUTE TO PUBLIC, so a migration that ' +
+      'writes GRANT EXECUTE TO reasoner_role without the REVOKE FROM PUBLIC that must ' +
+      'precede it has NARROWED NOTHING — it reads as a restriction and is an addition. ' +
+      'Eleven functions were in that state when this rule was written, nine of them with ' +
+      'an explicit ACL that still carried the PUBLIC entry beside the role somebody meant ' +
+      'to name. ' +
+      'A SECURITY DEFINER function runs as its owner, so this is not a small over-grant: ' +
+      'it hands every role the owner\'s reach through that function. It sat latent because ' +
+      'PUBLIC EXECUTE on a function in `principal` does nothing to a role without USAGE on ' +
+      '`principal` — rule K from the other side — and migrations 037 and 039 then granted ' +
+      'exactly that USAGE to dqe_role and hp_app for unrelated, correct reasons. ' +
+      'What it allowed, proven by execution against 001-039 and not by reading: ' +
+      '`SET SESSION AUTHORIZATION dqe_role; SELECT principal.erase_subject(...)` ran, and ' +
+      'irreversibly crypto-shredded a data subject. The ingestion job\'s role could erase ' +
+      'any person in the database. Migration 040 is the cleanup; this rule is the fix. ' +
+      'TRIGGER FUNCTIONS ARE INCLUDED, though their PUBLIC grant is inert — both checked ' +
+      'against a running database: a trigger function cannot be called directly at all ' +
+      '("trigger functions can only be called as triggers"), and revoking PUBLIC does not ' +
+      'stop it firing for a non-owner. Including them costs nothing and makes the ' +
+      'invariant exceptionless, and a rule with a carve-out is a rule nobody applies.',
+    sql: `
+      SELECT 'PUBLIC'::text AS role,
+             n.nspname||'.'||p.proname AS object,
+             'SECURITY DEFINER, EXECUTE held by PUBLIC (runs as '||
+               pg_get_userbyid(p.proowner)||')' AS detail
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE p.prosecdef
+         AND n.nspname NOT IN ('pg_catalog','information_schema')
+         AND has_function_privilege('public', p.oid, 'EXECUTE')`,
+  },
+  {
     id: 'G-public-holds-nothing',
     title: 'PUBLIC holds no table privilege in any application schema',
     why:
@@ -356,6 +393,34 @@ async function main() {
     console.error('\nThis check reads pg_policy, pg_roles and information_schema against a live');
     console.error('schema; it cannot run without one. Point DATABASE_URL or PGHOST/PGUSER/PGDATABASE');
     console.error('at a database with migrations applied.');
+    process.exit(1);
+  }
+
+  // INSTRUMENT SELF-CHECK, and it is here because this gate just failed it.
+  //
+  // The preflight above proves a database ANSWERS. It does not prove the
+  // database has a schema, and every rule in this file is a query that returns
+  // zero rows against an empty one — so an empty database produces eleven
+  // `clean` lines and the words GRANT CONTRACT OK. That is not a hypothetical:
+  // running this against a database whose migration run had silently failed
+  // printed exactly that, and only the baseline-orphan check (four entries "no
+  // longer violating") gave the game away. A check that passes hardest when it
+  // is not really running is the failure mode CI-3 had and role_contract.mjs
+  // already carries a self-check for; this is grant_contract's.
+  //
+  // The threshold is deliberately low and structural rather than a count that
+  // has to be maintained: `principal.subject_key` exists from the first
+  // migration, and SECURITY DEFINER functions are what rules K and L are about.
+  const { rows: [health] } = await client.query(`
+    SELECT to_regclass('principal.subject_key') IS NOT NULL AS has_core,
+           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog','information_schema')) AS definers`);
+  if (!health.has_core || Number(health.definers) === 0) {
+    console.error('The database is reachable but does not look migrated.');
+    console.error(`  principal.subject_key present: ${health.has_core}`);
+    console.error(`  SECURITY DEFINER functions:    ${health.definers}`);
+    console.error('\nEvery rule below returns zero rows against an empty schema, so running');
+    console.error('anyway would report a perfectly clean grant model. Apply the migrations first.');
     process.exit(1);
   }
 

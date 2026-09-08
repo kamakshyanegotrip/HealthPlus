@@ -235,10 +235,28 @@ async function processAlert(client, alert) {
 // answer for. When an escalation path exists it hangs off this function.
 // ---------------------------------------------------------------------------
 async function reportBreaches(client) {
+  // SCOPED TO THIS WORKER'S REGION, and that is a fix rather than a filter.
+  //
+  // safety.v_alert_sla_breach is not region-scoped, this query did not scope it
+  // either, and the worker runs as an owner or a role RLS does not constrain —
+  // so a worker deployed for IN reported, and EXIT-CODED on, breaches belonging
+  // to every other region. Migration 035 made claim_alert_batch region-scoped;
+  // this half was left global, so the worker paged on alerts it cannot claim,
+  // cannot deliver and is not responsible for, and would have stayed at exit 2
+  // until somebody else's operator fixed somebody else's alert.
+  //
+  // It is also a region-boundary leak of the kind SEC-1 exists to prevent: the
+  // IN operator's log carried EU alert ids and event ids.
+  //
+  // Found by running the RF6 gate after the other gates for the first time —
+  // they leave alerts in other regions, the worker counted them, and run 2
+  // failed with "worker exited 2 with a working channel". The gate was right.
   const { rows } = await client.query(
     `SELECT id, event_id, severity, breach_kind, raised_at
        FROM safety.v_alert_sla_breach
+      WHERE data_region = $1
       ORDER BY severity DESC, raised_at ASC`,
+    [DATA_REGION],
   );
   for (const b of rows) {
     console.error(
