@@ -116,11 +116,35 @@ jobs:
       #
       # If (2) ever stops stamping, RF6 has traded a false positive for a false
       # negative and a real page would go unrecorded.
+      # DATA_REGION is now required by the alert worker itself, not just by the
+      # app: migration 035's claim is region-scoped and REFUSES to run without
+      # it rather than draining an empty batch, so a worker started without a
+      # region fails loudly instead of reporting healthy silence on the §4.1
+      # path. Same contract src/lib/db.ts has had since SEC-1.
       - name: "RF6 - clinician alert delivery, both outcomes (worker + schema)"
+        env:
+          DATA_REGION: IN
         run: |
           set -euo pipefail
           npm --prefix chat-pipeline install pg --no-save --silent
           bash migrations/test/rf6_alert_delivery.sh
+
+      # RF6-claim. R13-roleci found, on its first run, that the alert worker's
+      # batch claim could never have executed: `SELECT ... FOR UPDATE` is a write
+      # lock and needs UPDATE, which alert_role deliberately does not hold. No
+      # §4.1 CRITICAL/EMERGENCY alert was ever deliverable. RF6's own gate above
+      # connects as the owner, which is exactly why it passed for four months.
+      #
+      # Migration 035 moves the claim into a SECURITY DEFINER function. That fix
+      # carries its own trap — a DEFINER function runs as the table's owner, and
+      # safety.clinician_alert is not FORCE ROW LEVEL SECURITY, so its
+      # region-scoping policy does NOT apply inside it. Section 3 of this gate
+      # seeds a second region and asserts it is not returned; without the
+      # explicit predicate in 035 the worker would silently reach every region.
+      - name: "RF6-claim - the worker can claim a batch, in its own region only"
+        run: |
+          set -euo pipefail
+          bash migrations/test/rf6_claim.sh
 
       # J3-4. The six §6.5 safety metrics, computed against the real schema.
       # Two runs' worth of assertions in one script:

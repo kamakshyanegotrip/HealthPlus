@@ -58,7 +58,15 @@ DECLARE
   ms int[] := ARRAY[100, 200, 900];
   hrs int[] := ARRAY[1, 2, 6];
 BEGIN
-  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  -- NOT `LIMIT 1` off an unordered scan, which is what this said until RF6-claim.
+  -- region_registry also holds 'ZZ' — migration 019's sentinel for reference data
+  -- with NO DATA SUBJECT — and physical order returned it first, so every run of
+  -- this gate had been seeding its safety events into a region that by
+  -- definition holds no subject. Nothing noticed while nothing filtered by
+  -- region; migration 035's region-scoped claim made it visible immediately.
+  -- Same predicate migration 034 §3 uses to find the admitted region.
+  SELECT code INTO v_region FROM public.region_registry
+   WHERE code <> 'ZZ' AND active_to IS NULL ORDER BY active_from LIMIT 1;
   SELECT code INTO v_domain FROM safety.clinical_domain LIMIT 1;
 
   INSERT INTO principal.app_user (id, auth_subject, data_region)
@@ -167,7 +175,15 @@ END $$;
 DO $$
 DECLARE v_region char(2); v_quiet timestamptz := date_trunc('day', now()) - interval '2 days'; i int;
 BEGIN
-  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  -- NOT `LIMIT 1` off an unordered scan, which is what this said until RF6-claim.
+  -- region_registry also holds 'ZZ' — migration 019's sentinel for reference data
+  -- with NO DATA SUBJECT — and physical order returned it first, so every run of
+  -- this gate had been seeding its safety events into a region that by
+  -- definition holds no subject. Nothing noticed while nothing filtered by
+  -- region; migration 035's region-scoped claim made it visible immediately.
+  -- Same predicate migration 034 §3 uses to find the admitted region.
+  SELECT code INTO v_region FROM public.region_registry
+   WHERE code <> 'ZZ' AND active_to IS NULL ORDER BY active_from LIMIT 1;
   FOR i IN 1..5 LOOP
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,

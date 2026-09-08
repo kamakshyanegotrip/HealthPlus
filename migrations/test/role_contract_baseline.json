@@ -115,14 +115,6 @@
       "item": "R10-role-routing, with the cutover"
     },
     {
-      "id": "53c7e7b4f9bd",
-      "file": "chat-pipeline/worker/alert-worker.mjs",
-      "role": "alert_role",
-      "error": "permission denied for table clinician_alert",
-      "why": "SHIPPED DEFECT, not a porting gap. alert_role holds SELECT on safety.clinician_alert and no UPDATE — deliberately: its state changes go through the SECURITY DEFINER functions mark_alert_delivered / mark_alert_undeliverable / acknowledge_alert. But the batch-claim query is `SELECT ... FOR UPDATE SKIP LOCKED`, and FOR UPDATE requires UPDATE. So the worker's FIRST query fails on every poll and no §4.1 CRITICAL/EMERGENCY alert is ever delivered. RF6's own gate connects as the owner, which is why it passed. The fix follows the schema's idiom rather than granting UPDATE: a DEFINER safety.claim_alert_batch(...).",
-      "item": "RF6-claim — new, and it should jump the queue: this is a live safety-path outage"
-    },
-    {
       "id": "b70657b765ee",
       "file": "chat-pipeline/worker/side-effect-worker.mjs",
       "role": "hp_app",

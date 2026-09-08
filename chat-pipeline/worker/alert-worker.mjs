@@ -59,6 +59,7 @@
 // Env: DATABASE_URL (connects as alert_role's login user — see migration 029
 // §10; this role deliberately cannot write red_flag_event's notification
 // columns except through safety.mark_alert_delivered).
+//   DATA_REGION             required, two uppercase letters — see the pool below
 //   ALERT_POLL_INTERVAL_MS  default 5000
 //   ALERT_BATCH_SIZE        default 20
 // ============================================================================
@@ -70,11 +71,34 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
+// SEC-1 / RF6-claim. Every alert this worker touches is region-scoped, and
+// safety.claim_alert_batch refuses to run without app.data_region rather than
+// returning an empty batch — because an empty batch on the §4.1 path is
+// indistinguishable from a quiet night.
+//
+// Migration 034 §3 sets a per-role default for alert_role in this database, so
+// a connection that really is alert_role already arrives with a region. That is
+// the braces; this is the belt. A per-role default does not follow a member
+// role, a pooler login, or any deployment that connects as something else, and
+// the failure would then be an outage rather than a config error.
+//
+// Sent in the startup packet, exactly as chat-pipeline/src/lib/db.ts does it:
+// no round trip, and no window in which a connection exists without a region.
+const DATA_REGION = process.env.DATA_REGION;
+if (!/^[A-Z]{2}$/.test(DATA_REGION ?? '')) {
+  console.error(`alert-worker: DATA_REGION must be two uppercase letters, got ${JSON.stringify(DATA_REGION)} — refusing to start.`);
+  process.exit(1);
+}
+
 const POLL_INTERVAL_MS = Number(process.env.ALERT_POLL_INTERVAL_MS ?? 5000);
 const BATCH_SIZE = Number(process.env.ALERT_BATCH_SIZE ?? 20);
 const RUN_ONCE = process.argv.includes('--once');
 
-const pool = new pg.Pool({ connectionString: DATABASE_URL, max: 4 });
+const pool = new pg.Pool({
+  connectionString: DATABASE_URL,
+  max: 4,
+  options: `-c app.data_region=${DATA_REGION}`,
+});
 
 let shuttingDown = false;
 for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -122,16 +146,25 @@ async function loadChannels() {
 }
 
 async function claimBatch(client) {
-  // FOR UPDATE SKIP LOCKED so multiple worker instances never process the same
-  // alert — the same pattern side-effect-worker uses, and the reason
-  // HP-ADR-001 §3.2 chose Postgres-backed queueing.
+  // RF6-claim / migration 035. This used to issue the SELECT ... FOR UPDATE
+  // SKIP LOCKED inline, and it could never have run: `FOR UPDATE` is a write
+  // lock and needs UPDATE privilege, which alert_role deliberately does not
+  // hold — every state transition it may make goes through 029's DEFINER
+  // functions. So the worker's FIRST query failed on every poll and no §4.1
+  // alert was ever delivered. RF6's own CI gate connects as the owner, which is
+  // why it passed; R13-roleci, which probes as the real role, found it.
+  //
+  // safety.claim_alert_batch is SECURITY DEFINER and runs in THIS transaction,
+  // so FOR UPDATE SKIP LOCKED still means what it meant: the locks are held
+  // until the COMMIT below, and a second worker instance skips them. That is
+  // asserted across two real connections by migrations/test/rf6_claim.sh §5.
+  //
+  // It also re-states the region predicate internally, because a DEFINER
+  // function runs as the table's owner and RLS is not FORCEd — the policy that
+  // scopes this role to its own region does not apply inside it.
   const { rows } = await client.query(
     `SELECT id, event_id, severity, data_region, raised_at, notify_deadline, ack_deadline
-       FROM safety.clinician_alert
-      WHERE state = 'PENDING'
-      ORDER BY severity DESC, raised_at ASC
-      LIMIT $1
-        FOR UPDATE SKIP LOCKED`,
+       FROM safety.claim_alert_batch($1)`,
     [BATCH_SIZE],
   );
   return rows;
