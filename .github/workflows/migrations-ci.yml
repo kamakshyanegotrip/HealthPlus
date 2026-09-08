@@ -255,6 +255,24 @@ jobs:
       # clean and stay that way: append-only tables grant no UPDATE/DELETE,
       # reference data grants no writes, nothing holds DELETE, PUBLIC holds
       # nothing. Like CI-3 the baseline can only shrink.
+      # C-30, finished. obs.response_audit carried prev_hash/row_hash NOT NULL
+      # from migration 001_003 with NOTHING computing them, so the row was
+      # unwritable by any means HP-RB-001 permits — the runbook forbids the
+      # application to supply a chain value, and no trigger or function supplied
+      # one either. The only thing that had ever written the table was
+      # j34_metrics.sh, passing eight random bytes to get past the constraint.
+      #
+      # Migration 036 drops the two columns: C-30 already decided that the chain
+      # lives in public.response_audit_event and that this table is a mutable,
+      # rebuildable projection. This gate proves BOTH directions, because only
+      # one of them is the point — the projection is writable and unchained, AND
+      # the event log is still chained, still computes its own hashes (a caller
+      # that supplies one is overridden), and is still append-only.
+      - name: "C-30 - the audit projection is writable, the event chain is not weakened"
+        run: |
+          set -euo pipefail
+          bash migrations/test/c30_projection.sh
+
       - name: "R13 - GRANT/RLS contract (grants that cannot be exercised)"
         run: |
           set -euo pipefail
