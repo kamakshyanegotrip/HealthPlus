@@ -121,7 +121,7 @@ jobs:
       # it rather than draining an empty batch, so a worker started without a
       # region fails loudly instead of reporting healthy silence on the §4.1
       # path. Same contract src/lib/db.ts has had since SEC-1.
-      - name: "RF6 - clinician alert delivery, both outcomes (worker + schema)"
+      - name: "RF6 - clinician alert delivery, both outcomes + region-scoped SLA report (worker + schema)"
         env:
           DATA_REGION: IN
         run: |
