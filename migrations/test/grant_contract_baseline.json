@@ -1,42 +1,6 @@
 {
-  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run: rules A, B and H are clean. Migration 032 closed the one rule-I finding that was a live boundary defect (safety.session_severity_floor). The five C entries are one decision, not five bugs — reasoner_role joined at R10c. The three I entries are one question, not three bugs: HP-ADR-004 §2 seeds exactly one region, so none of them can leak today; each becomes a real boundary the day a second region is added under Migration Pack §2.2, which is the moment they must be settled and the last cheap moment to do it.",
+  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run. Migration 032 closed the one rule-I finding that was a live boundary defect. **Migration 034 closed all five rule-C findings: R13-conn was decided on 8 September 2026 as Option 2, one LOGIN role per worker role, so every privilege-holding role is now reachable.** The three I entries that remain are one question, not three bugs: HP-ADR-004 §2 seeds exactly one region, so none of them can leak today; each becomes a real boundary the day a second region is added under Migration Pack §2.2, which is the moment they must be settled and the last cheap moment to do it.",
   "entries": [
-    {
-      "key": "C-role-reachable|alert_role|(role)|NOLOGIN and no members",
-      "rule": "C-role-reachable",
-      "role": "alert_role",
-      "object": "(role)",
-      "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
-    },
-    {
-      "key": "C-role-reachable|confirmation_ui_role|(role)|NOLOGIN and no members",
-      "rule": "C-role-reachable",
-      "role": "confirmation_ui_role",
-      "object": "(role)",
-      "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
-    },
-    {
-      "key": "C-role-reachable|metrics_role|(role)|NOLOGIN and no members",
-      "rule": "C-role-reachable",
-      "role": "metrics_role",
-      "object": "(role)",
-      "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
-    },
-    {
-      "key": "C-role-reachable|redflag_role|(role)|NOLOGIN and no members",
-      "rule": "C-role-reachable",
-      "role": "redflag_role",
-      "object": "(role)",
-      "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly.",
-      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
-    },
     {
       "key": "I-pseudonym-readable-unbounded|metrics_role|obs.response_audit|can SELECT; RLS is off, so every row is visible",
       "rule": "I-pseudonym-readable-unbounded",
@@ -65,13 +29,13 @@
       "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
     },
     {
-      "key": "C-role-reachable|reasoner_role|(role)|NOLOGIN and no members",
+      "key": "C-role-reachable|confirmation_ui_role|(role)|NOLOGIN and no members",
       "rule": "C-role-reachable",
-      "role": "reasoner_role",
+      "role": "confirmation_ui_role",
       "object": "(role)",
       "detail": "NOLOGIN and no members",
-      "why": "NOLOGIN with no members, so nothing can ever assume this role. The grants and policies it holds are correct and now complete (migration 031); what is missing is a way for any process to BE it. Closing this means choosing between three security models with materially different behaviour under compromise — see HP-JOB-007 §5. Note that the cheapest option, GRANT <role> TO hp_app, is a trap in this cluster: hp_app has rolinherit = true and would silently acquire every privilege at all times rather than having to assume the role explicitly. Added by migration 033 (R10c): retrieval runs as reasoner_role, so the fifth role now holds real grants — claim_search, render_citation, confidence_band and SELECT on evidence.tier_label. Nothing changes about the decision; it now covers one more role.",
-      "item": "R13-conn — the connection-model decision. HP-JOB-007 §5. Yours, not engineering's."
+      "why": "NOT R13-conn — that decision is closed. This role is unreachable ON PURPOSE. Its one grant is INSERT on principal.patient_attribute_confirmation, and nothing in the codebase writes that table: the confirmation UI does not exist yet. Migration 034 §1 withholds LOGIN from roles with no caller, the same reasoning that had migration 031 revoke thirty speculative grants — each individually defensible, none with a caller. dqe_role and erasure_role are in the same position but hold no grants, so rule C does not reach them.",
+      "item": "Closes in the migration that builds the confirmation UI (CGP-001 §8.3, the reviewer console). Give it LOGIN there, not before."
     }
   ]
 }

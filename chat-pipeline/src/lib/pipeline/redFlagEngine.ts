@@ -90,7 +90,7 @@ async function matchDeterministicRules(
     // identically in migrations/027 and db/010 — one code path, both schemas.
     // It already applies the §0.6 adoption filter and the supersession/retired
     // rules, so this query does not have to restate them.
-    ({ rows } = await db().query<RedFlagRuleRow>(
+    ({ rows } = await db('redflag').query<RedFlagRuleRow>(
       `SELECT r.id, r.version, r.severity, r.pattern, r.clinically_adopted,
               s.rule_set_id
          FROM safety.adopted_rule_set($1, $2) s
@@ -415,7 +415,7 @@ export async function recordRedFlagEvent(
   const commercialSuppressed = true;
   const sessionPseudo = sessionPseudonym(ctx.sessionId);
 
-  const { rows } = await db().query<{ id: string }>(
+  const { rows } = await db('redflag').query<{ id: string }>(
     `INSERT INTO safety.red_flag_event
        (id, audit_id, subject_pseudonym, session_pseudonym, occurred_at, severity,
         rule_id, rule_version, rule_set_id, trigger_detail, template_id, template_version,
@@ -454,7 +454,7 @@ export async function recordRedFlagEvent(
   // whatever severity it carries, which can be lower than the old cleared
   // value — clearing means "this session is no longer flagged," not "never
   // flag it below X again."
-  await db().query(
+  await db('redflag').query(
     // SEC-1: data_region is written on BOTH branches. The composite FK
     // `c_floor_region_is_its_event_region` (migration 032) makes a floor whose
     // region differs from its setting event's region impossible, so the
@@ -492,7 +492,7 @@ export interface SessionFloor {
  * message in it happens to look ordinary on its own.
  */
 export async function getSessionFloor(ctx: Pick<PipelineContext, 'sessionId'>): Promise<SessionFloor | null> {
-  const { rows } = await db().query<{ floor_severity: RedFlagSeverity; cleared_at: string | null }>(
+  const { rows } = await db('redflag').query<{ floor_severity: RedFlagSeverity; cleared_at: string | null }>(
     `SELECT floor_severity, cleared_at FROM safety.session_severity_floor WHERE session_pseudonym = $1`,
     [sessionPseudonym(ctx.sessionId)],
   );
@@ -522,7 +522,7 @@ export function applySessionFloor(severity: RedFlagSeverity, floor: SessionFloor
  * still enforces that a clearance is never anonymous.
  */
 export async function clearSessionSeverityFloor(sessionId: string, clinicianId: string): Promise<void> {
-  await db().query(
+  await db('redflag').query(
     `UPDATE safety.session_severity_floor
         SET cleared_at = now(), cleared_by = $2
       WHERE session_pseudonym = $1 AND cleared_at IS NULL`,
@@ -618,7 +618,7 @@ export async function recordRedFlagLog(
 ): Promise<void> {
   const firstByteAt = new Date(ctx.receivedAt);
   try {
-    await db().query(
+    await db('redflag').query(
       `INSERT INTO safety.red_flag_log
          (id, event_id, audit_id, subject_pseudonym, session_pseudonym, occurred_at,
           rule_derived_severity, model_proposed_severity, applied_severity,

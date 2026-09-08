@@ -11,80 +11,123 @@ import { Pool, type PoolClient } from 'pg';
  * no health data leaves India at v1, so DATABASE_URL must point at the
  * regional instance and DATA_REGION must agree with it.
  */
-let pool: Pool | null = null;
+/**
+ * R13-conn, decided 8 September 2026: **Option 2 — one LOGIN role per worker
+ * role**, and therefore one POOL per role rather than one connection that
+ * assumes roles.
+ *
+ * The decision that drove it: a pool cannot become another role. `SET LOCAL
+ * ROLE` (Option 1) would have left every privilege reachable from any code in
+ * this process; a separate pool means a SQL-injection reached through the
+ * retrieval path cannot write a §4.0.7 safety event, because `reasoner_role`
+ * holds no grant on `safety.red_flag_event` and no way to acquire one.
+ *
+ * HP-RB-001 §2 still governs: "the application must never connect as owner or
+ * superuser." None of these is.
+ */
+export type DbRole = 'app' | 'redflag' | 'reasoner';
+
+/**
+ * Each role's own connection string, and its pool ceiling.
+ *
+ * `max` is deliberately BELOW the CONNECTION LIMIT migration 034 §1 sets on
+ * each role. The database's limit is the backstop; this is the budget. If they
+ * were equal, a pool at capacity would be indistinguishable from a role
+ * locked out, and the error would arrive at the worst moment.
+ */
+const ROLE_CONFIG: Record<DbRole, { env: string; max: number }> = {
+  app:             { env: 'DATABASE_URL',                  max: 8 },
+  redflag:         { env: 'DATABASE_URL_REDFLAG',          max: 3 },
+  reasoner:        { env: 'DATABASE_URL_REASONER',         max: 5 },
+};
+
+const pools = new Map<DbRole, Pool>();
+/** Which roles fell back to DATABASE_URL. Read by `dbRoleBindings()`. */
+const fellBack = new Set<DbRole>();
 
 export const DATA_REGION = process.env.DATA_REGION ?? 'IN';
 
-/**
- * SEC-1. The GUCs the SHIPPING SCHEMA's row-level security actually reads.
- *
- * Fifteen of the sixteen policies in migrations/ are expressed in terms of
- * `app.current_region()`, `app.current_user_id()` and
- * `app.current_provider_org()`, which read `app.data_region`, `app.user_id`
- * and `app.provider_org_id` respectively. Until this file was changed, the
- * application set none of them: the pool set no GUC at all, and `runAsUser()`
- * set exactly one — `request.jwt.claims` — which no policy in that schema
- * reads. `request.jwt.claims` is the stub's vocabulary (db/020_rls.sql, and
- * the HP-SEC-001 policy files); the real schema speaks `app.*`.
- *
- * The consequence was not a subtle one, and it was confirmed by connecting the
- * way this file connects rather than the way a test finds convenient:
- *
- *     ERROR:  new row violates row-level security policy for table
- *             "red_flag_event"
- *
- * — the §4.0.7 write the pipeline performs on every flagged message, refused,
- * because `data_region = app.current_region()` compared a real value to NULL.
- *
- * `request.jwt.claims` is still set alongside these, unchanged. The stub
- * schema is what runs today; both vocabularies have to be spoken until R10
- * retires one of them, and setting a GUC nothing reads costs nothing.
- */
 const REGION_GUC = 'app.data_region';
 
-export function db(): Pool {
-  if (!pool) {
-    // Validated, not trusted: this value is interpolated into a libpq startup
-    // option string below, and a two-letter check is the whole of what makes
-    // that safe. Thrown at pool construction so a misconfigured deployment
-    // fails at start rather than on the first flagged message.
-    if (!/^[A-Z]{2}$/.test(DATA_REGION)) {
-      throw new Error(`DATA_REGION must be a two-letter region code, got ${JSON.stringify(DATA_REGION)}`);
-    }
-    pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      max: 10,
-      idleTimeoutMillis: 30_000,
-      // Statement timeout protects the request-path red-flag scan and
-      // knowledge lookups from ever queuing behind a slow analytical query —
-      // §4.0.1/§4.0.5 require the safety path to be fast and synchronous.
-      statement_timeout: 5_000,
-      // SEC-1. The region GUC, set in the CONNECTION STARTUP PACKET rather
-      // than by a query afterwards.
-      //
-      // The region is a property of the DEPLOYMENT, not of a request: one
-      // process serves one region (HP-ADR-004 §2 — one region, immutable at
-      // project creation). So it belongs on the connection, not in
-      // runAsUser: taking it from a caller-supplied claim would let a request
-      // name its own region, which is the thing the boundary exists to stop.
-      //
-      // The obvious spelling — `pool.on('connect', c => c.query('SET ...'))`
-      // — was written first and then tested rather than trusted. It does
-      // work, but only because pg queues queries per client so the SET lands
-      // ahead of the first real one; pg emits "Calling client.query() when
-      // the client is already executing a query is deprecated and will be
-      // removed in pg@9.0" while doing it. A safety boundary that holds
-      // because of an internal queue, and is scheduled for removal, is not
-      // one to build on. `options` is set before the connection is usable at
-      // all, so there is no ordering to get wrong.
-      //
-      // NOTE: this overrides any `options` carried in DATABASE_URL's query
-      // string. Nothing sets one today; if something ever does, it has to be
-      // merged here rather than added there.
-      options: `-c ${REGION_GUC}=${DATA_REGION}`,
-    });
+/**
+ * The pool for a role. Defaults to `app`, so every existing call site keeps
+ * the behaviour it had.
+ *
+ * **The fallback is deliberate and it is recorded.** When a role has no
+ * connection string of its own it uses `DATABASE_URL`, because the stub schema
+ * (`chat-pipeline/db/`) grants `hp_app` directly and has no worker roles at
+ * all — the pipeline's own tests must keep running until R10g retires it.
+ *
+ * A silent fallback would be the same species of bug this project keeps
+ * finding, so it is not silent: `dbRoleBindings()` reports it, and a
+ * deployment gate can assert that production configured both. Falling back
+ * is correct against the stub and wrong against the real schema, and the
+ * difference has to be visible rather than inferred.
+ */
+export function db(role: DbRole = 'app'): Pool {
+  const existing = pools.get(role);
+  if (existing) return existing;
+
+  // Validated, not trusted: interpolated into a libpq startup option string
+  // below. Thrown at pool construction so a misconfigured deployment fails at
+  // start rather than on the first flagged message.
+  if (!/^[A-Z]{2}$/.test(DATA_REGION)) {
+    throw new Error(`DATA_REGION must be a two-letter region code, got ${JSON.stringify(DATA_REGION)}`);
   }
+
+  const cfg = ROLE_CONFIG[role];
+  const own = process.env[cfg.env];
+  if (!own && role !== 'app') fellBack.add(role);
+  const connectionString = own ?? process.env.DATABASE_URL;
+
+  const pool = new Pool({
+    connectionString,
+    max: cfg.max,
+    idleTimeoutMillis: 30_000,
+    // Statement timeout protects the request-path red-flag scan and
+    // knowledge lookups from ever queuing behind a slow analytical query —
+    // §4.0.1/§4.0.5 require the safety path to be fast and synchronous.
+    statement_timeout: 5_000,
+    // SEC-1. The region GUC, set in the CONNECTION STARTUP PACKET rather than
+    // by a query afterwards.
+    //
+    // The region is a property of the DEPLOYMENT, not of a request: one
+    // process serves one region (HP-ADR-004 §2). So it belongs on the
+    // connection, not in runAsUser — taking it from a caller-supplied claim
+    // would let a request name its own region, which is the thing the boundary
+    // exists to stop.
+    //
+    // The obvious spelling — `pool.on('connect', c => c.query('SET ...'))` —
+    // was written first and then tested rather than trusted. It works, but
+    // only because pg queues queries per client, and pg says that pattern is
+    // removed in pg@9.0. A safety boundary that holds because of an internal
+    // queue is not one to build on. `options` lands before the connection is
+    // usable at all, so there is no ordering to get wrong.
+    //
+    // EVERY pool needs this, not just the first. Migration 034 §3 also sets a
+    // per-role database default as braces — five pools is five chances to
+    // forget, and forgetting does not fail loudly: `data_region = NULL` is
+    // never true, so the pool would silently see zero rows.
+    //
+    // NOTE: this overrides any `options` carried in the connection string.
+    options: `-c ${REGION_GUC}=${DATA_REGION}`,
+  });
+
+  pools.set(role, pool);
   return pool;
+}
+
+/**
+ * Which roles have their own connection string and which fell back.
+ *
+ * Exists so a deployment check can assert the real thing rather than trusting
+ * that four secrets were set. Reports only roles whose pool has actually been
+ * constructed — a role nothing has used yet has bound to nothing.
+ */
+export function dbRoleBindings(): { role: DbRole; separate: boolean }[] {
+  return (Object.keys(ROLE_CONFIG) as DbRole[])
+    .filter((r) => pools.has(r))
+    .map((r) => ({ role: r, separate: !fellBack.has(r) }));
 }
 
 /**

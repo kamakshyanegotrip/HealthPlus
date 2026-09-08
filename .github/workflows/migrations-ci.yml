@@ -200,6 +200,23 @@ jobs:
           npm --prefix chat-pipeline install tsx pg --no-save --silent
           bash migrations/test/r10c_retrieval.sh
 
+      # R13-conn, decided 8 September 2026 as Option 2: one LOGIN role per
+      # worker role, one pool per role.
+      #
+      # The argument for Option 2 was a SECURITY CLAIM, so section 2 tests the
+      # claim rather than the tidiness: no role but redflag_role may write a
+      # 4.0.7 safety event. If reasoner_role can, Option 2 bought nothing over
+      # Option 3 and migration 034 is decoration.
+      #
+      # Section 4 covers the class that appeared the moment the roles could log
+      # in: reasoner_role held EXECUTE on claim_search and SELECT on nothing
+      # claim_search reads. R13 rules A and B were both clean - the role HAD
+      # schema USAGE and those tables have no RLS.
+      - name: "R13-conn - roles reachable, isolated, and able to do their own work"
+        run: |
+          set -euo pipefail
+          bash migrations/test/r13_conn_isolation.sh
+
       # R13. The GRANT / RLS contract. R12 audited safety.* only; this is the
       # generalisation, and writing it found the class the earlier two GRANT
       # bugs were instances of: a privilege that CANNOT BE EXERCISED reads

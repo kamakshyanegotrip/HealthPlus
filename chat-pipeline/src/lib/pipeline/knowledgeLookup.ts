@@ -33,7 +33,7 @@ import type { KnowledgeDomain, PipelineContext, ResponseCategory, RetrievedClaim
  * one would have returned zero rows, silently, which is the failure this file
  * already carries a scar from: a real data gap and a wiring bug produce the
  * identical symptom. `claim_search` now RAISES on an unknown entity type, and
- * `migrations/test/r10c_domain_map.sh` asserts this map against the registry
+ * `migrations/test/r10c_retrieval.sh` asserts this map against the registry
  * in CI, so the map cannot drift again without something going red.
  *
  * A domain maps to a SET, not to one table, because the real schema split
@@ -94,7 +94,7 @@ async function lookupDomain(
   // Each drops the row when it yields nothing, and yielding nothing is exactly
   // the case §3.0.3 calls a prohibition: no policy row for this
   // tier×kind×category means not permitted, not "permitted by default".
-  const { rows } = await db().query(
+  const { rows } = await db('reasoner').query(
     `SELECT c.id AS claim_id, c.kind, es.tier,
             c.statement AS text, c.jurisdiction, c.population,
             ag.agg_confidence AS confidence,
