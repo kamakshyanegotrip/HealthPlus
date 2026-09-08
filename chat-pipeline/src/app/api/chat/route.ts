@@ -9,7 +9,7 @@ import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken
 import { resolveTemplateForSeverity } from '@/lib/pipeline/templateResolution';
 import { makePrepareTemplate } from '@/lib/pipeline/templateSlots';
 import { resolveEmergencyNumber } from '@/lib/pipeline/unavailability';
-import { lookupPatientProfile } from '@/lib/pipeline/patientProfile';
+import { lookupPatientProfile, minorGateRequiresReview } from '@/lib/pipeline/patientProfile';
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
 import { beginSynthesis } from '@/lib/pipeline/synthesis';
@@ -383,7 +383,14 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
 
   // §2.4.3 — a minor's Decision Support requires mandatory pre-publication
   // review regardless of §2.2.5b's usual conditions.
-  const minorForcesReview = profile?.isMinor === true;
+  //
+  // Was `profile?.isMinor === true`, which answered "is this definitely a
+  // minor?" when the clause asks "may this be published without review?".
+  // Those differ on exactly the cases where nothing is known: no profile row,
+  // or a row that does not establish age. §3.0.3 resolves an unestablished
+  // fact closed, so both now force review. HP-SR-001 §4; the reasoning and the
+  // two things this deliberately does NOT fix live on the helper.
+  const minorForcesReview = minorGateRequiresReview(profile);
 
   // ---- 5. Knowledge Lookup Layer, parallel, direct SQL, no LLM -------------
   const byDomain = await lookupKnowledge(ctx, intent.requiresKnowledgeDomains, category);

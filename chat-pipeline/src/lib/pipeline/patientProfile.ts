@@ -51,7 +51,51 @@ export async function lookupPatientProfile(ctx: PipelineContext): Promise<Patien
     dataRegion: row.data_region,
     ageBand: row.age_band,
     preferences: row.preferences,
-    isMinor: row.is_minor, // §2.4.3: if true, caller must force mandatory review and keep Category C impossible regardless of §2.3.2
+    // §2.4.3. Preserved as three-valued rather than coerced: `null` here means
+    // the column holds no answer, which `minorGateRequiresReview` treats as
+    // "not established", not as "adult". `?? null` is deliberate — `??` leaves
+    // `false` alone, where `||` would collapse it into the unknown case and
+    // force review on every confirmed adult.
+    isMinor: row.is_minor ?? null,
     statedConditions: row.stated_conditions,
   };
+}
+
+
+/**
+ * §2.4.3's gate, in one named, testable place rather than inline at the call
+ * site — because the interesting cases are the ones a `?.` chain hides.
+ *
+ * Returns true unless minority has been POSITIVELY ESTABLISHED AS FALSE. Three
+ * inputs resolve to "force review":
+ *
+ *   profile === null      no profile row exists, or none is visible under RLS
+ *   isMinor === null      a row exists and does not answer the question
+ *   isMinor === true      the subject is a minor
+ *
+ * This was previously `profile?.isMinor === true` at the call site, which
+ * resolved the first two to "adult" — HP-SR-001 §4. The stub schema agreed with
+ * the code (`is_minor boolean NOT NULL DEFAULT false`), so a patient whose age
+ * nobody had ever established was recorded as not a minor, by default, in the
+ * column itself.
+ *
+ * §3.0.3 is the governing clause: enforcement is structural, and the absence of
+ * an establishing fact is a prohibition rather than a permission. An unknown age
+ * is therefore handled as a minor for review purposes. That is deliberately the
+ * expensive direction — it costs reviewer time (CL8's capacity model), and
+ * reviewer time is the thing §2.4.3 exists to spend.
+ *
+ * WHAT THIS DOES NOT FIX, deliberately, and both are recorded in HP-SR-001:
+ *
+ *  - §2.4.3 is scoped to "the subject of a clinical question"; this still reads
+ *    the AUTHENTICATED USER's own flag, so a parent asking about a child does
+ *    not trigger it (SR-3). Establishing the subject from a message is a
+ *    clinical-lead question, not an engineering one.
+ *  - The Charter scopes this obligation to Decision Support. The caller applies
+ *    it to Informational responses too. That is over-inclusive rather than
+ *    unsafe, and NARROWING a safety gate should be a recorded decision, not a
+ *    side effect of a fix that widens one — so it is left alone here.
+ */
+export function minorGateRequiresReview(profile: PatientProfile | null): boolean {
+  return profile?.isMinor !== false;
 }

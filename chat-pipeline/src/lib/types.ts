@@ -134,7 +134,13 @@ export interface PatientProfile {
   ageBand: string | null;
   statedConditions: Array<{ label: string; provenance: 'stated' | 'inferred' }>; // §3.8.2
   preferences: Record<string, unknown> | null;
-  isMinor: boolean; // §2.4.3 — forces mandatory Decision Support review, blocks Category C absolutely
+  // §2.4.3 — forces mandatory Decision Support review, blocks Category C
+  // absolutely. THREE-VALUED, and the third value is the point: `null` means
+  // minority was never established for this subject, which is NOT the same as
+  // "adult". §3.0.3 makes the absence of an establishing fact a prohibition
+  // rather than a permission, so `null` resolves the gate closed. See
+  // `minorGateRequiresReview` and HP-SR-001 §4.
+  isMinor: boolean | null;
 }
 
 export interface PipelineContext {

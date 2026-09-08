@@ -37,6 +37,10 @@ const RUN = process.env.RUN_PIPELINE_INTEGRATION === '1';
 
 // Seeded in db/999_seed_smoke_test.sql.
 const SEEDED_USER_ID = '11111111-1111-1111-1111-111111111111';
+/** db/999: a patient whose age was never established — `is_minor IS NULL`, not
+ *  false. Before HP-SR-001 §4 the stub column was `NOT NULL DEFAULT false`, so
+ *  this user could not be written down at all. */
+const UNKNOWN_AGE_USER_ID = 'cccccccc-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 // A second, unrelated patient — seeded purely to prove HP-SEC-001 RLS
 // isolation (db/020_rls.sql) below; never referenced by any non-RLS test.
 const SEEDED_USER_ID_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
@@ -332,6 +336,60 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     // NORMAL severity — no red_flag_event row expected on the happy path either.
     const rfe = await db().query('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
     expect(rfe.rows).toHaveLength(0);
+  });
+
+  it('test_unknown_age_forces_review: the SAME response that publishes for a confirmed adult is held for review when age was never established (§2.4.3 / §3.0.3)', async () => {
+    // Deliberately a twin of test_branch_normal_completion: identical message,
+    // identical scenario, identical seeded claim. The ONLY difference is which
+    // patient asks. So a divergence in review_state is attributable to §2.4.3's
+    // gate and to nothing else — the point of the test is the contrast, not the
+    // value.
+    //
+    // This is the case HP-SR-001 §4 found. Under `profile?.isMinor === true`
+    // this user resolved to "adult" and the response published, because
+    // is_minor IS NULL was read as false. Under `minorGateRequiresReview` an
+    // unestablished age is not an adult (§3.0.3), so review is required.
+    const ctx = newCtx('HbA1c target diabetes guideline', randomUUID(), UNKNOWN_AGE_USER_ID);
+
+    // The profile must actually be READ for this to mean anything. If RLS or a
+    // missing row made lookupPatientProfile return null, the gate would still
+    // fire — but for the wrong reason, and the test would pass while proving
+    // nothing about a NULL column. Assert the row is visible and its answer is
+    // genuinely absent before driving the pipeline.
+    const seen = await lookupPatientProfile(ctx);
+    expect(seen).not.toBeNull();
+    expect(seen!.userId).toBe(UNKNOWN_AGE_USER_ID);
+    expect(seen!.isMinor).toBeNull();
+
+    const events = await drive(ctx, {
+      intentDomains: ['GUIDELINE'],
+      intentComplexity: 'LOW',
+      category: 'DECISION_SUPPORT',
+      proposedSeverity: 'NORMAL',
+      reasoningText: `Relevant: [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]] gives the ADA HbA1c target for this population.`,
+      synthesisText: `For most non-pregnant adults with type 2 diabetes, guidance commonly targets an HbA1c below 7% [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]].`,
+    });
+
+    // Retrieval and synthesis are unaffected — the gate changes disposition,
+    // not content. If this diverged from the twin, the fix would be doing
+    // something it was not meant to do.
+    const sources = events.find((e) => e.event === 'sources');
+    expect((sources!.data as { count: number }).count).toBe(1);
+    const sentences = events.filter((e) => e.event === 'sentence');
+    expect(sentences.map((x) => (x.data as { text: string }).text).join(' ')).toContain('HbA1c');
+
+    const audit = await db().query('SELECT category, review_state FROM response_audit WHERE id = $1', [ctx.auditId]);
+    expect(audit.rows).toHaveLength(1);
+    expect(audit.rows[0].category).toBe('DECISION_SUPPORT');
+    // The twin above asserts NOT_REQUIRED on these exact inputs.
+    expect(audit.rows[0].review_state).toBe('PENDING');
+
+    // §2.2.5b's disposition is recorded as REVIEW_REQUESTED, not PUBLISHED.
+    const published = await db().query(`SELECT seq FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
+    expect(published.rows).toHaveLength(0);
+    const requested = await db().query(`SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'REVIEW_REQUESTED'`, [ctx.auditId]);
+    expect(requested.rows).toHaveLength(1);
+    expect(requested.rows[0].payload.review_required).toBe(true);
   });
 
   it('test_session_severity_floor_sticks_across_turns_in_the_same_session (§4.0.8)', async () => {
