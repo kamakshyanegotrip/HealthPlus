@@ -273,6 +273,24 @@ jobs:
           set -euo pipefail
           bash migrations/test/c30_projection.sh
 
+      # R10-key. principal.subject_key has existed since 001_003 and nothing has
+      # ever created a row in it — five functions reference the table and every
+      # one CONSUMES or DESTROYS a key. obs.response_content.key_id is NOT NULL
+      # with an FK to it, so the encrypted response store has never been
+      # writable. Migration 038 adds the mint.
+      #
+      # A migration that makes an ERASURE mechanism usable has to prove the
+      # mechanism still works, so §5 is the point: it seeds a real encrypted
+      # attribute, reads it back through the audited envelope, erases the
+      # subject, and shows the same read returns nothing while the audit
+      # projection is unchanged. That is ADR-003 §2.4's crypto-shredding claim
+      # and §2.3.4g's audit guarantee executed together — which is what HP-LB-001
+      # is being asked to validate.
+      - name: "R10-key - the subject key mints, destruction is final, the shred erases"
+        run: |
+          set -euo pipefail
+          bash migrations/test/key_mint.sh
+
       - name: "R13 - GRANT/RLS contract (grants that cannot be exercised)"
         run: |
           set -euo pipefail
