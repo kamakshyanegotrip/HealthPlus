@@ -191,7 +191,11 @@ export async function resolveNearestFacility(
 ): Promise<NearestFacility | null> {
   if (!statedCountry) return null;
   try {
-    const { rows } = await db().query<{
+    // R10-role-routing: safety.emergency_facility_reference SELECT belongs to
+    // redflag_role. RF4's nearest-ED lookup is reached only from the §4.3.2 slot
+    // renderer, which is the red-flag path. See templateResolution.ts for why
+    // this is safe to land before the cutover.
+    const { rows } = await db('redflag').query<{
       id: string;
       facility_name: string;
       address_line: string;

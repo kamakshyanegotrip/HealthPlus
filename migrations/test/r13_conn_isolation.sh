@@ -35,20 +35,23 @@ fail() { echo "R13-conn FAIL: $*" >&2; exit 1; }
 #    cannot, and that is deliberate rather than an oversight.
 # ---------------------------------------------------------------------------
 echo "1. roles with a caller can log in; roles without one cannot"
-for r in redflag_role reasoner_role alert_role metrics_role; do
+for r in redflag_role reasoner_role alert_role metrics_role dqe_role; do
   ok=$(psql -qAt -c "SELECT rolcanlogin FROM pg_roles WHERE rolname='$r'")
   [ "$ok" = "t" ] || fail "$r cannot log in. Migration 034 §1 gives LOGIN to the four roles
 that have a process behind them; without it every grant and policy R13 and
 migration 031 fixed is still unreachable in production."
 done
-for r in confirmation_ui_role dqe_role erasure_role; do
+# dqe_role LEFT THIS LIST IN MIGRATION 037, which is the outcome the message
+# below asks for: the ingestion job now connects through src/db/pool.ts's dqe
+# pool, so the role has a caller and gets LOGIN in the migration that built it.
+for r in confirmation_ui_role erasure_role; do
   ok=$(psql -qAt -c "SELECT rolcanlogin FROM pg_roles WHERE rolname='$r'")
   [ "$ok" = "f" ] || fail "$r can log in, but nothing connects as it.
 Migration 034 §1 withholds LOGIN from roles with no caller on purpose — the
 same reasoning that had migration 031 revoke thirty speculative grants. If a
 caller now exists, give it LOGIN in the migration that builds the caller."
 done
-echo "  4 reachable, 3 deliberately not"
+echo "  5 reachable, 2 deliberately not"
 
 # ---------------------------------------------------------------------------
 # 2. ISOLATED. THE CLAIM OPTION 2 WAS CHOSEN FOR.
