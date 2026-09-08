@@ -105,8 +105,8 @@ const ENTRY_POINTS = [
   },
   {
     prefix: 'src/jobs/',
-    role: 'hp_app',
-    reason: 'ingestion jobs share src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app today, where dqe_role is the role holding the grants they need',
+    role: 'dqe_role',
+    reason: "src/db/pool.ts is per-role since R10-role-routing: jobPool('dqe') carries DATABASE_URL_DQE, and migration 037 gave dqe_role LOGIN because this became its caller. Until the operator sets that password the pool falls back to DATABASE_URL — recorded by poolRoleBindings(), not silent — so this declaration is the SPECIFICATION the deployment must match, which is exactly what it is for",
   },
 ];
 

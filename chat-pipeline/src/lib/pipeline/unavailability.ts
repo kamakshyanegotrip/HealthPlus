@@ -153,7 +153,10 @@ export async function resolveEmergencyNumber(
 ): Promise<EmergencyRouting | null> {
   if (!statedCountry) return null;
   try {
-    const { rows } = await db().query<{ id: string; number_e164: string; label: string }>(
+    // R10-role-routing: safety.emergency_contact_reference SELECT belongs to
+    // redflag_role. This is the FAIL_CLOSED surface — the number shown when the
+    // red-flag module cannot run — so it is the red-flag path by definition.
+    const { rows } = await db('redflag').query<{ id: string; number_e164: string; label: string }>(
       `SELECT id, number_e164, label
          FROM safety.emergency_contact_reference
         WHERE country = $1 AND contact_kind = 'EMERGENCY' AND language = $2 AND active = true

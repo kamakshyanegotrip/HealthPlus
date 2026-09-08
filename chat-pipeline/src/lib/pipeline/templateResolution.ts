@@ -167,7 +167,16 @@ export async function lookupTemplate(a: {
   jurisdiction: string;
   language: string;
 }): Promise<SafetyTemplateRow | null> {
-  const { rows } = await db().query<SafetyTemplateRow>(
+  // R10-role-routing. safety.safety_template SELECT is held by redflag_role and
+  // by no other application role, so as hp_app this query has never been able to
+  // run against the real schema — R13-roleci scores it `permission denied for
+  // schema safety`. Template resolution is only ever reached from the red-flag
+  // path, so the red-flag pool is where it belongs.
+  //
+  // Safe to land before the cutover: db.ts falls back to DATABASE_URL when
+  // DATABASE_URL_REDFLAG is unset, so against the stub — which has no worker
+  // roles — this is a no-op, and against the real schema it is the fix.
+  const { rows } = await db('redflag').query<SafetyTemplateRow>(
     `SELECT id, version, severity, jurisdiction, language, body, slots,
             is_fallback, machine_translated
        FROM safety.safety_template
