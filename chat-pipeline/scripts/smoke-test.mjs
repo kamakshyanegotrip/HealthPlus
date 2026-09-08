@@ -194,19 +194,21 @@ async function main() {
   // ---- knowledgeLookup.ts (FTS-only fallback path, no query_embedding) ---
   await check('knowledgeLookup.lookupDomain [GUIDELINE, DECISION_SUPPORT]', async () => {
     const { rows } = await pool.query(
-      `SELECT c.id AS claim_id, c.kind, es.tier, c.text, c.jurisdiction, c.population,
-              ca.confidence, ca.confidence_band, ca.citation
-         FROM claim_search($1, $2) cs
+      `SELECT c.id AS claim_id, c.kind, es.tier, c.statement AS text, c.jurisdiction, c.population,
+              ag.agg_confidence AS confidence,
+            evidence.confidence_band(ag.agg_confidence) AS confidence_band,
+            evidence.render_citation(es.id) AS citation
+         FROM evidence.claim_search($1, $2::text[]) cs
          JOIN evidence.claim c ON c.id = cs.claim_id
          JOIN evidence.evidence_source es ON es.id = cs.source_id
-         JOIN LATERAL evidence.claim_aggregate(c.id, $3) ca ON true
+         CROSS JOIN LATERAL evidence.aggregate_claim(c.id) ag
          JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol ON true
-        WHERE c.domain_table = $4
+        WHERE true
           AND pol.disposition <> 'PROHIBITED'
           AND es.retracted = false
-        ORDER BY cs.rank
+        ORDER BY cs.rank DESC
         LIMIT 12`,
-      ['HbA1c target diabetes guideline', 'domain.guideline', 'DECISION_SUPPORT', 'domain.guideline'],
+      ['HbA1c target diabetes guideline', ['guideline'], 'DECISION_SUPPORT'],
     );
     if (rows.length !== 1) throw new Error(`expected 1 claim to surface, got ${rows.length}`);
     if (Number(rows[0].confidence) <= 0) throw new Error(`expected positive confidence, got ${rows[0].confidence}`);
@@ -233,30 +235,34 @@ async function main() {
   // first check below will explain why in its own error rather than a
   // confusing "0 rows".
   await check("claim_search() vector branch actually executes when given a real embedding (never exercised by any call site before this)", async () => {
-    const { rows: embeddedCount } = await pool.query('SELECT count(*) FROM evidence.claim WHERE embedding IS NOT NULL');
+    const { rows: embeddedCount } = await pool.query('SELECT count(*) FROM evidence.retrieval_chunk WHERE embedding IS NOT NULL');
     if (Number(embeddedCount[0].count) === 0) {
-      throw new Error('no claims have an embedding yet — run `node scripts/generate-embeddings.mjs` first (now a step in npm run db:migrate:stub)');
+      throw new Error('no chunks have an embedding yet — run `node scripts/generate-embeddings.mjs` first (now a step in npm run db:migrate:stub)');
     }
     // A query embedding derived from text that shares heavy vocabulary with
     // the seeded GUIDELINE claim — close, not identical, so this also
     // exercises actual distance computation rather than a degenerate
     // zero-distance case.
     const queryVec = toPgVectorLiteral(pseudoEmbed('HbA1c target guidance for diabetes'));
-    const { rows } = await pool.query('SELECT claim_id, rank FROM claim_search($1, $2, $3::vector)', ['HbA1c target diabetes guideline', 'domain.guideline', queryVec]);
+    const { rows } = await pool.query('SELECT claim_id, rank FROM evidence.claim_search($1, $2::text[], $3::vector)', ['HbA1c target diabetes guideline', ['guideline'], queryVec]);
     if (rows.length === 0) throw new Error('expected the vector-fused RRF query to return at least one row');
     return `${rows.length} row(s), top rank=${rows[0].rank}`;
   });
 
   await check('claim_search() vector branch: an embedding built from a claim\'s OWN text ranks that claim at or near the top', async () => {
     const GUIDELINE_CLAIM_ID = '33333333-3333-3333-3333-333333333333';
-    const { rows: claimRows } = await pool.query('SELECT text FROM evidence.claim WHERE id = $1', [GUIDELINE_CLAIM_ID]);
+    // R10c: embeddings live on the chunk, so the self-embedding must be built
+    // from the passage that was actually indexed, not from the claim statement.
+    const { rows: claimRows } = await pool.query(
+      'SELECT body AS text FROM evidence.retrieval_chunk WHERE claim_id = $1 ORDER BY chunk_ordinal LIMIT 1',
+      [GUIDELINE_CLAIM_ID]);
     if (claimRows.length !== 1) throw new Error('seeded GUIDELINE claim not found — check db/999_seed_smoke_test.sql');
     const selfVec = toPgVectorLiteral(pseudoEmbed(claimRows[0].text));
     // p_query left deliberately generic (few shared FTS tokens) so this
     // check is actually exercising the VECTOR ranking, not riding along on
     // a strong FTS match for the same reasons the RRF result happens to
     // look right.
-    const { rows } = await pool.query('SELECT claim_id, rank FROM claim_search($1, $2, $3::vector)', ['general information', 'domain.guideline', selfVec]);
+    const { rows } = await pool.query('SELECT claim_id, rank FROM evidence.claim_search($1, $2::text[], $3::vector)', ['general information', ['guideline'], selfVec]);
     if (rows.length === 0) throw new Error('expected at least one row back');
     if (rows[0].claim_id !== GUIDELINE_CLAIM_ID) {
       throw new Error(`expected the claim's own text-derived embedding to rank it first; got ${rows[0].claim_id} first instead`);
@@ -267,12 +273,12 @@ async function main() {
   await check('knowledgeLookup: CLINICAL_DECISION category is excluded by policy_for (fail-closed)', async () => {
     const { rows } = await pool.query(
       `SELECT c.id
-         FROM claim_search($1, $2) cs
+         FROM evidence.claim_search($1, $2::text[]) cs
          JOIN evidence.claim c ON c.id = cs.claim_id
          JOIN evidence.evidence_source es ON es.id = cs.source_id
          JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol ON true
-        WHERE c.domain_table = $4 AND pol.disposition <> 'PROHIBITED'`,
-      ['HbA1c target diabetes guideline', 'domain.guideline', 'CLINICAL_DECISION', 'domain.guideline'],
+        WHERE pol.disposition <> 'PROHIBITED'`,
+      ['HbA1c target diabetes guideline', ['guideline'], 'CLINICAL_DECISION'],
     );
     if (rows.length !== 0) throw new Error(`expected 0 rows (category disabled), got ${rows.length}`);
     return 'confirmed: 0 rows leak through for a disabled category';
@@ -508,52 +514,61 @@ async function main() {
 
   // ---- knowledgeLookup.ts across the other 8 of 9 knowledge domains ------
   // Turn-5 gap: only GUIDELINE had ever been queried. Same query pattern as
-  // the GUIDELINE check above, run once per remaining domain table against
-  // db/999's new seed rows.
+  // the GUIDELINE check above, run once per remaining domain against db/999's
+  // seed rows.
+  //
+  // R10c: these are now REGISTRY ENTITY TYPES, not table-name strings, and a
+  // domain can name more than one. Five of the nine old values did not resolve
+  // against evidence.domain_entity_type at all — each would have returned zero
+  // rows and read as "no evidence". claim_search now raises on an unknown one.
+  // These must stay in step with DOMAIN_ENTITY_TYPE_MAP in knowledgeLookup.ts;
+  // migrations/test/r10c_retrieval.sh §1 asserts that map against the registry.
   const otherDomains = [
-    ['NUTRITION query', 'low glycaemic index diet', 'domain.nutrition_pattern'],
-    ['EXERCISE query', 'aerobic activity minutes diabetes', 'domain.exercise_guidance'],
-    ['LIFESTYLE query', 'pre-travel checklist elective surgery', 'domain.lifestyle_screening_tool'],
-    ['MONITORING query (GENERAL_EDUCATION claim)', 'glucose monitor calibration setup', 'domain.clinical_metric_reference'],
-    ['COST query', 'hospital cost package pricing orthopaedic', 'hospital_cost'],
-    ['HOSPITAL query', 'JCI accreditation hospital credential', 'hospital_profile'],
-    ['VISA query', 'medical visa invitation letter', 'domain.regulation'],
-    ['ENVIRONMENT query', 'air quality index recovery destination', 'domain.environment_reference'],
+    ['NUTRITION query', 'low glycaemic index diet', ['nutrition_pattern']],
+    ['EXERCISE query', 'aerobic activity minutes diabetes', ['activity_recommendation','activity_precaution']],
+    ['LIFESTYLE query', 'pre-travel checklist elective surgery', ['lifestyle_screening_tool']],
+    ['MONITORING query (GENERAL_EDUCATION claim)', 'glucose monitor calibration setup', ['reference_value','clinical_indicator']],
+    ['COST query', 'hospital cost package pricing orthopaedic', ['hospital_cost']],
+    ['HOSPITAL query', 'JCI accreditation hospital credential', ['hospital']],
+    ['VISA query', 'medical visa invitation letter', ['medical_visa','regulation']],
+    ['ENVIRONMENT query', 'air quality index recovery destination', ['environment']],
   ];
   for (const [label, query, table] of otherDomains) {
     await check(`knowledgeLookup.lookupDomain [${label}, DECISION_SUPPORT]`, async () => {
       const { rows } = await pool.query(
-        `SELECT c.id AS claim_id, c.kind, es.tier, c.text, c.jurisdiction, c.population,
-                ca.confidence, ca.confidence_band, ca.citation
-           FROM claim_search($1, $2) cs
+        `SELECT c.id AS claim_id, c.kind, es.tier, c.statement AS text, c.jurisdiction, c.population,
+                ag.agg_confidence AS confidence,
+              evidence.confidence_band(ag.agg_confidence) AS confidence_band,
+              evidence.render_citation(es.id) AS citation
+           FROM evidence.claim_search($1, $2::text[]) cs
            JOIN evidence.claim c ON c.id = cs.claim_id
            JOIN evidence.evidence_source es ON es.id = cs.source_id
-           JOIN LATERAL evidence.claim_aggregate(c.id, $3) ca ON true
+           CROSS JOIN LATERAL evidence.aggregate_claim(c.id) ag
            JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol ON true
-          WHERE c.domain_table = $4
+          WHERE true
             AND pol.disposition <> 'PROHIBITED'
             AND es.retracted = false
-          ORDER BY cs.rank
+          ORDER BY cs.rank DESC
           LIMIT 12`,
-        [query, table, 'DECISION_SUPPORT', table],
+        [query, table, 'DECISION_SUPPORT'],
       );
-      if (rows.length !== 1) throw new Error(`expected 1 claim to surface for ${table}, got ${rows.length}`);
+      if (rows.length !== 1) throw new Error(`expected 1 claim to surface for ${table.join('+')}, got ${rows.length}`);
       if (Number(rows[0].confidence) <= 0) throw new Error(`expected positive confidence, got ${rows[0].confidence}`);
-      return `domain_table=${table} confidence=${rows[0].confidence}`;
+      return `entity_types=${table.join('+')} confidence=${rows[0].confidence}`;
     });
   }
 
   await check('knowledgeLookup: MONITORING domain surfaces the seeded TEST_INTERPRETATION claim (drives §2.0.2 reconciliation)', async () => {
     const { rows } = await pool.query(
       `SELECT c.id AS claim_id, c.kind
-         FROM claim_search($1, $2) cs
+         FROM evidence.claim_search($1, $2::text[]) cs
          JOIN evidence.claim c ON c.id = cs.claim_id
          JOIN evidence.evidence_source es ON es.id = cs.source_id
          JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol ON true
-        WHERE c.domain_table = $4
+        WHERE true
           AND pol.disposition <> 'PROHIBITED'
           AND es.retracted = false`,
-      ['fasting glucose reading interpretation diagnosis correlation', 'domain.clinical_metric_reference', 'DECISION_SUPPORT', 'domain.clinical_metric_reference'],
+      ['fasting glucose reading interpretation diagnosis correlation', ['reference_value','clinical_indicator'], 'DECISION_SUPPORT'],
     );
     const kinds = rows.map((r) => r.kind);
     if (!kinds.includes('TEST_INTERPRETATION')) throw new Error(`expected a TEST_INTERPRETATION claim to surface, got kinds=${JSON.stringify(kinds)}`);

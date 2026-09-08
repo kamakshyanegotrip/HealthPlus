@@ -1,4 +1,7 @@
-// Backfills evidence.claim.embedding for every seeded claim using the
+// R10c: backfills evidence.retrieval_chunk.embedding, not evidence.claim.
+// Both the tsvector and the embedding moved to CHUNK grain (HP-DR-003):
+// a claim may have many chunks, and retrieval ranks passages, not claims.
+// Backfills every seeded chunk using the
 // deterministic, non-semantic pseudo-embedding in pseudo-embed.mjs — see
 // that file's header for exactly what this does and does not prove. This
 // is a TEST-DATA step, not a production migration: it does not belong in
@@ -25,19 +28,19 @@ const pool = new pg.Pool({
 });
 
 async function main() {
-  const { rows } = await pool.query('SELECT id, text FROM evidence.claim WHERE embedding IS NULL');
+  const { rows } = await pool.query('SELECT id, body AS text FROM evidence.retrieval_chunk WHERE embedding IS NULL');
   if (rows.length === 0) {
-    console.log('No claims with a NULL embedding — nothing to backfill.');
+    console.log('No chunks with a NULL embedding — nothing to backfill.');
     await pool.end();
     return;
   }
 
   for (const row of rows) {
     const vec = pseudoEmbed(row.text);
-    await pool.query('UPDATE evidence.claim SET embedding = $1::vector WHERE id = $2', [toPgVectorLiteral(vec), row.id]);
+    await pool.query('UPDATE evidence.retrieval_chunk SET embedding = $1::vector WHERE id = $2', [toPgVectorLiteral(vec), row.id]);
   }
 
-  console.log(`Backfilled ${rows.length} claim embedding(s) with pseudo-embed (non-semantic — see pseudo-embed.mjs header).`);
+  console.log(`Backfilled ${rows.length} chunk embedding(s) with pseudo-embed (non-semantic — see pseudo-embed.mjs header).`);
   await pool.end();
 }
 
