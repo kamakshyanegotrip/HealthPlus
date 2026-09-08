@@ -51,7 +51,15 @@ DECLARE
   v_tmpl uuid := gen_random_uuid();
   v_v int;
 BEGIN
-  SELECT code INTO v_region FROM public.region_registry LIMIT 1;
+  -- NOT `LIMIT 1` off an unordered scan, which is what this said until RF6-claim.
+  -- region_registry also holds 'ZZ' — migration 019's sentinel for reference data
+  -- with NO DATA SUBJECT — and physical order returned it first, so every run of
+  -- this gate had been seeding its safety events into a region that by
+  -- definition holds no subject. Nothing noticed while nothing filtered by
+  -- region; migration 035's region-scoped claim made it visible immediately.
+  -- Same predicate migration 034 §3 uses to find the admitted region.
+  SELECT code INTO v_region FROM public.region_registry
+   WHERE code <> 'ZZ' AND active_to IS NULL ORDER BY active_from LIMIT 1;
   SELECT coalesce(max(version), 0) + 1 INTO v_v
     FROM safety.safety_template
    WHERE severity = '$1' AND jurisdiction = v_region AND language = 'en';
