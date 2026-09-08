@@ -77,13 +77,19 @@ BEGIN
   -- 7 plain audited responses. With the 3 review-carrying ones below, the
   -- denominator for both ratio metrics is 10.
   FOR i IN 1..7 LOOP
+    -- No row_hash. Until migration 036 this fixture had to pass
+    -- gen_random_bytes(8) here — eight random bytes standing in for a SHA-256
+    -- chain link — because obs.response_audit had a NOT NULL row_hash that
+    -- nothing computed. That made this script the only writer of the table in
+    -- the whole system, and it wrote a forgery to get past a constraint. C-30
+    -- says the projection is not chained; 036 finished it.
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state, row_hash)
+       cited_claim_ids, review_state)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_day + (i || ' minutes')::interval,
             'INFORMATIONAL', 'j34-fixture', 'NORMAL',
-            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED', gen_random_bytes(8));
+            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED');
   END LOOP;
 
   -- 3 blocks, all §3.1 -> 3/10
@@ -108,13 +114,12 @@ BEGIN
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state, row_hash)
+       cited_claim_ids, review_state)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_day, 'INFORMATIONAL',
             -- NOT_REQUIRED, not APPROVED: §2.3.4b's assert_reviewer_in_scope()
             -- refuses an approval without a named, registered reviewer, and
             -- this fixture is measuring queue turnaround, not review validity.
-            'j34-fixture', 'NORMAL', 0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED',
-            gen_random_bytes(8))
+            'j34-fixture', 'NORMAL', 0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED')
     RETURNING id INTO v_audit;
 
     INSERT INTO obs.review_queue_item
@@ -188,10 +193,10 @@ BEGIN
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state, row_hash)
+       cited_claim_ids, review_state)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_quiet + (i || ' minutes')::interval,
             'INFORMATIONAL', 'j34-fixture', 'NORMAL',
-            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED', gen_random_bytes(8));
+            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED');
   END LOOP;
 END $$;
 SQL
