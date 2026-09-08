@@ -249,6 +249,27 @@ const RULES = [
          AND NOT has_table_privilege(refs.role, rc.oid, 'SELECT')`,
   },
   {
+    id: 'K-function-schema-usage',
+    title: 'An EXECUTE grant is dead unless the role holds USAGE on the function\'s schema',
+    why:
+      'Rule A\'s twin, and it went unwritten for four migrations while a live example ' +
+      'sat in the schema. hp_app holds EXECUTE on safety.raise_alert and ' +
+      'safety.acknowledge_alert and has USAGE on `public` only, so both calls fail with ' +
+      '"permission denied for schema safety" — the grants have been decoration since ' +
+      'they were written. This matters more now than it did: migration 039 makes ' +
+      'SECURITY DEFINER functions the request path\'s ONLY way to write obs, so an ' +
+      'EXECUTE grant that cannot be reached is no longer an unused convenience, it is ' +
+      'the whole access path.',
+    sql: `
+      SELECT DISTINCT g.grantee AS role,
+             g.routine_schema||'.'||g.routine_name AS object,
+             'EXECUTE granted, no USAGE on schema '||g.routine_schema AS detail
+        FROM information_schema.role_routine_grants g
+       WHERE g.grantee IN ${APP_ROLES}
+         AND g.privilege_type = 'EXECUTE'
+         AND NOT has_schema_privilege(g.grantee, g.routine_schema, 'USAGE')`,
+  },
+  {
     id: 'G-public-holds-nothing',
     title: 'PUBLIC holds no table privilege in any application schema',
     why:
