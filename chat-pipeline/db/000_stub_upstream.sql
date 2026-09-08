@@ -48,16 +48,38 @@ CREATE TABLE evidence.evidence_source (
   tier          source_tier NOT NULL,
   retracted     boolean NOT NULL DEFAULT false,
   superseded_by uuid,
-  last_verified_at timestamptz
+  last_verified_at timestamptz,
+  -- R10c: the fields §1.9.1 requires a citation to carry. The stub previously
+  -- had none of them, because its claim_aggregate() returned a citation STRING
+  -- it invented. §1.9.5 makes that a fabrication class: "citation strings are
+  -- rendered from the persisted source record." There was no persisted record
+  -- to render from, so the stub could not have been telling the truth.
+  -- STAND-IN: §1.9.6 mandates fourteen fields on the real table; these are the
+  -- five the renderer reads, plus source_type for §1.3.4's preprint marker.
+  source_type   text,
+  publisher     text,
+  title         text,
+  url           text,
+  doi           text,
+  published_at  date,
+  effective_at  date
 );
 
 CREATE TABLE evidence.claim (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   kind           claim_kind NOT NULL,
-  domain_table   text NOT NULL,       -- which domain.* table this claim supports (STAND-IN name)
-  text           text NOT NULL,
+  -- R10c: `domain_table` is GONE. The real schema binds a claim to a domain
+  -- through evidence.domain_attribute -> domain_entity_type, FK-governed, so a
+  -- claim cannot name a domain that does not exist. The free-text column was
+  -- the cause of the silent-zero-rows bug knowledgeLookup.ts carries a scar
+  -- from: an enum value was passed where a table name was expected and nothing
+  -- errored. See migrations/033 §4.
+  statement      text NOT NULL,       -- real column name; was `text` in the stub
   jurisdiction   text,
   population     text,
+  -- R10c: retrieval moved to evidence.retrieval_chunk (both the tsvector and
+  -- the embedding hang off the CHUNK now, not the claim). Kept nullable and
+  -- unused rather than dropped, so any straggling INSERT still applies.
   search_tsv     tsvector,
   embedding      vector(384)          -- HP-ADR-001 §3.3: 384 dims (bge-small-en-v1.5) per ADR-002/HP-SCHEMA-001 §11 "confirmed at 384 dimensions"
 );

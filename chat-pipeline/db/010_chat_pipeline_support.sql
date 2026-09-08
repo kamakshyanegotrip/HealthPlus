@@ -262,126 +262,217 @@ CREATE TABLE side_effect_job (
 CREATE INDEX idx_side_effect_job_pending ON side_effect_job (enqueued_at) WHERE status = 'PENDING';
 
 GRANT SELECT, INSERT, UPDATE ON side_effect_job TO hp_app;
+-- ---- 5/6. RETRIEVAL, PORTED TO THE REAL GRAIN (R10c / HP-DR-003) -----------
+--
+-- REPLACES the old `evidence.claim_aggregate(claim_id, category)` and
+-- `claim_search(query, domain_table)`. Both were stub inventions, and both
+-- encoded the wrong grain: they retrieved on `evidence.claim.search_tsv` and
+-- filtered on `evidence.claim.domain_table`, neither of which exists in the
+-- shipping schema. HP-RECON-002 §3 recorded the divergence; migration 033
+-- closes it; this section keeps the double able to accept the same calls.
+--
+-- STAND-IN DIFFERENCES, stated rather than left to be discovered:
+--
+--  * The function BODIES below are copied from migrations/033 rather than
+--    shared with it, because a stub cannot import a migration. That is a real
+--    drift risk and it is why both sides are tested: the real ones by
+--    migrations/test/r10c_retrieval.sh, these by
+--    test/runPipeline.integration.test.ts. IF YOU CHANGE ONE, CHANGE BOTH.
+--  * evidence.retrieval_chunk here drops embedding_model/embedded_at and
+--    makes `embedding` nullable — this stub has no embedding pipeline, and a
+--    NOT NULL column with nothing to put in it forces every test fixture to
+--    invent a vector. The real table keeps them NOT NULL.
+--  * domain_attribute here has no FK to domain_attribute_kind and no
+--    cardinality trigger. Those enforce §1.3.7's single-study prohibition,
+--    which is the DQE's business and not the pipeline's; the real schema
+--    enforces it and this stub deliberately does not pretend to.
+-- ---------------------------------------------------------------------------
 
--- ---- 5. evidence.claim_aggregate(claim_id, category) -----------------------
--- HP-SCHEMA-001 §23.3 argues by name for MIN-over-cited-sources aggregation
--- ("A mean over cited claims lets a 0.95 claim carry a 0.50 one... MIN is
--- the only rule consistent with [§3.10.1]") but that section is about
--- response-level aggregation across MULTIPLE claims. This function is the
--- claim level: MIN across a single claim's own concordant source bindings,
--- gated through policy_for so a PROHIBITED disposition still returns 0.00
--- rather than a number that looks usable. knowledgeLookup.ts calls this
--- once per candidate claim; route.ts separately does the response-level MIN
--- across whichever claims actually got cited.
-CREATE OR REPLACE FUNCTION evidence.claim_aggregate(p_claim_id uuid, p_category response_category)
-RETURNS TABLE (confidence numeric(3,2), confidence_band text, citation text)
-LANGUAGE plpgsql STABLE AS $$
-DECLARE
-  v_conf numeric(3,2);
-  v_kind claim_kind;
-  v_tier source_tier;
-  v_pol evidence.claim_policy;
-BEGIN
-  SELECT c.kind INTO v_kind FROM evidence.claim c WHERE c.id = p_claim_id;
-  IF NOT FOUND THEN
-    RETURN QUERY SELECT 0.00::numeric(3,2), 'Insufficient'::text, NULL::text;
-    RETURN;
-  END IF;
+-- The registry that replaced `claim.domain_table`. FK-governed, so a claim
+-- cannot be bound to a domain that does not exist — the fix for the bug class
+-- where an enum value was passed where a table name was expected and every
+-- lookup silently returned zero rows.
+CREATE TABLE evidence.domain_entity_type (
+  entity_type  text PRIMARY KEY,
+  schema_name  text NOT NULL,
+  table_name   text NOT NULL
+);
 
-  -- MIN across this claim's own concordant source bindings, excluding any
-  -- binding a hard block already zeroed.
-  SELECT MIN(cs.confidence), (array_agg(es.tier ORDER BY cs.confidence))[1]
-    INTO v_conf, v_tier
+-- Only the entity types the pipeline's own map names. The real registry has
+-- ~100; seeding all of them here would be inventing content.
+INSERT INTO evidence.domain_entity_type (entity_type, schema_name, table_name) VALUES
+  ('nutrition_pattern','domain','nutrition_pattern'),
+  ('activity_recommendation','domain','activity_recommendation'),
+  ('activity_precaution','domain','activity_precaution'),
+  ('lifestyle_screening_tool','domain','lifestyle_screening_tool'),
+  ('reference_value','domain','reference_value'),
+  ('clinical_indicator','domain','clinical_indicator'),
+  ('hospital_cost','domain','hospital_cost'),
+  ('hospital','domain','hospital'),
+  ('medical_visa','domain','medical_visa'),
+  ('regulation','domain','regulation'),
+  ('environment','domain','environment'),
+  ('guideline','domain','guideline');
+
+CREATE TABLE evidence.domain_attribute (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type text NOT NULL REFERENCES evidence.domain_entity_type(entity_type),
+  entity_id   uuid NOT NULL,
+  attribute   text NOT NULL,
+  claim_id    uuid REFERENCES evidence.claim(id),
+  UNIQUE (entity_type, entity_id, attribute, claim_id)
+);
+
+-- Retrieval moved to chunk grain. A claim may have many chunks; a chunk may
+-- anchor to a claim, a source, or a domain entity. Both rankers hang off here.
+CREATE TABLE evidence.retrieval_chunk (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  entity_type   text REFERENCES evidence.domain_entity_type(entity_type),
+  entity_id     uuid,
+  claim_id      uuid REFERENCES evidence.claim(id) ON DELETE CASCADE,
+  source_id     uuid REFERENCES evidence.evidence_source(id),
+  chunk_ordinal integer NOT NULL DEFAULT 0,
+  body          text NOT NULL,
+  language      text NOT NULL DEFAULT 'en',
+  embedding     vector(384),          -- STAND-IN: nullable here, NOT NULL in real
+  tsv           tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED,
+  CONSTRAINT c_chunk_anchored
+    CHECK (claim_id IS NOT NULL OR source_id IS NOT NULL
+           OR (entity_type IS NOT NULL AND entity_id IS NOT NULL))
+);
+CREATE INDEX idx_stub_chunk_tsv ON evidence.retrieval_chunk USING gin (tsv);
+
+-- §1.9.2 tier labels as reference data. PROPOSED until AMB-08 closes.
+CREATE TABLE evidence.tier_label (
+  tier           source_tier PRIMARY KEY,
+  label          text NOT NULL,
+  adoption_state text NOT NULL,
+  CONSTRAINT c_tier_label_not_enum
+    CHECK (length(btrim(label)) > 0 AND label NOT LIKE 'TIER\_%')
+);
+INSERT INTO evidence.tier_label (tier, label, adoption_state) VALUES
+  ('TIER_1','Official / regulatory','PROPOSED'),
+  ('TIER_2','Clinical guideline',   'PROPOSED'),
+  ('TIER_3','Published research',   'PROPOSED'),
+  ('TIER_4','Provider-supplied',    'PROPOSED'),
+  ('TIER_5','General web',          'PROPOSED');
+
+-- §1.9.4. IDENTICAL TO migrations/033 §2.
+CREATE OR REPLACE FUNCTION evidence.confidence_band(p_confidence numeric)
+RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+  SELECT CASE
+    WHEN p_confidence IS NULL  THEN 'Insufficient'
+    WHEN p_confidence >= 0.85  THEN 'High'
+    WHEN p_confidence >= 0.65  THEN 'Medium'
+    WHEN p_confidence >= 0.40  THEN 'Low'
+    ELSE 'Insufficient'
+  END;
+$$;
+
+-- §1.9.1/§1.9.5/§1.3.4/§1.4.2. IDENTICAL TO migrations/033 §3.
+CREATE OR REPLACE FUNCTION evidence.render_citation(p_source uuid)
+RETURNS text LANGUAGE sql STABLE AS $$
+  SELECT concat_ws(' — ',
+      nullif(btrim(es.title), ''),
+      nullif(btrim(es.publisher), ''),
+      tl.label,
+      to_char(coalesce(es.effective_at, es.published_at), 'FMDD Mon YYYY'),
+      coalesce(nullif(btrim(es.doi), ''), nullif(btrim(es.url), ''))
+    )
+    || CASE WHEN es.tier = 'TIER_5' AND es.source_type ILIKE '%preprint%'
+              THEN ' (preprint — not peer reviewed)' ELSE '' END
+    || CASE WHEN es.tier = 'TIER_4' THEN ' (self-reported by provider)' ELSE '' END
+    FROM evidence.evidence_source es
+    JOIN evidence.tier_label tl ON tl.tier = es.tier
+   WHERE es.id = p_source;
+$$;
+
+-- Replaces the stub's claim_aggregate(claim_id, category). The real
+-- aggregate_claim takes NO category: HP-DR-003 §4 made policy_for the single
+-- category gate, so aggregation is a property of the claim alone.
+CREATE OR REPLACE FUNCTION evidence.aggregate_claim(p_claim uuid)
+RETURNS TABLE (agg_confidence numeric, source_count smallint, min_tier smallint, best_tier smallint)
+LANGUAGE sql STABLE AS $$
+  -- STAND-IN: the real schema has evidence.tier_ordinal(); this stub does not,
+  -- so the ordinal comes from the enum label. Same values, no new function.
+  SELECT min(cs.confidence)::numeric,
+         count(*)::smallint,
+         min(right(es.tier::text, 1)::smallint)::smallint,
+         max(right(es.tier::text, 1)::smallint)::smallint
     FROM evidence.claim_source cs
     JOIN evidence.evidence_source es ON es.id = cs.source_id
-   WHERE cs.claim_id = p_claim_id AND cs.hard_block IS NULL;
+   WHERE cs.claim_id = p_claim AND es.retracted = false
+  HAVING count(*) > 0;
+$$;
 
-  IF v_conf IS NULL THEN
-    RETURN QUERY SELECT 0.00::numeric(3,2), 'Insufficient'::text, NULL::text;
-    RETURN;
-  END IF;
-
-  SELECT * INTO v_pol FROM evidence.policy_for(v_tier, v_kind, p_category);
-  IF v_pol.disposition = 'PROHIBITED' THEN
-    RETURN QUERY SELECT 0.00::numeric(3,2), 'Insufficient'::text, NULL::text;
-    RETURN;
-  END IF;
-  IF v_pol.confidence_cap IS NOT NULL AND v_conf > v_pol.confidence_cap THEN
-    v_conf := v_pol.confidence_cap;
-  END IF;
-
-  RETURN QUERY SELECT
-    v_conf,
-    CASE WHEN v_conf >= 0.85 THEN 'High' WHEN v_conf >= 0.65 THEN 'Medium'
-         WHEN v_conf >= 0.40 THEN 'Low' ELSE 'Insufficient' END,
-    format('claim:%s', p_claim_id)::text; -- placeholder rendering; §1.9.5 requires the
-                                            -- real citation string to come from
-                                            -- evidence_source fields, not be assembled
-                                            -- here — wire to the real renderer, this is
-                                            -- only enough to keep the pipeline running
-END $$;
-
-GRANT EXECUTE ON FUNCTION evidence.claim_aggregate TO hp_app;
-
--- ---- 6. claim_search(query, domain) — hybrid FTS + vector, RRF-fused ------
--- HP-ADR-001 §3.3: "pgvector at 512 dims + Postgres FTS fused with RRF" (the
--- dimension was later confirmed at 384 in HP-SCHEMA-001 §11 — this stub
--- follows the confirmed number). No embedding call is made inside SQL — the
--- caller passes a pre-embedded query vector; this signature takes plain text
--- and does FTS-only ranking as a temporary fallback (search_tsv @@ query),
--- clearly marked, so the pipeline is at least runnable before the embedding
--- step is wired in. Replace the vector half before relying on recall.
--- Param named p_domain_table (not p_domain) deliberately: this filters on
--- evidence.claim.domain_table, the SQL table name (e.g. "domain.guideline"),
--- NOT the app-level KnowledgeDomain enum (e.g. "GUIDELINE") that
--- knowledgeLookup.ts's `domain` variable holds. Those two were conflated in
--- an earlier version of this function's caller and it silently zeroed every
--- lookup (caught by scripts/smoke-test.mjs, not by review) — the param name
--- is now part of preventing that regression, not just documenting it.
-CREATE OR REPLACE FUNCTION claim_search(p_query text, p_domain_table text, p_query_embedding vector(384) DEFAULT NULL)
+-- HP-DR-003 §2 Option B, §3, §5. IDENTICAL IN BEHAVIOUR TO migrations/033 §4,
+-- including the guard: an unknown entity type RAISES rather than filtering to
+-- zero rows, because a wiring bug must not be able to look like an answer.
+CREATE OR REPLACE FUNCTION evidence.claim_search(
+  p_query text, p_entity_types text[],
+  p_query_embedding vector(384) DEFAULT NULL, p_limit integer DEFAULT 12)
 RETURNS TABLE (claim_id uuid, source_id uuid, rank numeric)
 LANGUAGE plpgsql STABLE AS $$
+DECLARE unknown text[];
 BEGIN
-  IF p_query_embedding IS NULL THEN
-    -- FTS-ONLY FALLBACK — not the RRF-fused hybrid search HP-ADR-001 §3.3
-    -- specifies. Flagged loudly rather than silently degrading recall.
-    RETURN QUERY
-      SELECT c.id, cs.source_id, ts_rank(c.search_tsv, websearch_to_tsquery('english', p_query))::numeric
-        FROM evidence.claim c
-        JOIN evidence.claim_source cs ON cs.claim_id = c.id
-       WHERE c.domain_table = p_domain_table
-         AND c.search_tsv @@ websearch_to_tsquery('english', p_query)
-       ORDER BY 3 DESC
-       LIMIT 40;
-    RETURN;
+  SELECT array_agg(t.et) INTO unknown
+    FROM unnest(coalesce(p_entity_types,'{}')) AS t(et)
+   WHERE NOT EXISTS (SELECT 1 FROM evidence.domain_entity_type d WHERE d.entity_type = t.et);
+  IF unknown IS NOT NULL AND cardinality(unknown) > 0 THEN
+    RAISE EXCEPTION 'claim_search: unknown entity_type(s) %; not present in evidence.domain_entity_type', unknown
+      USING HINT = 'The application''s domain map has drifted from the registry.';
+  END IF;
+  IF p_entity_types IS NULL OR cardinality(p_entity_types) = 0 THEN
+    RAISE EXCEPTION 'claim_search: no entity types given';
   END IF;
 
-  -- Reciprocal Rank Fusion of FTS rank and vector distance, k=60 (a common
-  -- RRF default; not a value taken from any project doc — tune against a
-  -- real eval set per HP-ADR-001 §3.3's own "spend the effort on chunking
-  -- and on an eval set" guidance before trusting this constant).
   RETURN QUERY
-  WITH fts AS (
-    SELECT c.id AS claim_id, cs.source_id,
-           row_number() OVER (ORDER BY ts_rank(c.search_tsv, websearch_to_tsquery('english', p_query)) DESC) AS rnk
-      FROM evidence.claim c JOIN evidence.claim_source cs ON cs.claim_id = c.id
-     WHERE c.domain_table = p_domain_table
-     LIMIT 100
-  ), vec AS (
-    SELECT c.id AS claim_id, cs.source_id,
-           row_number() OVER (ORDER BY c.embedding <=> p_query_embedding) AS rnk
-      FROM evidence.claim c JOIN evidence.claim_source cs ON cs.claim_id = c.id
-     WHERE c.domain_table = p_domain_table AND c.embedding IS NOT NULL
-     LIMIT 100
+  WITH scoped AS (
+    SELECT DISTINCT da.claim_id FROM evidence.domain_attribute da
+     WHERE da.entity_type = ANY(p_entity_types) AND da.claim_id IS NOT NULL
+  ),
+  chunks AS (   -- DR-003 §3: a claim anchor is required. DO NOT REMOVE.
+    SELECT rc.claim_id cid, rc.source_id sid, rc.tsv, rc.embedding
+      FROM evidence.retrieval_chunk rc JOIN scoped s ON s.claim_id = rc.claim_id
+     WHERE rc.claim_id IS NOT NULL
+  ),
+  fts_hits AS (
+    SELECT c.cid, c.sid, ts_rank_cd(c.tsv, websearch_to_tsquery('simple', p_query)) score
+      FROM chunks c
+     WHERE p_query IS NOT NULL AND btrim(p_query) <> ''
+       AND c.tsv @@ websearch_to_tsquery('simple', p_query)
+  ),
+  fts_best AS (  -- DR-003 §2: collapse to the claim's best chunk, THEN fuse
+    SELECT DISTINCT ON (h.cid) h.cid, h.sid, h.score FROM fts_hits h
+     ORDER BY h.cid, h.score DESC, h.sid
+  ),
+  fts_ranked AS (
+    SELECT b.cid, b.sid, row_number() OVER (ORDER BY b.score DESC, b.cid) rnk FROM fts_best b
+  ),
+  vec_hits AS (
+    SELECT c.cid, c.sid, (c.embedding <=> p_query_embedding) dist FROM chunks c
+     WHERE p_query_embedding IS NOT NULL AND c.embedding IS NOT NULL
+  ),
+  vec_best AS (
+    SELECT DISTINCT ON (v.cid) v.cid, v.sid, v.dist FROM vec_hits v ORDER BY v.cid, v.dist ASC, v.sid
+  ),
+  vec_ranked AS (
+    SELECT b.cid, b.sid, row_number() OVER (ORDER BY b.dist ASC, b.cid) rnk FROM vec_best b
   )
-  SELECT COALESCE(f.claim_id, v.claim_id), COALESCE(f.source_id, v.source_id),
-         (COALESCE(1.0/(60+f.rnk), 0) + COALESCE(1.0/(60+v.rnk), 0))::numeric AS rank
-    FROM fts f FULL OUTER JOIN vec v ON f.claim_id = v.claim_id AND f.source_id = v.source_id
-   ORDER BY rank DESC
-   LIMIT 40;
-END $$;
+  SELECT coalesce(f.cid, v.cid), coalesce(f.sid, v.sid),
+         round(coalesce(1.0/(60+f.rnk),0)::numeric + coalesce(1.0/(60+v.rnk),0)::numeric, 8)
+    FROM fts_ranked f FULL OUTER JOIN vec_ranked v ON v.cid = f.cid
+   ORDER BY 3 DESC, 1
+   LIMIT greatest(coalesce(p_limit,12),1);
+END;
+$$;
 
-GRANT EXECUTE ON FUNCTION claim_search TO hp_app;
+GRANT SELECT ON evidence.domain_entity_type, evidence.domain_attribute,
+                evidence.retrieval_chunk, evidence.tier_label TO hp_app, hp_reader;
+GRANT EXECUTE ON FUNCTION evidence.claim_search(text, text[], vector, integer) TO hp_app;
+GRANT EXECUTE ON FUNCTION evidence.aggregate_claim(uuid)                       TO hp_app;
+GRANT EXECUTE ON FUNCTION evidence.render_citation(uuid)                       TO hp_app;
+GRANT EXECUTE ON FUNCTION evidence.confidence_band(numeric)                    TO hp_app;
 
 -- ---- 7. safety.red_flag_event — per-message safety log (§4.0.7) -----------
 -- SOURCE: HP-SCHEMA-001 Annex A Extension, migration 012/013 (quoted

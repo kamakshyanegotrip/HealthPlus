@@ -12,56 +12,113 @@ import type { KnowledgeDomain, PipelineContext, ResponseCategory, RetrievedClaim
  * is excluded before it ever reaches the composer — the emission validator
  * is a second, independent check on top of this, not a replacement for it).
  *
- * Full-text + vector hybrid search (pgvector 384-dim + Postgres FTS fused by
- * RRF, per HP-ADR-001 §3.3) is assumed to already populate a `claim_search`
- * view; this module queries that view rather than re-implementing ranking.
+ * R10c / HP-DR-003, approved 8 September 2026. Rewritten against the shipping
+ * schema, where RETRIEVAL HAPPENS AT CHUNK GRAIN AND CITATION AT CLAIM GRAIN.
+ * `evidence.claim_search` (migration 033 §4) bridges the two: it collapses
+ * each claim to its best-ranked chunk per ranker BEFORE fusing, so chunk count
+ * — an artefact of the chunker — cannot buy rank. Executed against a fixture
+ * where a Tier 4 provider brochure holds ten weak chunks and a Tier 1
+ * guideline holds one strong one: the rejected alternative ranked the
+ * brochure NINE TIMES higher; this one does not.
  */
 
-const DOMAIN_TABLE: Record<KnowledgeDomain, string> = {
-  NUTRITION: 'domain.nutrition_pattern',
-  EXERCISE: 'domain.exercise_guidance',
-  LIFESTYLE: 'domain.lifestyle_screening_tool',
-  MONITORING: 'domain.clinical_metric_reference',
-  COST: 'hospital_cost',
-  HOSPITAL: 'hospital_profile',
-  VISA: 'domain.regulation',
-  ENVIRONMENT: 'domain.environment_reference',
-  GUIDELINE: 'domain.guideline',
+/**
+ * R10c. The domain map, checked against `evidence.domain_entity_type` rather
+ * than written from the stub.
+ *
+ * FIVE OF THE NINE PREVIOUS ENTRIES DID NOT RESOLVE AT ALL — `hospital_cost`
+ * was unqualified, `hospital_profile` and `domain.environment_reference` were
+ * renamed, and `domain.exercise_guidance` and
+ * `domain.clinical_metric_reference` never existed under any spelling. Each
+ * one would have returned zero rows, silently, which is the failure this file
+ * already carries a scar from: a real data gap and a wiring bug produce the
+ * identical symptom. `claim_search` now RAISES on an unknown entity type, and
+ * `migrations/test/r10c_domain_map.sh` asserts this map against the registry
+ * in CI, so the map cannot drift again without something going red.
+ *
+ * A domain maps to a SET, not to one table, because the real schema split
+ * these deliberately and picking one would silently discard the rest:
+ *
+ *   EXERCISE     an activity recommendation without its precautions is the
+ *                dangerous half of the pair (§4 high-risk profiles).
+ *   MONITORING   `reference_value` is the only one of the candidates that
+ *                carries `population_key`, and §1.9.7 blocks a reference range
+ *                with a null population from publication at all.
+ *   VISA         `medical_visa` is the specific instrument; `regulation` is
+ *                the law behind it. §1.8.4 requires both jurisdictions'
+ *                positions where they diverge, so dropping either loses half
+ *                the answer.
+ */
+const DOMAIN_ENTITY_TYPES: Record<KnowledgeDomain, readonly string[]> = {
+  NUTRITION: ['nutrition_pattern'],
+  EXERCISE: ['activity_recommendation', 'activity_precaution'],
+  LIFESTYLE: ['lifestyle_screening_tool'],
+  MONITORING: ['reference_value', 'clinical_indicator'],
+  COST: ['hospital_cost'],
+  HOSPITAL: ['hospital'],
+  VISA: ['medical_visa', 'regulation'],
+  ENVIRONMENT: ['environment'],
+  GUIDELINE: ['guideline'],
 };
 
-async function lookupDomain(domain: KnowledgeDomain, query: string, category: ResponseCategory): Promise<RetrievedClaim[]> {
-  const table = DOMAIN_TABLE[domain];
-  // claim_search: view over evidence.claim joined to the RRF-fused hybrid
-  // search function, cross-joined to evidence.policy_for(tier, kind,
-  // category) so a PROHIBITED or category-disabled row never makes it into
-  // the result set (§3.0.3's "absence of a row is a prohibition" is
-  // enforced by policy_for itself; this query just refuses to override it).
-  // BUG FOUND BY scripts/smoke-test.mjs (run against a real Postgres, not
-  // just read): this used to pass `domain` (the KnowledgeDomain enum, e.g.
-  // "GUIDELINE") as claim_search's second argument, while claim_search
-  // filters internally on `c.domain_table` (the SQL table name, e.g.
-  // "domain.guideline"). The two never matched, so every lookup silently
-  // returned zero rows — exactly the kind of failure that reads as "no
-  // sources for this query" rather than as an error, which for a §3.0.3
-  // system is the worst possible failure mode (a real data gap and a wiring
-  // bug produce the identical symptom). Fixed by passing `table` into
-  // claim_search consistently with the outer WHERE clause; the outer filter
-  // is kept as a second, redundant check on the same value rather than
-  // removed, matching this codebase's existing belt-and-braces pattern.
+/** Exported for the CI gate, which asserts every value against the registry. */
+export const DOMAIN_ENTITY_TYPE_MAP = DOMAIN_ENTITY_TYPES;
+
+/**
+ * Thrown when retrieval itself fails, as distinct from retrieval finding
+ * nothing. Those two must never look the same to a caller — see
+ * `lookupKnowledge`.
+ */
+export class RetrievalFailedError extends Error {
+  readonly clause = 'HP-ESC §3.0.3';
+  constructor(readonly domain: KnowledgeDomain, readonly cause: unknown) {
+    super(`retrieval failed for domain ${domain}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'RetrievalFailedError';
+  }
+}
+
+async function lookupDomain(
+  domain: KnowledgeDomain,
+  query: string,
+  category: ResponseCategory,
+): Promise<RetrievedClaim[]> {
+  const entityTypes = DOMAIN_ENTITY_TYPES[domain];
+
+  // NOTE ON `ORDER BY cs.rank DESC`, which is the reverse of what this query
+  // used to say. The stub's claim_search returned a position (lower = better).
+  // Reciprocal Rank Fusion returns a SCORE (higher = better). Ordering the new
+  // function ascending would return the twelve WORST matches while looking
+  // entirely correct — a silent inversion, not an error.
+  //
+  // `aggregate_claim` and `policy_for` are both CROSS JOIN LATERAL on purpose.
+  // Each drops the row when it yields nothing, and yielding nothing is exactly
+  // the case §3.0.3 calls a prohibition: no policy row for this
+  // tier×kind×category means not permitted, not "permitted by default".
   const { rows } = await db().query(
-    `SELECT c.id AS claim_id, c.kind, es.tier, c.text, c.jurisdiction, c.population,
-            ca.confidence, ca.confidence_band, ca.citation
-       FROM claim_search($1, $2) cs
+    `SELECT c.id AS claim_id, c.kind, es.tier,
+            c.statement AS text, c.jurisdiction, c.population,
+            ag.agg_confidence AS confidence,
+            evidence.confidence_band(ag.agg_confidence) AS confidence_band,
+            evidence.render_citation(es.id) AS citation
+       FROM evidence.claim_search($1, $2::text[], NULL, $4::integer) cs
        JOIN evidence.claim c ON c.id = cs.claim_id
        JOIN evidence.evidence_source es ON es.id = cs.source_id
-       JOIN LATERAL evidence.claim_aggregate(c.id, $3) ca ON true
-       JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol ON true
-      WHERE c.domain_table = $4
-        AND pol.disposition <> 'PROHIBITED'
+       CROSS JOIN LATERAL evidence.aggregate_claim(c.id) ag
+       CROSS JOIN LATERAL evidence.policy_for(es.tier, c.kind, $3::response_category) pol
+      WHERE pol.disposition <> 'PROHIBITED'
         AND es.retracted = false
-      ORDER BY cs.rank
-      LIMIT 12`,
-    [query, table, category, table],
+        -- §1.9.4: below 0.40 is the Insufficient band, which "is not published
+        -- as an assertion under §2". Dropped HERE because nothing downstream
+        -- drops it — emissionValidator has no band check at all, verified by
+        -- grep, not assumed. If this moves, that check has to exist first.
+        AND ag.agg_confidence >= 0.40
+        -- §1.9.1 makes a resolvable citation mandatory for a surfaced claim,
+        -- so a claim whose citation cannot be rendered is not publishable.
+        -- §1.9.5 forbids the model supplying the missing one.
+        AND evidence.render_citation(es.id) IS NOT NULL
+      ORDER BY cs.rank DESC
+      LIMIT $4::integer`,
+    [query, entityTypes, category, 12],
   );
 
   return rows.map((r) => ({
@@ -92,10 +149,36 @@ export async function lookupKnowledge(
   if (category === 'CLINICAL_DECISION') return new Map();
 
   const uniqueDomains = Array.from(new Set(domains));
-  const results = await Promise.all(uniqueDomains.map((d) => lookupDomain(d, ctx.message, category).catch(() => [] as RetrievedClaim[])));
+
+  // R10c. This used to be `.catch(() => [])`.
+  //
+  // That turned every failure — a dropped connection, a schema drift, the
+  // unknown-entity-type guard migration 033 §4 exists to fire — into an empty
+  // result, which the composer reads as "there is no evidence on this topic".
+  // This file's own comment calls that "the worst possible failure mode: a
+  // real data gap and a wiring bug produce the identical symptom", and then
+  // the file did it. A §3.0.3 system may answer with less; it may not answer
+  // with less while believing it looked.
+  //
+  // `allSettled` so one domain's failure does not discard the other eight's
+  // results, and the rejections are re-raised together so the caller fails
+  // closed with every reason named rather than the first one.
+  const settled = await Promise.allSettled(
+    uniqueDomains.map((d) => lookupDomain(d, ctx.message, category)),
+  );
+
+  const failures = settled.flatMap((s, i) =>
+    s.status === 'rejected' ? [new RetrievalFailedError(uniqueDomains[i]!, s.reason)] : [],
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `knowledge retrieval failed for ${failures.length} domain(s)`);
+  }
 
   const byDomain = new Map<KnowledgeDomain, RetrievedClaim[]>();
-  uniqueDomains.forEach((d, i) => byDomain.set(d, results[i] ?? []));
+  uniqueDomains.forEach((d, i) => {
+    const s = settled[i];
+    byDomain.set(d, s && s.status === 'fulfilled' ? s.value : []);
+  });
   return byDomain;
 }
 

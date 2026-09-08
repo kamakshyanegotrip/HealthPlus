@@ -183,6 +183,23 @@ jobs:
           npm --prefix chat-pipeline install tsx pg --no-save --silent
           bash migrations/test/sec1_region_context.sh
 
+      # R10c / HP-DR-003. Retrieval grain, citability, and the domain map.
+      #
+      # Five of the nine entries in the application's domain map did not
+      # resolve against evidence.domain_entity_type when this was written -
+      # each would have filtered to zero rows and read as "no evidence on this
+      # topic", which is the failure knowledgeLookup.ts already carries a scar
+      # from. Section 1 asserts the map READ FROM the module (a copy would
+      # drift from the thing it checks); section 2 asserts an unknown entity
+      # type RAISES; section 4 runs BOTH fusion strategies over the same rows
+      # and asserts they disagree in the predicted direction - shipped picks
+      # the Tier 1 guideline, the rejected one picks the Tier 4 brochure.
+      - name: "R10c - retrieval grain, citability and the domain map"
+        run: |
+          set -euo pipefail
+          npm --prefix chat-pipeline install tsx pg --no-save --silent
+          bash migrations/test/r10c_retrieval.sh
+
       # R13. The GRANT / RLS contract. R12 audited safety.* only; this is the
       # generalisation, and writing it found the class the earlier two GRANT
       # bugs were instances of: a privilege that CANNOT BE EXERCISED reads

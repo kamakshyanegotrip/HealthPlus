@@ -29,11 +29,20 @@ INSERT INTO hospital_cost (id, hospital_id) VALUES
   ('dddddddd-1111-1111-1111-111111111111', 'cccccccc-1111-1111-1111-111111111111'),
   ('dddddddd-2222-2222-2222-222222222222', 'cccccccc-2222-2222-2222-222222222222');
 
-INSERT INTO evidence.evidence_source (id, tier, retracted) VALUES
-  ('22222222-2222-2222-2222-222222222222', 'TIER_2', false);
+-- R10c: the citation fields §1.9.1 requires. Without them render_citation()
+-- returns NULL, and knowledgeLookup drops the claim — which is correct
+-- behaviour (§1.9.1 makes a resolvable citation mandatory for a surfaced
+-- claim), and would otherwise make every retrieval test fail for a reason
+-- that looks like a retrieval bug.
+INSERT INTO evidence.evidence_source
+  (id, tier, retracted, source_type, publisher, title, url, published_at, effective_at) VALUES
+  ('22222222-2222-2222-2222-222222222222', 'TIER_2', false,
+   'GUIDELINE', 'American Diabetes Association',
+   'Standards of Care in Diabetes 2026',
+   'https://example.test/ada-2026', date '2026-01-01', date '2026-01-01');
 
-INSERT INTO evidence.claim (id, kind, domain_table, text, population, search_tsv) VALUES
-  ('33333333-3333-3333-3333-333333333333', 'GUIDELINE', 'domain.guideline',
+INSERT INTO evidence.claim (id, kind, statement, population, search_tsv) VALUES
+  ('33333333-3333-3333-3333-333333333333', 'GUIDELINE', 
    'ADA 2026 guidance recommends HbA1c target below 7% for most non-pregnant adults with type 2 diabetes.',
    'non-pregnant adults with type 2 diabetes',
    to_tsvector('english', 'ADA guidance HbA1c target diabetes guideline'));
@@ -113,20 +122,20 @@ INSERT INTO safety.safety_template
 -- divergence has something real to surface against. Distinct search terms
 -- per row so a test can target one domain's claim without cross-matching
 -- another's via claim_search's websearch_to_tsquery ranking.
-INSERT INTO evidence.claim (id, kind, domain_table, text, population, search_tsv) VALUES
-  ('a1000000-0000-0000-0000-000000000001', 'GENERAL_EDUCATION', 'domain.nutrition_pattern',
+INSERT INTO evidence.claim (id, kind, statement, population, search_tsv) VALUES
+  ('a1000000-0000-0000-0000-000000000001', 'GENERAL_EDUCATION', 
    'A low-glycaemic-index diet is commonly recommended alongside metformin for type 2 diabetes management.',
    'adults with type 2 diabetes',
    to_tsvector('english', 'low glycaemic index diet nutrition diabetes')),
-  ('a1000000-0000-0000-0000-000000000002', 'GENERAL_EDUCATION', 'domain.exercise_guidance',
+  ('a1000000-0000-0000-0000-000000000002', 'GENERAL_EDUCATION', 
    '150 minutes per week of moderate aerobic activity is a commonly cited target for adults managing type 2 diabetes.',
    'adults with type 2 diabetes',
    to_tsvector('english', 'exercise aerobic activity minutes diabetes')),
-  ('a1000000-0000-0000-0000-000000000003', 'GENERAL_EDUCATION', 'domain.lifestyle_screening_tool',
+  ('a1000000-0000-0000-0000-000000000003', 'GENERAL_EDUCATION', 
    'A pre-travel checklist commonly includes a dental and vision check before elective surgery abroad.',
    'medical tourism patients',
    to_tsvector('english', 'pre-travel checklist lifestyle screening elective surgery')),
-  ('a1000000-0000-0000-0000-000000000004', 'GENERAL_EDUCATION', 'domain.clinical_metric_reference',
+  ('a1000000-0000-0000-0000-000000000004', 'GENERAL_EDUCATION', 
    'Home glucose monitors are commonly calibrated against a lab reference reading during setup.',
    'adults with type 2 diabetes',
    to_tsvector('english', 'glucose monitor calibration reference reading setup')),
@@ -135,23 +144,23 @@ INSERT INTO evidence.claim (id, kind, domain_table, text, population, search_tsv
   -- can retrieve it specifically and exercise route.ts's §2.0.2
   -- post-retrieval reconciliation (retrievalImpliesClinical). See
   -- test/runPipeline.integration.test.ts.
-  ('a1000000-0000-0000-0000-000000000005', 'TEST_INTERPRETATION', 'domain.clinical_metric_reference',
+  ('a1000000-0000-0000-0000-000000000005', 'TEST_INTERPRETATION', 
    'A single fasting glucose reading above the reference range on its own is not a diagnosis and needs clinical correlation.',
    'adults with type 2 diabetes',
    to_tsvector('english', 'fasting glucose reading result interpretation diagnosis correlation')),
-  ('a1000000-0000-0000-0000-000000000006', 'COST', 'hospital_cost',
+  ('a1000000-0000-0000-0000-000000000006', 'COST', 
    'Published package pricing for elective orthopaedic procedures in Chennai commonly bundles a fixed post-op stay.',
    'medical tourism patients',
    to_tsvector('english', 'hospital cost package pricing orthopaedic Chennai')),
-  ('a1000000-0000-0000-0000-000000000007', 'ACCREDITATION', 'hospital_profile',
+  ('a1000000-0000-0000-0000-000000000007', 'ACCREDITATION', 
    'JCI accreditation is commonly cited as a baseline credential when comparing hospitals for medical tourism.',
    'medical tourism patients',
    to_tsvector('english', 'JCI accreditation hospital credential comparison')),
-  ('a1000000-0000-0000-0000-000000000008', 'LEGAL_REGULATORY', 'domain.regulation',
+  ('a1000000-0000-0000-0000-000000000008', 'LEGAL_REGULATORY', 
    'A medical visa commonly requires a formal invitation letter from the treating hospital.',
    'medical tourism patients',
    to_tsvector('english', 'medical visa invitation letter hospital regulation')),
-  ('a1000000-0000-0000-0000-000000000009', 'GENERAL_EDUCATION', 'domain.environment_reference',
+  ('a1000000-0000-0000-0000-000000000009', 'GENERAL_EDUCATION', 
    'Air quality index guidance is commonly published for major destination cities during a recovery period.',
    'medical tourism patients',
    to_tsvector('english', 'air quality index environment recovery destination city'));
@@ -178,3 +187,57 @@ INSERT INTO evidence.claim_policy (tier, kind, category, disposition, confidence
   -- the reconciliation that then upgrades the category, not to permit the
   -- kind broadly.
   ('TIER_2', 'TEST_INTERPRETATION', 'DECISION_SUPPORT', 'PERMITTED', NULL, 1, 'HP-ESC 2.2.2 (SMOKE-TEST)', 'SMOKE-TEST', '11111111-1111-1111-1111-111111111111', now() - interval '1 day');
+
+-- ---------------------------------------------------------------------------
+-- R10c / HP-DR-003. Bind every seeded claim to a domain entity, and give each
+-- one a retrieval chunk.
+--
+-- This is not bookkeeping — it is the whole shape of the change. Under the old
+-- stub a claim was retrievable because it carried a `domain_table` string and
+-- its own `search_tsv`. Under the real grain a claim is retrievable only if
+-- (a) evidence.domain_attribute binds it to an entity type in the registry, and
+-- (b) evidence.retrieval_chunk holds a passage anchored to it.
+--
+-- A claim with neither is invisible to retrieval BY DESIGN, and that is what
+-- HP-DR-003 §3 and §5 approved: a passage with no claim anchor has no
+-- confidence and no policy disposition, so §3.0.3's default-deny gate has
+-- nothing to evaluate.
+--
+-- The chunk bodies deliberately reuse each claim's own search terms so the
+-- per-domain targeting the integration tests rely on still holds. Note the
+-- 'simple' text-search configuration: retrieval_chunk.tsv is GENERATED ALWAYS
+-- with 'simple', which does NOT stem — 'limits' does not match 'limit'.
+-- ---------------------------------------------------------------------------
+INSERT INTO evidence.domain_attribute (entity_type, entity_id, attribute, claim_id) VALUES
+  ('guideline',                'e0000000-0000-0000-0000-000000000001','scope',      '33333333-3333-3333-3333-333333333333'),
+  ('nutrition_pattern',        'e0000000-0000-0000-0000-000000000002','description','a1000000-0000-0000-0000-000000000001'),
+  ('activity_recommendation',  'e0000000-0000-0000-0000-000000000003','description','a1000000-0000-0000-0000-000000000002'),
+  ('lifestyle_screening_tool', 'e0000000-0000-0000-0000-000000000004','description','a1000000-0000-0000-0000-000000000003'),
+  ('clinical_indicator',       'e0000000-0000-0000-0000-000000000005','description','a1000000-0000-0000-0000-000000000004'),
+  ('reference_value',          'e0000000-0000-0000-0000-000000000006','description','a1000000-0000-0000-0000-000000000005'),
+  ('hospital_cost',            'e0000000-0000-0000-0000-000000000007','description','a1000000-0000-0000-0000-000000000006'),
+  ('hospital',                 'e0000000-0000-0000-0000-000000000008','description','a1000000-0000-0000-0000-000000000007'),
+  ('medical_visa',             'e0000000-0000-0000-0000-000000000009','description','a1000000-0000-0000-0000-000000000008'),
+  ('environment',              'e0000000-0000-0000-0000-00000000000a','description','a1000000-0000-0000-0000-000000000009');
+
+INSERT INTO evidence.retrieval_chunk (claim_id, source_id, chunk_ordinal, body) VALUES
+  ('33333333-3333-3333-3333-333333333333','22222222-2222-2222-2222-222222222222',0,
+   'ADA guidance HbA1c target diabetes guideline recommends below 7 percent for non-pregnant adults'),
+  ('a1000000-0000-0000-0000-000000000001','22222222-2222-2222-2222-222222222222',0,
+   'low glycaemic index diet nutrition diabetes metformin management'),
+  ('a1000000-0000-0000-0000-000000000002','22222222-2222-2222-2222-222222222222',0,
+   'exercise aerobic activity minutes diabetes 150 per week moderate'),
+  ('a1000000-0000-0000-0000-000000000003','22222222-2222-2222-2222-222222222222',0,
+   'pre-travel checklist lifestyle screening elective surgery dental vision'),
+  ('a1000000-0000-0000-0000-000000000004','22222222-2222-2222-2222-222222222222',0,
+   'glucose monitor calibration reference reading setup home'),
+  ('a1000000-0000-0000-0000-000000000005','22222222-2222-2222-2222-222222222222',0,
+   'fasting glucose reading result interpretation diagnosis correlation clinical'),
+  ('a1000000-0000-0000-0000-000000000006','22222222-2222-2222-2222-222222222222',0,
+   'hospital cost package pricing orthopaedic Chennai bundled post-op stay'),
+  ('a1000000-0000-0000-0000-000000000007','22222222-2222-2222-2222-222222222222',0,
+   'JCI accreditation hospital credential comparison medical tourism baseline'),
+  ('a1000000-0000-0000-0000-000000000008','22222222-2222-2222-2222-222222222222',0,
+   'medical visa invitation letter hospital regulation formal treating'),
+  ('a1000000-0000-0000-0000-000000000009','22222222-2222-2222-2222-222222222222',0,
+   'air quality index environment recovery destination city guidance published');

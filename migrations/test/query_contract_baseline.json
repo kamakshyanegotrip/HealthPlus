@@ -17,13 +17,6 @@
       "item": "R10d, which rides with the cutover"
     },
     {
-      "id": "ef4942a22352",
-      "file": "chat-pipeline/src/lib/pipeline/knowledgeLookup.ts",
-      "error": "function claim_search(unknown, unknown) does not exist",
-      "why": "THE BIG ONE. claim_search does not exist in the real schema and cannot be ported: the stub retrieves on evidence.claim.domain_table, .text, .search_tsv and .embedding, none of which exist there. Real retrieval is chunk-grained in evidence.retrieval_chunk, so this is a change of grain rather than a rename — claims are the citable unit, chunks the retrievable one. Getting the resolution wrong is a §3.9.2 fabrication-class bug, which is why it needs a decision before code.",
-      "item": "R10c, gated on HP-DR-003"
-    },
-    {
       "id": "19a3fe957d59",
       "file": "chat-pipeline/src/lib/pipeline/patientProfile.ts",
       "error": "relation \"patient_profile\" does not exist",
