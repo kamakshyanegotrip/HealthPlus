@@ -303,7 +303,19 @@ CREATE TABLE patient_profile (
   data_region  char(2) NOT NULL,
   age_band     text,
   preferences  jsonb,
-  is_minor     boolean NOT NULL DEFAULT false
+  -- §2.4.3 / HP-SR-001 §4. NULLABLE, AND WITH NO DEFAULT, ON PURPOSE.
+  --
+  -- This was `boolean NOT NULL DEFAULT false`, which made "nobody has ever
+  -- established this subject's age" indistinguishable from "this subject is
+  -- confirmed to be an adult" — and resolved it to the second. The column
+  -- itself encoded the fail-open that `minorGateRequiresReview` now closes,
+  -- and while it stayed NOT NULL the unknown case could not even be written
+  -- down, so no test against this schema could have exercised it.
+  --
+  -- A fixture that cannot express the failure cannot prove its absence: the
+  -- same lesson as RF4's first nearest-ED fixture and SEC-1's first clinician
+  -- seed. Three seeded patients now cover false / true / NULL.
+  is_minor     boolean
 );
 
 CREATE TABLE patient_attribute (

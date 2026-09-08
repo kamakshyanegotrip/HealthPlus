@@ -19,6 +19,16 @@ INSERT INTO patient_profile (user_id, data_region, age_band, preferences, is_min
 INSERT INTO patient_attribute (user_id, kind, label, provenance)
   VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'condition', 'hypertension', 'stated');
 
+-- A third patient whose age was NEVER ESTABLISHED — is_minor IS NULL, not
+-- false. This is the §2.4.3 case HP-SR-001 §4 found: before the column was
+-- made nullable it could not be represented here at all, so every test agreed
+-- with the code that an unknown age is an adult. `minorGateRequiresReview`
+-- must force review for this user, and runPipeline.integration.test.ts asserts
+-- it does.
+INSERT INTO app_user (id, data_region) VALUES ('cccccccc-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'IN');
+INSERT INTO patient_profile (user_id, data_region, age_band, preferences, is_minor)
+  VALUES ('cccccccc-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'IN', NULL, NULL, NULL);
+
 -- Two hospitals, used to prove the HP-SEC-001 §4 marketplace pattern:
 -- hospital_admin isolated to its own org across all statuses, patient/
 -- clinician/platform_admin see PUBLISHED rows from any org.
