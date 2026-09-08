@@ -237,6 +237,29 @@ jobs:
           npm install pg --no-save --silent
           node migrations/test/grant_contract.mjs
 
+      # R13-roleci. CI-3 above PREPAREs every SQL literal AS THE OWNER, which
+      # answers "does this SQL make sense against this schema?" — a different
+      # question from "can this code run?". Against the identical schema, 31 of
+      # 39 literals resolve as postgres and 1 of 39 as hp_app (HP-RECON-004 §1).
+      # So the gate that was used to SIZE the R10 cutover could not see the
+      # class of failure the cutover mostly consists of.
+      #
+      # This step probes each literal as the role its own module connects as,
+      # deriving that role from the db('<pool>') call sites and requiring an
+      # explicit declaration for the out-of-process entry points. A file with
+      # SQL and no role is a hard error, never a silent default to the owner.
+      #
+      # It refuses to run unless it can first observe a denial it knows must
+      # happen — otherwise a gate that had quietly stopped enforcing anything
+      # would report a clean bill of health for a codebase that cannot run.
+      #
+      # Baseline: 16 today, every one hp_app, each tagged with the item that
+      # closes it. Like CI-3's, it may only shrink.
+      - name: "R13-roleci - every query, as the role its module connects as"
+        run: |
+          set -euo pipefail
+          node migrations/test/role_contract.mjs
+
       # Cheap regression guard on the numbering question HP-JOB-002's Ledger
       # left open and this repo answered: nothing should silently reintroduce a
       # gap or a duplicate prefix as the sequence grows.
