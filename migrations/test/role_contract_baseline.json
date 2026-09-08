@@ -1,0 +1,134 @@
+{
+  "note": "Queries that do not resolve AS THE ROLE THEIR MODULE CONNECTS AS. See role_contract.mjs. Entries may only be REMOVED — never edited to hide a regression, and never added without a reason. A baselined site that starts passing fails the build, so this list can only shrink.",
+  "source": "HP-RECON-004 — the request path has no role",
+  "entries": [
+    {
+      "id": "3d6558427253",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema obs",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "b707c7eb3820",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema domain",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "e836377ae7d5",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema principal",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "70c13b7c64c6",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema domain",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "3fdff0047795",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema evidence",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "5af876e2a96a",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema evidence",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "cef2541be381",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema evidence",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "ac47668508c7",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema evidence",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "a7bbdccb164b",
+      "file": "src/jobs/extractClaimsFromProviderSubmission.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema domain",
+      "why": "The ingestion job shares src/db/pool.ts, which is built from DATABASE_URL — i.e. hp_app, which holds USAGE on public only. dqe_role is the role with evidence and safety USAGE and is the one this job is designed around. Ten sites, one cause: the job has never been given its own pool.",
+      "item": "R10-role-routing — the ingestion half; needs dqe_role LOGIN (034 §1 withholds it until a caller exists)"
+    },
+    {
+      "id": "9db2615e7e4a",
+      "file": "chat-pipeline/src/lib/anthropic.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema obs",
+      "why": "obs.ai_call INSERT is granted to redflag_role and to nothing else, but the request path logs COMPOSE and CATEGORY_CLASSIFY calls too, so moving anthropic.ts onto the red-flag pool would be the wrong shape. Needs obs.record_ai_call(...).",
+      "item": "HP-RECON-004 §4 — migration 035"
+    },
+    {
+      "id": "fb9dfe30d551",
+      "file": "chat-pipeline/src/lib/pipeline/emissionValidator.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema obs",
+      "why": "obs.fabrication_block has no INSERT grant to any application role. Needs obs.record_fabrication_block(...).",
+      "item": "HP-RECON-004 §4 — migration 035"
+    },
+    {
+      "id": "b0ad54838ff9",
+      "file": "chat-pipeline/src/lib/pipeline/templateResolution.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema safety",
+      "why": "safety.safety_template SELECT is held by redflag_role. A pool change, not a migration: this module is only ever reached from the red-flag path.",
+      "item": "R10-role-routing, with the cutover"
+    },
+    {
+      "id": "8d0adeecd7b5",
+      "file": "chat-pipeline/src/lib/pipeline/templateSlots.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema safety",
+      "why": "safety.emergency_facility_reference SELECT is held by redflag_role. Pool change.",
+      "item": "R10-role-routing, with the cutover"
+    },
+    {
+      "id": "b9ad0524ca48",
+      "file": "chat-pipeline/src/lib/pipeline/unavailability.ts",
+      "role": "hp_app",
+      "error": "permission denied for schema safety",
+      "why": "safety.emergency_contact_reference SELECT is held by redflag_role. Pool change.",
+      "item": "R10-role-routing, with the cutover"
+    },
+    {
+      "id": "53c7e7b4f9bd",
+      "file": "chat-pipeline/worker/alert-worker.mjs",
+      "role": "alert_role",
+      "error": "permission denied for table clinician_alert",
+      "why": "SHIPPED DEFECT, not a porting gap. alert_role holds SELECT on safety.clinician_alert and no UPDATE — deliberately: its state changes go through the SECURITY DEFINER functions mark_alert_delivered / mark_alert_undeliverable / acknowledge_alert. But the batch-claim query is `SELECT ... FOR UPDATE SKIP LOCKED`, and FOR UPDATE requires UPDATE. So the worker's FIRST query fails on every poll and no §4.1 CRITICAL/EMERGENCY alert is ever delivered. RF6's own gate connects as the owner, which is why it passed. The fix follows the schema's idiom rather than granting UPDATE: a DEFINER safety.claim_alert_batch(...).",
+      "item": "RF6-claim — new, and it should jump the queue: this is a live safety-path outage"
+    },
+    {
+      "id": "b70657b765ee",
+      "file": "chat-pipeline/worker/side-effect-worker.mjs",
+      "role": "hp_app",
+      "error": "permission denied for schema safety",
+      "why": "The side-effect worker runs on the app's own DATABASE_URL, so it is hp_app, and it reads safety.clinician_alert — which hp_app cannot reach at all. It is also the consumer half of side_effect_job, the stub-invented queue R10b replaces with obs.review_queue_item.",
+      "item": "R10b, which rides with the cutover"
+    }
+  ]
+}

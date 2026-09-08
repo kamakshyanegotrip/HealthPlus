@@ -61,80 +61,16 @@
  *   ... --write-baseline    regenerate the baseline from current reality
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { join, relative } from 'node:path';
+import { extract } from './sql_literals.mjs';
 
-const ROOT = process.cwd();
 const BASELINE = 'migrations/test/query_contract_baseline.json';
 
-// Shipping source only. Test files are excluded deliberately: a test may
-// legitimately assert against a stub-shaped table, and mixing those into this
-// baseline would blur the one question this check exists to answer — does the
-// code we deploy match the schema we deploy?
-const ROOTS = ['src', 'chat-pipeline/src', 'chat-pipeline/worker', 'chat-pipeline/scripts'];
-const EXT = /\.(ts|tsx|mjs|js)$/;
-const IS_TEST = /\.test\.(ts|tsx|mjs|js)$/;
-
-// Named exclusions, each of which must earn its place.
-//
-// scripts/smoke-test.mjs is a test OF the stub schema, by design — it asserts
-// against db/000..020 and is deleted at R10g along with them. Every one of its
-// SQL literals fails against the real schema for the same uninteresting
-// reason, and baselining ten copies of "this is the stub smoke test" would
-// bury the failures that actually mean something. Delete this exclusion when
-// R10g deletes the file.
-const EXCLUDE = new Set(['chat-pipeline/scripts/smoke-test.mjs']);
-
-function walk(dir, out = []) {
-  let entries;
-  try { entries = readdirSync(dir); } catch { return out; }
-  for (const e of entries) {
-    if (e === 'node_modules' || e === '.next' || e.startsWith('.')) continue;
-    const p = join(dir, e);
-    const st = statSync(p);
-    if (st.isDirectory()) walk(p, out);
-    else if (EXT.test(e) && !IS_TEST.test(e)) out.push(p);
-  }
-  return out;
-}
-
-// A SQL literal, for this check, is a backtick template literal whose first
-// word is a statement keyword. Anchoring on the FIRST word rather than
-// searching anywhere in the string is what keeps Annex B prompt text out:
-// prompts mention SELECT and UPDATE in prose, but never start with them.
-const STARTS_SQL = /^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|WITH)\b/i;
-const TOUCHES_RELATION = /\b(FROM|INTO|UPDATE)\s+[a-zA-Z_"]/;
-
-function extract() {
-  const found = [];
-  for (const r of ROOTS) {
-    for (const file of walk(join(ROOT, r))) {
-      const rel = relative(ROOT, file).split('\\').join('/');
-      if (EXCLUDE.has(rel)) continue;
-      const src = readFileSync(file, 'utf8');
-      const re = /`([^`]*)`/gs;
-      let m;
-      while ((m = re.exec(src)) !== null) {
-        const sql = m[1];
-        if (!STARTS_SQL.test(sql)) continue;
-        if (!TOUCHES_RELATION.test(sql)) continue;
-        // ${} interpolation cannot be prepared as written. Flag rather than
-        // silently skip — a query assembled by interpolation is exactly the
-        // kind this check would most like to see.
-        const interpolated = sql.includes('${');
-        const line = src.slice(0, m.index).split('\n').length;
-        const norm = sql.replace(/\s+/g, ' ').trim();
-        found.push({
-          id: createHash('sha256').update(norm).digest('hex').slice(0, 12),
-          file: rel, line, sql: sql.trim(), interpolated,
-        });
-      }
-    }
-  }
-  return found;
-}
+// The extractor moved to ./sql_literals.mjs when role_contract.mjs (R13-roleci)
+// needed the identical list. One extractor, two gates: a second copy would
+// drift, and the two checks would then disagree about how many queries exist
+// while both reported confidently.
 
 function probe(sql, n) {
   try {
