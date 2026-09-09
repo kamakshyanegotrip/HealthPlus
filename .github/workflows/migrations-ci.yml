@@ -291,6 +291,29 @@ jobs:
           set -euo pipefail
           bash migrations/test/key_mint.sh
 
+      # R10d-attr. The profile read, as reasoner_role rather than as the owner —
+      # and §4 of it is the only check in this repository that does NOT run as a
+      # superuser owner.
+      #
+      # principal.patient_attribute is FORCE ROW LEVEL SECURITY, so its policy
+      # applies to the table owner too, and therefore inside
+      # fetch_attribute_envelope, which is SECURITY DEFINER. A superuser bypasses
+      # RLS regardless — and every migration and gate here runs as `postgres`,
+      # which is one. So that boundary has never applied in any test this project
+      # has run, while applying in full on a deployment whose owner is not a
+      # superuser (the normal Supabase shape). §4 rents that shape for one
+      # transaction by reassigning the three objects and the function to a
+      # non-superuser role; ALTER ... OWNER is transactional, so ROLLBACK
+      # restores them.
+      #
+      # It also pins the audit_id ordering trap: attribute_access_log.audit_id
+      # FKs to obs.response_audit, which is written at the END of a turn, so
+      # passing ctx.auditId to the envelope at profile-read time kills the turn.
+      - name: "R10d-attr - the profile read path, as the role and under a non-superuser owner"
+        run: |
+          set -euo pipefail
+          bash migrations/test/r10d_attr.sh
+
       - name: "R13 - GRANT/RLS contract (grants that cannot be exercised)"
         run: |
           set -euo pipefail

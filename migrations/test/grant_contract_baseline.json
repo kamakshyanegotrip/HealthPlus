@@ -36,6 +36,15 @@
       "detail": "NOLOGIN and no members",
       "why": "NOT R13-conn — that decision is closed. This role is unreachable ON PURPOSE. Its one grant is INSERT on principal.patient_attribute_confirmation, and nothing in the codebase writes that table: the confirmation UI does not exist yet. Migration 034 §1 withholds LOGIN from roles with no caller, the same reasoning that had migration 031 revoke thirty speculative grants — each individually defensible, none with a caller. dqe_role and erasure_role are in the same position but hold no grants, so rule C does not reach them.",
       "item": "Closes in the migration that builds the confirmation UI (CGP-001 §8.3, the reviewer console). Give it LOGIN there, not before."
+    },
+    {
+      "key": "M-policy-with-no-grant|PUBLIC|principal.patient_attribute|RLS policy p_pa_own exists; no application role holds any privilege",
+      "rule": "M-policy-with-no-grant",
+      "role": "PUBLIC",
+      "object": "principal.patient_attribute",
+      "detail": "RLS policy p_pa_own exists; no application role holds any privilege",
+      "why": "DELIBERATE, and the only entry of this rule that is. The request path must read patient attributes ONLY through principal.fetch_attribute_envelope, which writes principal.attribute_access_log on every read (§3.8.2) and raises HP-ESC 3.8.2 for inferred rows outside CONFIRMATION_UI. A direct SELECT grant would let the request path read health attributes with no record that it did — which is the guarantee the envelope exists to provide. p_pa_own is therefore the backstop for the day somebody adds that grant anyway, not dead code: migration 041 §3 asserts no such grant exists and fails if one appears.",
+      "item": "Permanent. Closes only if attribute access stops being envelope-mediated, which would be a §3.8.2 amendment."
     }
   ]
 }

@@ -72,21 +72,112 @@ blocks the permitted direction is an outage, not a boundary."
 echo "  reasoner, alert and metrics all refused; redflag permitted"
 
 # ---------------------------------------------------------------------------
-# 3. AND THE REVERSE. The retrieval role reads evidence and nothing else.
+# 3. AND THE REVERSE. What the retrieval role may reach, stated precisely.
+#
+# THIS SECTION USED TO SAY "evidence and nothing else", and migration 041 made
+# it fail — correctly, by catching a real widening. Reworking it turned up that
+# the old assertion had ALREADY been false for as long as it existed, in a place
+# it did not look: it checked information_schema.role_table_grants only, and
+# reasoner_role has held EXECUTE on principal.fetch_attribute_envelope and
+# principal.attribute_ref_digest since migration 018. A boundary that only
+# inspects tables is not a boundary on a schema whose access is function-shaped.
+#
+# So the invariant is restated as what it actually needs to be, in three parts:
+#
+#   (a) reasoner_role writes NOTHING, anywhere. Retrieval does not write, and
+#       this is the part that makes Option 2 worth its cost.
+#   (b) reasoner_role holds nothing at all — table OR function — in `safety` or
+#       `obs`. Those are the schemas whose integrity §4.0.7 and C-30 depend on,
+#       and they are the blast radius Option 2 was chosen to bound.
+#   (c) outside `evidence`, its reach is an ENUMERATED allowlist, and every
+#       table on it must be RLS-scoped to the calling subject's own rows. That
+#       last clause is what keeps the allowlist from becoming a place to park an
+#       unbounded read: being listed here is not enough, the row boundary has to
+#       be real.
+#
+# Adding to the allowlist means coming here and arguing for it, which is the
+# point. R10d-attr's argument: the §2.4.3 minor gate reads
+# principal.patient_risk_flag, the composer needs the subject's region, and both
+# reads are confined by p_prf_own / p_pp_own to the one subject the request is
+# already about — so a SQL injection reached through retrieval gains access to
+# the profile of the person whose request it is, and to nobody else's.
 # ---------------------------------------------------------------------------
-echo "3. reasoner_role reads evidence and holds nothing in safety, obs or principal"
-leak=$(psql -qAt -c "
-  SELECT string_agg(DISTINCT table_schema||'.'||table_name, ', ')
-    FROM information_schema.role_table_grants
-   WHERE grantee='reasoner_role' AND table_schema <> 'evidence'")
-[ -z "$leak" ] || fail "reasoner_role holds grants outside evidence: $leak
-Retrieval reads evidence. Anything else is privilege it did not need and
-cannot justify."
+echo "3. reasoner_role: no writes, nothing in safety/obs, and an RLS-scoped allowlist elsewhere"
+
+# (a) no writes, anywhere.
 w=$(psql -qAt -c "
   SELECT count(*) FROM information_schema.role_table_grants
    WHERE grantee='reasoner_role' AND privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE')")
 [ "$w" = "0" ] || fail "reasoner_role holds $w write privilege(s). Retrieval does not write."
-echo "  evidence only, read only"
+
+# (b) nothing in safety or obs — tables and functions both.
+leak=$(psql -qAt -c "
+  SELECT string_agg(DISTINCT table_schema||'.'||table_name, ', ')
+    FROM information_schema.role_table_grants
+   WHERE grantee='reasoner_role' AND table_schema IN ('safety','obs')")
+[ -z "$leak" ] || fail "reasoner_role holds table grants in safety/obs: $leak
+Those schemas are the blast radius Option 2 exists to bound — code reached
+through the retrieval role must not be able to touch a §4.0.7 event or the C-30
+audit projection."
+
+fleak=$(psql -qAt -c "
+  SELECT string_agg(n.nspname||'.'||p.proname, ', ')
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname IN ('safety','obs')
+     AND has_function_privilege('reasoner_role', p.oid, 'EXECUTE')
+     AND NOT has_function_privilege('public', p.oid, 'EXECUTE')")
+[ -z "$fleak" ] || fail "reasoner_role holds EXECUTE in safety/obs: $fleak
+A function grant reaches just as far as a table grant, and this check did not
+look at functions until R10d-attr."
+
+# (c) the allowlist outside evidence, tables and functions.
+ALLOW_TABLES="principal.patient_profile principal.patient_risk_flag"
+ALLOW_FUNCS="principal.fetch_attribute_envelope principal.attribute_ref_digest"
+
+outside=$(psql -qAt -c "
+  SELECT DISTINCT table_schema||'.'||table_name
+    FROM information_schema.role_table_grants
+   WHERE grantee='reasoner_role' AND table_schema <> 'evidence' ORDER BY 1")
+for obj in $outside; do
+  case " $ALLOW_TABLES " in
+    *" $obj "*) ;;
+    *) fail "reasoner_role holds a grant on $obj, which is not on this gate's allowlist.
+Retrieval reads evidence. A grant anywhere else needs an argument recorded in
+section 3's header — not just a migration that adds it." ;;
+  esac
+done
+
+outside_f=$(psql -qAt -c "
+  SELECT n.nspname||'.'||p.proname
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+   WHERE n.nspname NOT IN ('evidence','pg_catalog','information_schema','app','public')
+     AND has_function_privilege('reasoner_role', p.oid, 'EXECUTE')
+     AND NOT has_function_privilege('public', p.oid, 'EXECUTE')
+   ORDER BY 1")
+for obj in $outside_f; do
+  case " $ALLOW_FUNCS " in
+    *" $obj "*) ;;
+    *) fail "reasoner_role holds EXECUTE on $obj, which is not on this gate's allowlist." ;;
+  esac
+done
+
+# And the clause that makes the allowlist safe rather than merely a list: every
+# allowlisted principal table must confine the role to the calling subject.
+for obj in $ALLOW_TABLES; do
+  tbl=${obj#principal.}
+  scoped=$(psql -qAt -c "
+    SELECT count(*) FROM pg_policy pol
+      JOIN pg_class c ON c.oid = pol.polrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname='principal' AND c.relname='$tbl'
+       AND c.relrowsecurity
+       AND pg_get_expr(pol.polqual, pol.polrelid) LIKE '%current_user_id()%'")
+  [ "$scoped" -ge 1 ] || fail "principal.$tbl is on the allowlist but has no RLS policy
+scoping it to app.current_user_id(). The allowlist is only defensible while every
+entry on it is confined to the subject the request is already about; without the
+policy this is an unbounded read of every patient in the database."
+done
+echo "  no writes; nothing in safety/obs; 2 tables + 2 functions allowlisted, all subject-scoped"
 
 # ---------------------------------------------------------------------------
 # 4. AND IT CAN ACTUALLY DO ITS JOB.

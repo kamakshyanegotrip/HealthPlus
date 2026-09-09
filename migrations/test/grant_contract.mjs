@@ -83,6 +83,9 @@ const DATABASE_URL =
 const APP_ROLES = `('hp_app','hp_reader','redflag_role','alert_role','metrics_role',
                     'dqe_role','erasure_role','reasoner_role','confirmation_ui_role')`;
 
+/** The same list as an ARRAY literal, for rules that need `unnest` rather than `IN`. */
+const APP_ROLES_ARRAY = `ARRAY${APP_ROLES.replace('(', '[').replace(/\)$/, ']')}`;
+
 // Append-only by design: an audit or log row that can be updated or deleted
 // is not an audit record. §2.3.4g, HP-RB-001, §3.13.1, §4.0.7.
 const APPEND_ONLY = `('red_flag_log','response_audit_event','fabrication_block',
@@ -268,6 +271,52 @@ const RULES = [
        WHERE g.grantee IN ${APP_ROLES}
          AND g.privilege_type = 'EXECUTE'
          AND NOT has_schema_privilege(g.grantee, g.routine_schema, 'USAGE')`,
+  },
+  {
+    id: 'M-policy-with-no-grant',
+    title: 'A row-level policy is inert unless some application role can reach the table',
+    why:
+      'Rule B\'s exact mirror, and the half that was missing. B catches a GRANT with no ' +
+      'policy behind it — a privilege that reaches a default-deny table. This catches a ' +
+      'POLICY with no grant in front of it: a row boundary, correctly written and scoped, ' +
+      'guarding a table no application role holds a single privilege on. It never ' +
+      'evaluates, because nothing ever reaches the table for it to filter. ' +
+      'Both shapes read as "configured" to anyone skimming the schema, and neither does ' +
+      'anything. ' +
+      'HP-SR-001 recorded the symptom without the cause: "§4.6\'s flagged-high-risk-profile ' +
+      'trigger is already built in the schema — principal.patient_risk_flag — and nothing ' +
+      'reads it." Nothing read it because nothing COULD. p_prf_own has been sitting on that ' +
+      'table since migration 018 with USING (subject_id = app.current_user_id()) — the right ' +
+      'predicate, waiting for a reader that no migration ever granted. §2.4.3\'s minor gate ' +
+      'was reading a stub column instead, defaulted to false, for the entire life of the ' +
+      'project. Migration 041 grants the read; this rule is what would have found it. ' +
+      'ONE ENTRY IS BASELINED AND IS NOT A DEFECT: principal.patient_attribute keeps p_pa_own ' +
+      'with no grant deliberately, because the request path must read attributes only through ' +
+      'principal.fetch_attribute_envelope — which writes the §3.8.2 access log on every read ' +
+      'and enforces the inferred/CONFIRMATION_UI rule. The policy is the backstop for the day ' +
+      'somebody adds a direct grant, so it is dormant by design rather than by oversight.',
+    sql: `
+      WITH app_roles AS (
+        SELECT unnest(${APP_ROLES_ARRAY}) AS r
+      ),
+      policied AS (
+        SELECT c.oid, n.nspname, c.relname,
+               string_agg(DISTINCT p.polname, ', ') AS pols
+          FROM pg_policy p
+          JOIN pg_class c ON c.oid = p.polrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relrowsecurity
+           AND n.nspname NOT IN ('pg_catalog','information_schema')
+         GROUP BY 1,2,3
+      )
+      SELECT 'PUBLIC'::text AS role,
+             t.nspname||'.'||t.relname AS object,
+             'RLS policy '||t.pols||' exists; no application role holds any privilege' AS detail
+        FROM policied t
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM app_roles a, unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) pv
+          WHERE has_table_privilege(a.r, t.oid, pv))`,
   },
   {
     id: 'L-definer-not-public',
