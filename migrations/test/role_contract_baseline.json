@@ -17,14 +17,6 @@
       "error": "permission denied for schema obs",
       "why": "obs.fabrication_block has no INSERT grant to any application role and RLS is on with one metrics-only SELECT policy. Needs obs.record_fabrication_block(...) — a DEFINER function, per the idiom obs.record_metric_sample already sets, rather than a direct grant.",
       "item": "HP-RECON-004 §4 — the obs write functions"
-    },
-    {
-      "id": "b70657b765ee",
-      "file": "chat-pipeline/worker/side-effect-worker.mjs",
-      "role": "hp_app",
-      "error": "permission denied for schema safety",
-      "why": "The side-effect worker runs on the app's own DATABASE_URL, so it is hp_app, and it reads safety.clinician_alert — which hp_app cannot reach at all. It is also the consumer half of side_effect_job, the stub-invented queue R10b replaces with obs.review_queue_item. R10b is PARKED by decision: review_queue_item.clinical_domain is NOT NULL and nothing in the request path produces a clinical domain, so the reroute needs response-domain classification — which decides who is competent to review what, and is the clinical lead's call.",
-      "item": "R10b — parked, HP-RECON-006 §5"
     }
   ]
 }

@@ -94,11 +94,6 @@ const ENTRY_POINTS = [
     reason: "its own Fly process; the file's own header says it connects as alert_role (migration 029)",
   },
   {
-    prefix: 'chat-pipeline/worker/side-effect-worker.mjs',
-    role: 'hp_app',
-    reason: 'its header says "the same connection string the app itself uses" — which is the finding, not the design (HP-RECON-004 §2)',
-  },
-  {
     prefix: 'src/jobs/computeSafetyMetrics.mjs',
     role: 'metrics_role',
     reason: 'the scheduled metrics process; obs.record_metric_sample EXECUTE is granted to metrics_role and to nothing else',

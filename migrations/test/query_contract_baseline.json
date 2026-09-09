@@ -22,41 +22,6 @@
       "error": "relation \"patient_profile\" does not exist",
       "why": "The real schema files this under principal.patient_profile; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no principal.patient_profile at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs. app_user, patient_attribute and subject_key are likewise principal.*.",
       "item": "R10d, which rides with the cutover"
-    },
-    {
-      "id": "94d08cf05f38",
-      "file": "chat-pipeline/src/lib/pipeline/sideEffectDispatcher.ts",
-      "error": "relation \"side_effect_job\" does not exist",
-      "why": "side_effect_job is a stub invention. The real schema has obs.review_queue_item, which is strictly better — FKs to principal.clinician and safety.clinical_domain, a c_no_implicit_approval CHECK, and a trigger enforcing §2.3.4c (a clinician may not claim a review outside their registered domain). The stub replaced a safety control with a generic queue that enforces none of it. Fixing this is a reroute, not a new table.",
-      "item": "R10b, which rides with the cutover"
-    },
-    {
-      "id": "38a4b6f5a32d",
-      "file": "chat-pipeline/worker/side-effect-worker.mjs",
-      "error": "relation \"side_effect_job\" does not exist",
-      "why": "Consumer side of the same stub invention — the claim/lease query. Reroutes with the dispatcher.",
-      "item": "R10b, which rides with the cutover"
-    },
-    {
-      "id": "dedf79dc6009",
-      "file": "chat-pipeline/worker/side-effect-worker.mjs",
-      "error": "relation \"side_effect_job\" does not exist",
-      "why": "Consumer side of the same stub invention — the DONE transition.",
-      "item": "R10b, which rides with the cutover"
-    },
-    {
-      "id": "461abc93b81b",
-      "file": "chat-pipeline/worker/side-effect-worker.mjs",
-      "error": "relation \"side_effect_job\" does not exist",
-      "why": "Consumer side of the same stub invention — the FAILED transition.",
-      "item": "R10b, which rides with the cutover"
-    },
-    {
-      "id": "69a3fd01eee4",
-      "file": "chat-pipeline/worker/side-effect-worker.mjs",
-      "error": "relation \"side_effect_job\" does not exist",
-      "why": "Consumer side of the same stub invention — the requeue transition.",
-      "item": "R10b, which rides with the cutover"
     }
   ]
 }
