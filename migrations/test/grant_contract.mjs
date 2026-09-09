@@ -234,11 +234,18 @@ const RULES = [
          WHERE NOT p.prosecdef
       ), refs AS (
         SELECT trig.role, trig.proname, trig.on_table,
+               -- "public" belongs in this list and was missing from it. The
+               -- audit log lives there, and public.audit_event_chain reads it —
+               -- so the one trigger on the immutable record of truth sat
+               -- outside the only rule that checks triggers. (It also reads the
+               -- table UNQUALIFIED, which no regex over prosrc will catch;
+               -- rule O is what actually covers that, by asking about the
+               -- security context rather than parsing the body.)
                (regexp_matches(trig.prosrc,
-                 '(safety|obs|principal|evidence|domain|commercial)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
+                 '(safety|obs|principal|evidence|domain|commercial|public)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
                  'g'))[1] AS sch,
                (regexp_matches(trig.prosrc,
-                 '(safety|obs|principal|evidence|domain|commercial)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
+                 '(safety|obs|principal|evidence|domain|commercial|public)\\.([a-zA-Z_][a-zA-Z0-9_]*)',
                  'g'))[2] AS rel
           FROM trig
       )
@@ -368,6 +375,39 @@ const RULES = [
         FROM information_schema.role_table_grants
        WHERE grantee = 'PUBLIC'
          AND table_schema NOT IN ('pg_catalog','information_schema')`,
+  },
+  {
+    id: 'O-trigger-decides-on-a-slice',
+    title: 'A trigger function that reads a table does not decide on the caller\'s slice of it',
+    why:
+      'Rule H asks whether a writer CAN READ what an INVOKER trigger reads, which is the ' +
+      'direction that fails loudly: permission denied, from inside a trigger, nothing ' +
+      'written. The other direction is silent. Under row-level security the writer does ' +
+      'not get an error, it gets FEWER ROWS — so a constraint that counts, or looks for a ' +
+      'conflicting row, reaches its verdict on the caller\'s slice rather than on the table. ' +
+      'evidence.assert_attribute_cardinality is that shape: it counts rows and raises when ' +
+      'the count exceeds a cap, so an undercount passes the cap. ' +
+      'The live case was public.audit_event_chain, which computed each row\'s prev_hash from ' +
+      '"the head of the log" — meaning, as INVOKER, the head THIS CALLER CAN SEE. Probed ' +
+      'with a policy that hides rows from each other, three appends produced two branches ' +
+      'from genesis with the middle row orphaned: HP-RB-001\'s hash chain became a forest, ' +
+      'in which a row can be removed from the middle of a branch without breaking any link ' +
+      'a verifier can follow. Migration 045 converted it and twelve others. ' +
+      'This rule does not parse bodies for table names the way rule H does — that regex ' +
+      'cannot see an unqualified reference, and audit_event_chain\'s was unqualified. It ' +
+      'asks the simpler question that has no blind spot: does this function read anything ' +
+      'at all, and is it running as the schema or as whoever happened to write the row. ' +
+      'A trigger function that reads NOTHING is not reported; there is no slice to decide on.',
+    sql: `
+      SELECT coalesce(pg_get_userbyid(p.proowner), '?')::text AS role,
+             n.nspname || '.' || p.proname || '()' AS object,
+             'INVOKER trigger reads a table; under RLS it decides on the caller''s rows'::text AS detail
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE p.prorettype = 'trigger'::regtype
+         AND NOT p.prosecdef
+         AND n.nspname NOT IN ('pg_catalog','information_schema')
+         AND p.prosrc ~ '(FROM|JOIN|INTO|UPDATE|DELETE FROM)\\s'`,
   },
   {
     id: 'N-view-runs-as-owner',
