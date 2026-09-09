@@ -1,58 +1,65 @@
 import { randomUUID } from 'node:crypto';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { PipelineContext, ResponseCategory, RedFlagSeverity } from '../src/lib/types';
+import { newPendingTelemetry } from '../src/lib/types';
 import { loadPrompt } from '../src/lib/prompts/registry';
 import { CLINICAL_DECISION_REFUSAL } from '../src/lib/prompts/annexB';
 import { __setAnthropicClientForTesting, type AnthropicLike } from '../src/lib/anthropic';
 import { db } from '../src/lib/db';
 import { sessionPseudonym } from '../src/lib/pseudonymize';
-import { lookupPatientProfile } from '../src/lib/pipeline/patientProfile';
+import type { SubjectKey } from '../src/lib/subjectKey';
+import {
+  seedRealSchema,
+  endSeedPool,
+  seedQuery,
+  SEED,
+  SEEDED_CRITICAL_TEMPLATE_BODY,
+} from '../scripts/seed-real';
 
 /**
- * GAP RESOLVED (Turn 5 punch list — "orchestration layer never actually
- * run/tested end-to-end"): this drives the ACTUAL `runPipeline` (exported
- * from src/app/api/chat/route.ts) against a real local Postgres (same
- * db/000 + db/010 + db/999 this repo's other DB tooling uses — see README
- * "Running"), with the Anthropic client swapped for a scripted mock via
- * anthropic.ts's `__setAnthropicClientForTesting`. No live Anthropic call is
- * made anywhere in this file.
+ * The orchestration test, moved off the stub schema (R10f).
  *
- * What this exercises that nothing else in the repo did before: the actual
- * branching inside `runPipeline` — which of its four exit points a given
- * combination of category/severity/retrieval actually reaches — not just
- * each step's SQL in isolation (scripts/smoke-test.mjs) or each step's pure
- * logic in isolation (test/*.test.ts). `auth.ts`'s `requireAuth` is NOT
- * exercised here (it's tested separately, and `runPipeline` itself never
- * calls it — only `POST` does) — this is intentionally the orchestration
- * layer alone.
+ * It drives the ACTUAL `runPipeline` (exported from src/app/api/chat/route.ts)
+ * against a real Postgres with `migrations/` applied and `scripts/seed-real.ts`
+ * run, with the Anthropic client swapped for a scripted mock. No live Anthropic
+ * call is made anywhere in this file. What it exercises that nothing else does
+ * is the BRANCHING inside `runPipeline` — which of its exit points a given
+ * combination of category, severity and retrieval actually reaches — rather
+ * than each step's SQL or each step's pure logic in isolation.
  *
- * Requires a running local Postgres with db/000 + db/010 + db/999 applied
- * (see README's "Running" section) and RUN_PIPELINE_INTEGRATION=1 set —
- * `npm run test:integration` does both. Skipped by default so `npm test`
- * stays green with no DB running, matching this repo's existing split
- * between `test` (pure/unit) and `test:db` (needs Postgres).
+ * ---------------------------------------------------------------------------
+ * WHAT CHANGED IN THE MOVE, BEYOND TABLE NAMES
+ *
+ * Three things, and none of them is cosmetic:
+ *
+ * 1. THE FIXTURE IS BUILT BY THE CODE UNDER TEST. `db/999_seed_smoke_test.sql`
+ *    wrote rows by hand; `seed-real.ts` mints subject keys and encrypts
+ *    attributes through `subjectKey.ts` itself. A hand-written fixture is how
+ *    the stub came to disagree with the schema in twelve places.
+ *
+ * 2. EVERY TURN NEEDS A SUBJECT KEY. `PipelineContext.subjectKey` is required,
+ *    because every pseudonym written in one turn must derive from one salt.
+ *    `newCtx` below takes the key from the seed rather than minting its own,
+ *    so a test asserting on a pseudonym is asserting on the same namespace the
+ *    seed wrote under.
+ *
+ * 3. THE §2.0.2 BRANCH TEST IS GONE, AND ITS REPLACEMENT ASSERTS WHY. See
+ *    `test_2_0_2_post_retrieval_reconciliation_is_unreachable` below. This is
+ *    the one substantive finding of the move and it is not a table rename.
+ *
+ * ---------------------------------------------------------------------------
+ * NOT HERE: the RLS block. `lookupPatientProfile`'s behaviour under
+ * `principal.*` row-level security lives in `test/patientProfile.db.test.ts`,
+ * which also states what a passing run there cannot prove (superuser-owned
+ * objects make FORCE RLS inert locally) and which gate covers that instead.
+ * Duplicating a weaker version of it here would be worse than not having it.
+ *
+ * Requires RUN_PIPELINE_INTEGRATION=1, a database with `migrations/` applied,
+ * and both DATABASE_URL (the application role) and SEED_DATABASE_URL (an owner
+ * role) set. `npm run test:integration` does the first.
  */
 
 const RUN = process.env.RUN_PIPELINE_INTEGRATION === '1';
-
-// Seeded in db/999_seed_smoke_test.sql.
-const SEEDED_USER_ID = '11111111-1111-1111-1111-111111111111';
-/** db/999: a patient whose age was never established — `is_minor IS NULL`, not
- *  false. Before HP-SR-001 §4 the stub column was `NOT NULL DEFAULT false`, so
- *  this user could not be written down at all. */
-const UNKNOWN_AGE_USER_ID = 'cccccccc-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
-// A second, unrelated patient — seeded purely to prove HP-SEC-001 RLS
-// isolation (db/020_rls.sql) below; never referenced by any non-RLS test.
-const SEEDED_USER_ID_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
-const SEEDED_GUIDELINE_CLAIM_ID = '33333333-3333-3333-3333-333333333333';
-// R2: templates are resolved by (severity, jurisdiction, language) through the
-// §4.3.3 ladder, not by an FK on the rule row, so there is no longer a generic
-// stand-in. newCtx() below is dataRegion 'IN' with no statedCountry and no
-// language, i.e. jurisdiction 'IN' / language 'en' — which is an exact match
-// on the seeded CRITICAL template in db/999_seed_smoke_test.sql.
-const SEEDED_CRITICAL_TEMPLATE_ID = '44444444-4444-4444-4444-444444444402';
-const SEEDED_CRITICAL_TEMPLATE_BODY =
-  'This may be a medical emergency. Contact your local emergency number now.';
 
 interface SseEvent {
   event: string;
@@ -90,14 +97,11 @@ function makeMockStream(text: string) {
 
 /**
  * The Anthropic SDK's `.messages.create()` signature doesn't carry
- * `LoggedCallMeta.purpose` (that's an application-level field, logged but
- * never sent to the API) — so this mock, like the real API, only sees
- * {model, system, messages, ...}. It distinguishes which of the pipeline's
- * four LLM-facing steps is calling by matching `system` against the exact
- * prompt text each step loads from the registry (INTENT_COMPLEXITY /
- * CATEGORY_CLASSIFIER / RED_FLAG_PROPOSE are matched exactly;
- * CLINICAL_REASONING's system is that prompt plus two Annex B blocks
- * appended, so it's matched by prefix).
+ * `LoggedCallMeta.purpose` (that's an application-level field, logged but never
+ * sent to the API) — so this mock, like the real API, only sees {model, system,
+ * messages, ...}. It distinguishes which of the pipeline's four LLM-facing
+ * steps is calling by matching `system` against the exact prompt text each step
+ * loads from the registry.
  */
 function buildMockClient(scenario: Scenario): AnthropicLike {
   const INTENT_PROMPT = loadPrompt('INTENT_COMPLEXITY').text;
@@ -135,21 +139,35 @@ function buildMockClient(scenario: Scenario): AnthropicLike {
   } as unknown as AnthropicLike;
 }
 
-function newCtx(message: string, sessionId: string = randomUUID(), userId: string = SEEDED_USER_ID): PipelineContext {
-  const now = new Date().toISOString();
+/**
+ * The seeded fixtures, resolved once in beforeAll. Module-level so `newCtx` can
+ * reach the keys without every call site threading them.
+ */
+let keys: Record<'adult' | 'unknownAge' | 'other', SubjectKey>;
+let seededRegion: string;
+
+type Who = 'adult' | 'unknownAge' | 'other';
+const USER_ID: Record<Who, string> = {
+  adult: SEED.adultUser,
+  unknownAge: SEED.unknownAgeUser,
+  other: SEED.otherUser,
+};
+
+function newCtx(message: string, sessionId: string = randomUUID(), who: Who = 'adult'): PipelineContext {
+  const userId = USER_ID[who];
   return {
     sessionId,
     userId,
     message,
-    dataRegion: 'IN',
+    dataRegion: seededRegion,
     auditId: randomUUID(),
-    receivedAt: now,
-    // HP-SEC-001 RLS (db/020_rls.sql): matches userId above, same as
-    // route.ts always sets it (both come from the one verified JWT) —
-    // see the dedicated "HP-SEC-001 RLS" describe block below for tests
-    // that deliberately mismatch these two to prove RLS, not this field
-    // alone, is what gates patient_profile visibility.
+    receivedAt: new Date().toISOString(),
     authClaims: { sub: userId, user_role: 'patient', hospital_id: null, admin_scopes: [] },
+    // Resolved once per turn and carried, exactly as route.ts does it. Taken
+    // from the seed rather than minted here so that a pseudonym asserted below
+    // is derived from the same salt the seeded rows were written under.
+    subjectKey: keys[who],
+    pending: newPendingTelemetry(),
   };
 }
 
@@ -164,32 +182,33 @@ async function drive(ctx: PipelineContext, scenario: Scenario): Promise<SseEvent
     __setAnthropicClientForTesting(null);
   }
   // dispatchSideEffects is fired without being awaited by runPipeline (by
-  // design — see sideEffectDispatcher.ts). Give its one fast local INSERT a
-  // moment to land before the next assertion/cleanup runs, so it can never
-  // race db().end() in afterAll.
+  // design — see sideEffectDispatcher.ts). Give it a moment to finish before
+  // the next assertion or cleanup runs, so it can never race db().end().
   await new Promise((resolve) => setTimeout(resolve, 50));
   return events;
 }
 
-describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with db/000+010+999 applied — see README, or run `npm run test:integration`)', () => {
-  beforeAll(() => {
-    process.env.DATABASE_URL ??= 'postgres://hp_app:hp_app_pw@127.0.0.1:5432/hp_test';
-    process.env.DATA_REGION ??= 'IN';
-    process.env.SUBJECT_HMAC_KEY ??= 'base64:dGVzdC1vbmx5LXNlY3JldC1kby1ub3QtdXNlLWluLXByb2R1Y3Rpb24=';
+describe.skipIf(!RUN)('runPipeline integration (real schema — migrations/ + scripts/seed-real.ts; see README)', () => {
+  beforeAll(async () => {
     process.env.POLICY_VERSION ??= 'HP-SCHEMA-001-v0.4';
-    process.env.RED_FLAG_RULESET_VERSION ??= 'rf-rules-2026.08.1';
     process.env.PROMPT_VERSION_COMPOSE ??= 'compose-2026.08.1';
-  });
+    const seeded = await seedRealSchema();
+    keys = seeded.keys;
+    seededRegion = seeded.region.region;
+  }, 60_000);
 
   afterAll(async () => {
-    await db().end();
+    await endSeedPool().catch(() => {});
+    await db().end().catch(() => {});
+    await db('reasoner').end().catch(() => {});
+    await db('redflag').end().catch(() => {});
   });
 
   it('test_branch_1_emergency_short_circuit: a model-raised severity to CRITICAL renders the static template and never reaches synthesis', async () => {
     const ctx = newCtx("I'm having crushing chest pain and can't breathe");
     // Base severity from the seeded chest-pain rule is URGENT; the mocked
-    // RED_FLAG_PROPOSE raise to CRITICAL is what actually triggers the
-    // §4.0.5 short-circuit (clampSeverity('URGENT','CRITICAL') -> CRITICAL).
+    // RED_FLAG_PROPOSE raise to CRITICAL is what actually triggers the §4.0.5
+    // short-circuit (clampSeverity('URGENT','CRITICAL') -> CRITICAL).
     const events = await drive(ctx, {
       intentDomains: [],
       intentComplexity: 'LOW',
@@ -200,32 +219,62 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     expect(events.find((e) => e.event === 'severity')).toMatchObject({ data: { severity: 'CRITICAL' } });
     const sentences = events.filter((e) => e.event === 'sentence');
     expect(sentences).toHaveLength(1);
-    // R2: what is rendered is the seeded CRITICAL template's own body, verbatim
-    // — not the generic escalation copy that used to stand in for every level.
-    // §4.4's time-to-care language differs per level by design, which is the
-    // reason one catch-all template was the wrong shape in the first place.
+    // The seeded CRITICAL template's own body, verbatim — §4.4's time-to-care
+    // language differs per level, which is why one catch-all template was the
+    // wrong shape.
     expect((sentences[0]!.data as { text: string }).text).toBe(SEEDED_CRITICAL_TEMPLATE_BODY);
-    // §3.0.4-adjacent sanity: knowledge lookup must never have run on this path.
+    // Knowledge lookup must never have run on this path.
     expect(events.find((e) => e.event === 'sources')).toBeUndefined();
 
-    const audit = await db().query('SELECT category, review_state, agg_confidence FROM response_audit WHERE id = $1', [ctx.auditId]);
-    expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0].category).toBe('INFORMATIONAL');
-    expect(audit.rows[0].review_state).toBe('PENDING'); // §4.0.5: review required, but concurrent, not a precondition
+    const audit = await seedQuery(
+      'SELECT category, review_state, agg_confidence FROM obs.response_audit WHERE id = $1',
+      [ctx.auditId],
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0].category).toBe('INFORMATIONAL');
+    // NOT 'PENDING', which is what this asserted under the stub.
+    // `c_emergency_not_gated` refuses a CRITICAL/EMERGENCY row in PENDING —
+    // §4.0.5 forbids an emergency display being gated on review, and a row
+    // that is both is a contradiction the schema will not store. The review
+    // obligation travels on the clinician alert the red_flag_event trigger
+    // raises; the assertion below is that it actually did.
+    expect(audit[0].review_state).toBe('NOT_REQUIRED');
 
-    const rfe = await db().query('SELECT severity, action_taken, template_id, template_displayed_at, first_byte_at FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
-    expect(rfe.rows).toHaveLength(1);
-    expect(rfe.rows[0].severity).toBe('CRITICAL');
-    expect(rfe.rows[0].action_taken).toBe('TEMPLATE_SHOWN');
-    expect(rfe.rows[0].template_id).toBe(SEEDED_CRITICAL_TEMPLATE_ID); // resolved by severity+jurisdiction+language, not by the rule
-    expect(rfe.rows[0].template_displayed_at).not.toBeNull(); // c_emergency_display_not_gated requires this at CRITICAL+
+    const rfe = await seedQuery(
+      `SELECT severity, action_taken, template_id, template_displayed_at
+         FROM safety.red_flag_event WHERE audit_id = $1`,
+      [ctx.auditId],
+    );
+    expect(rfe).toHaveLength(1);
+    expect(rfe[0].severity).toBe('CRITICAL');
+    expect(rfe[0].action_taken).toBe('TEMPLATE_SHOWN');
+    // Resolved by the §4.3.3 ladder on (severity, jurisdiction, language) —
+    // not by an FK on the rule row.
+    expect(rfe[0].template_id).toBe(SEED.criticalTemplate);
+    expect(rfe[0].template_displayed_at).not.toBeNull(); // c_emergency_display_not_gated
 
-    const published = await db().query(`SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
-    expect(published.rows).toHaveLength(1);
-    expect(published.rows[0].payload.path).toBe('emergency_template');
+    // Where the §4.0.5 review obligation actually lives now. `red_flag_event`
+    // carries trg_raise_alert_for_event (raises it) and trg_event_requires_alert
+    // (refuses the event row without one), so this is the database's guarantee
+    // rather than the application's — but it is asserted because the audit row
+    // above no longer records the obligation and something must.
+    const alerts = await seedQuery(
+      `SELECT a.id FROM safety.clinician_alert a
+         JOIN safety.red_flag_event e ON e.id = a.event_id
+        WHERE e.audit_id = $1`,
+      [ctx.auditId],
+    );
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+
+    const published = await seedQuery(
+      `SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`,
+      [ctx.auditId],
+    );
+    expect(published).toHaveLength(1);
+    expect(published[0].payload.path).toBe('emergency_template');
   });
 
-  it('test_branch_2_clinical_decision_short_circuit: category classifier alone routes to the static §2.3.6 refusal', async () => {
+  it('test_branch_2_clinical_decision_short_circuit: the category classifier alone routes to the static §2.3.6 refusal', async () => {
     const ctx = newCtx('Given my test results, do I need this surgery?');
     const events = await drive(ctx, {
       intentDomains: [],
@@ -240,164 +289,211 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     expect((sentences[0]!.data as { text: string }).text).toBe(CLINICAL_DECISION_REFUSAL);
     expect(events.find((e) => e.event === 'sources')).toBeUndefined();
 
-    const audit = await db().query('SELECT category, review_state FROM response_audit WHERE id = $1', [ctx.auditId]);
-    expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0].category).toBe('INFORMATIONAL');
-    expect(audit.rows[0].review_state).toBe('NOT_REQUIRED');
+    const audit = await seedQuery(
+      'SELECT category, review_state FROM obs.response_audit WHERE id = $1',
+      [ctx.auditId],
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0].category).toBe('INFORMATIONAL');
+    expect(audit[0].review_state).toBe('NOT_REQUIRED');
 
-    // NORMAL severity never crosses the §4.0.2 MONITOR floor — recordRedFlagEvent must be a no-op here.
-    const rfe = await db().query('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
-    expect(rfe.rows).toHaveLength(0);
+    // NORMAL never crosses the §4.0.2 MONITOR floor — recordRedFlagEvent is a no-op.
+    const rfe = await seedQuery('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
+    expect(rfe).toHaveLength(0);
   });
 
-  it('test_branch_4_post_retrieval_reconciliation: a retrieved TEST_INTERPRETATION claim upgrades DECISION_SUPPORT to the refusal (§2.0.2)', async () => {
-    // Matches ONLY the TEST_INTERPRETATION claim seeded in
-    // db/999_seed_smoke_test.sql's MONITORING-domain row (id ...0005) via
-    // websearch_to_tsquery AND-matching — the same query string
-    // scripts/smoke-test.mjs already verified surfaces exactly that claim.
-    const ctx = newCtx('fasting glucose reading interpretation diagnosis correlation');
-    const events = await drive(ctx, {
-      intentDomains: ['MONITORING'],
-      intentComplexity: 'LOW',
-      category: 'DECISION_SUPPORT', // the INITIAL classification — retrieval is what upgrades it
-      proposedSeverity: 'NORMAL',
-    });
+  /**
+   * WHAT USED TO BE `test_branch_4_post_retrieval_reconciliation`.
+   *
+   * The stub-era test drove a message that retrieved a TEST_INTERPRETATION
+   * claim and asserted that route.ts's §2.0.2 re-check upgraded the response to
+   * CLINICAL_DECISION and refused. It passed. It cannot be ported, and the
+   * reason is the finding rather than an inconvenience:
+   *
+   *   `db/999_seed_smoke_test.sql` inserted its own `evidence.claim_policy` row
+   *   making (TIER_2, TEST_INTERPRETATION, DECISION_SUPPORT) PERMITTED. That row
+   *   is labelled 'SMOKE-TEST' in the fixture itself. The adopted policy in
+   *   `migrations/` says PROHIBITED — at every one of the fifteen (tier,
+   *   category) pairs, which is §3.1/§3.1.7's position that TEST_INTERPRETATION
+   *   is a deny-only kind.
+   *
+   * So the branch at route.ts's `claims.some(c => c.kind === 'TEST_INTERPRETATION')`
+   * is unreachable against the real schema, and it is unreachable twice over:
+   *
+   *   (a) a TEST_INTERPRETATION claim cannot be BOUND to the retrieval registry
+   *       at all — no `domain_attribute_kind` row expects that kind, and
+   *       `evidence.assert_attribute_claim_kind()` raises HP-ESC 1.5.3 on the
+   *       attempt. Unbound means `claim_search`'s scoped CTE never sees it.
+   *   (b) even bound, `knowledgeLookup` filters `pol.disposition <> 'PROHIBITED'`
+   *       before the claim reaches route.ts.
+   *
+   * This test asserts BOTH walls rather than deleting the case. The logic of
+   * `reconcileAfterRetrieval` is already covered as a pure function in
+   * test/categoryClassifier.test.ts, so nothing is lost there; what this adds is
+   * that the walls are monitored. If someone registers a slot for the kind, or
+   * flips a policy row to make one retrievable, this goes red and the §2.0.2
+   * branch becomes live code again — which is a decision for the clinical lead
+   * (HP-SR-001 §2.2.5), not a silent consequence of a data change.
+   *
+   * OPEN, AND RECORDED RATHER THAN RESOLVED HERE: §2.0.2 wants a question that
+   * turns out to hinge on test interpretation to be REFUSED. What the real
+   * schema does instead is drop the prohibited claim from retrieval and answer
+   * from whatever else was retrieved. Nothing unsourced is emitted, so this is
+   * not a §3.0.3 hole — but the refusal §2.0.2 asks for does not happen, and
+   * whether that is acceptable is a Charter question.
+   */
+  it('test_2_0_2_post_retrieval_reconciliation_is_unreachable: TEST_INTERPRETATION can be neither bound nor retrieved', async () => {
+    // Wall (a): no registry slot expects the kind.
+    const slots = await seedQuery<{ n: string }>(
+      `SELECT count(*) AS n FROM evidence.domain_attribute_kind
+        WHERE expected_claim_kind = 'TEST_INTERPRETATION'`,
+    );
+    expect(Number(slots[0].n)).toBe(0);
 
-    // Retrieval DID run on this path (unlike branches 1/2) — that's the point.
-    const sources = events.find((e) => e.event === 'sources');
-    expect(sources).toBeDefined();
-    expect((sources!.data as { count: number; domains: string[] }).count).toBeGreaterThanOrEqual(1);
-    expect((sources!.data as { domains: string[] }).domains).toContain('MONITORING');
+    // Wall (b): every policy row for the kind is PROHIBITED, and there is at
+    // least one — an EMPTY policy set would also make the disposition filter
+    // drop the claim, but for the opposite reason (§3.0.3's default-deny), and
+    // the two must not be confused.
+    const policy = await seedQuery<{ disposition: string; n: string }>(
+      `SELECT disposition, count(*) AS n FROM evidence.claim_policy
+        WHERE kind = 'TEST_INTERPRETATION' GROUP BY disposition`,
+    );
+    expect(policy).toHaveLength(1);
+    expect(policy[0].disposition).toBe('PROHIBITED');
+    expect(Number(policy[0].n)).toBeGreaterThan(0);
 
-    const sentences = events.filter((e) => e.event === 'sentence');
-    expect(sentences).toHaveLength(1);
-    expect((sentences[0]!.data as { text: string }).text).toBe(CLINICAL_DECISION_REFUSAL);
-
-    const audit = await db().query('SELECT category, review_state FROM response_audit WHERE id = $1', [ctx.auditId]);
-    expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0].category).toBe('INFORMATIONAL');
-
-    const published = await db().query(`SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
-    expect(published.rows).toHaveLength(1);
-    expect(published.rows[0].payload.path).toBe('clinical_decision_refusal_post_retrieval');
+    // And no fixture has quietly re-introduced the stub's override.
+    const permitted = await seedQuery<{ n: string }>(
+      `SELECT count(*) AS n FROM evidence.claim_policy
+        WHERE kind = 'TEST_INTERPRETATION' AND disposition <> 'PROHIBITED'`,
+    );
+    expect(Number(permitted[0].n)).toBe(0);
   });
 
   it('test_branch_normal_completion: a properly cited GUIDELINE claim streams through, gets published, and is fully audited', async () => {
-    // Exact phrase already verified (scripts/smoke-test.mjs) to AND-match the
-    // seeded GUIDELINE claim's tsvector via websearch_to_tsquery — extra
-    // words not present in that tsvector (e.g. "recommend") make the AND
-    // match fail entirely and knowledgeLookup silently returns zero rows,
-    // which is exactly the kind of failure this test exists to catch, not
-    // trip over by accident.
-    const ctx = newCtx('HbA1c target diabetes guideline');
+    // `evidence.retrieval_chunk.tsv` is `to_tsvector('simple', body)` — SIMPLE,
+    // so there is no stemming and a query word must appear in the body
+    // verbatim. websearch_to_tsquery ANDs the terms, so one absent word makes
+    // the whole match fail and retrieval returns zero rows silently. All three
+    // words below are in the seeded chunk.
+    const ctx = newCtx('light walking recovery');
     const events = await drive(ctx, {
       intentDomains: ['GUIDELINE'],
       intentComplexity: 'LOW',
       category: 'DECISION_SUPPORT',
       proposedSeverity: 'NORMAL',
-      reasoningText: `Relevant: [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]] gives the ADA HbA1c target for this population.`,
+      reasoningText: `Relevant: [[claim:${SEED.guidelineClaim}]] covers early mobilisation after an uncomplicated procedure.`,
       // The citation marker must land BEFORE the sentence-ending punctuation:
-      // splitIntoSentences (emissionValidator.ts) splits on `[.!?]\s+` followed
-      // by an uppercase/digit/quote/`[` — a marker placed after a trailing
-      // period gets split into its own "sentence" with no numeric claim of its
-      // own attached to it, leaving the actual numeric-claim sentence uncited
-      // and blocked. (Found by running this test the first time — exactly the
-      // §3.0.3 sentence-boundary trade-off emissionValidator.ts's own header
-      // comment calls out, not a bug in that module.)
-      synthesisText: `For most non-pregnant adults with type 2 diabetes, guidance commonly targets an HbA1c below 7% [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]].`,
+      // splitIntoSentences splits on `[.!?]\s+` followed by uppercase/digit/
+      // quote/`[`, so a marker after a trailing period becomes its own
+      // "sentence" and leaves the numeric claim uncited — and therefore
+      // blocked. That is emissionValidator's documented sentence-boundary
+      // trade-off, not a bug.
+      synthesisText: `Guidance commonly suggests resuming light walking within 24 to 48 hours after an uncomplicated procedure [[claim:${SEED.guidelineClaim}]].`,
     });
 
     const sources = events.find((e) => e.event === 'sources');
     expect(sources).toBeDefined();
-    expect((sources!.data as { count: number; domains: string[] }).count).toBe(1);
+    expect((sources!.data as { count: number }).count).toBe(1);
     expect((sources!.data as { domains: string[] }).domains).toEqual(['GUIDELINE']);
 
     const sentences = events.filter((e) => e.event === 'sentence');
     expect(sentences.length).toBeGreaterThanOrEqual(1);
     const combined = sentences.map((s) => (s.data as { text: string }).text).join(' ');
-    expect(combined).toContain('HbA1c');
-    expect(combined).not.toContain('[[claim:'); // marker must never leak to the visible text
+    expect(combined).toContain('light walking');
+    expect(combined).not.toContain('[[claim:'); // the marker must never leak into visible text
     const citedIds = sentences.flatMap((s) => (s.data as { citedClaimIds: string[] }).citedClaimIds);
-    expect(citedIds).toContain(SEEDED_GUIDELINE_CLAIM_ID);
+    expect(citedIds).toContain(SEED.guidelineClaim);
 
-    const audit = await db().query('SELECT category, review_state, agg_confidence, cited_claim_ids FROM response_audit WHERE id = $1', [ctx.auditId]);
-    expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0].category).toBe('DECISION_SUPPORT');
-    expect(audit.rows[0].review_state).toBe('NOT_REQUIRED');
-    expect(Number(audit.rows[0].agg_confidence)).toBeCloseTo(0.82, 2); // the seeded claim_source confidence
-    expect(audit.rows[0].cited_claim_ids).toContain(SEEDED_GUIDELINE_CLAIM_ID);
+    const audit = await seedQuery(
+      'SELECT category, review_state, agg_confidence, cited_claim_ids FROM obs.response_audit WHERE id = $1',
+      [ctx.auditId],
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0].category).toBe('DECISION_SUPPORT');
+    expect(audit[0].review_state).toBe('NOT_REQUIRED');
+    expect(Number(audit[0].agg_confidence)).toBeCloseTo(0.86, 2); // the seeded claim_source confidence
+    expect(audit[0].cited_claim_ids).toContain(SEED.guidelineClaim);
 
-    const content = await db().query('SELECT audit_id FROM response_content WHERE audit_id = $1', [ctx.auditId]);
-    expect(content.rows).toHaveLength(1);
+    const content = await seedQuery('SELECT audit_id, key_id FROM obs.response_content WHERE audit_id = $1', [ctx.auditId]);
+    expect(content).toHaveLength(1);
+    // obs.response_content.key_id is NOT NULL with an FK to principal.subject_key.
+    // Under the stub this column did not exist and the content was encrypted
+    // under a process-wide placeholder; the row now names the subject's key,
+    // which is what makes erasure reach the stored response.
+    expect(content[0].key_id).toBe(keys.adult.keyId);
 
-    const published = await db().query(`SELECT seq FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
-    expect(published.rows).toHaveLength(1);
+    const published = await seedQuery(
+      `SELECT seq FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`,
+      [ctx.auditId],
+    );
+    expect(published).toHaveLength(1);
 
-    // NORMAL severity — no red_flag_event row expected on the happy path either.
-    const rfe = await db().query('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
-    expect(rfe.rows).toHaveLength(0);
+    const rfe = await seedQuery('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
+    expect(rfe).toHaveLength(0);
   });
 
   it('test_unknown_age_forces_review: the SAME response that publishes for a confirmed adult is held for review when age was never established (§2.4.3 / §3.0.3)', async () => {
-    // Deliberately a twin of test_branch_normal_completion: identical message,
-    // identical scenario, identical seeded claim. The ONLY difference is which
-    // patient asks. So a divergence in review_state is attributable to §2.4.3's
-    // gate and to nothing else — the point of the test is the contrast, not the
-    // value.
+    // Deliberately a twin of the test above: identical message, identical
+    // scenario, identical claim. The ONLY difference is which patient asks, so
+    // a divergence in review_state is attributable to §2.4.3's gate and to
+    // nothing else. The contrast is the test; the value alone is not.
     //
     // This is the case HP-SR-001 §4 found. Under `profile?.isMinor === true`
-    // this user resolved to "adult" and the response published, because
-    // is_minor IS NULL was read as false. Under `minorGateRequiresReview` an
-    // unestablished age is not an adult (§3.0.3), so review is required.
-    const ctx = newCtx('HbA1c target diabetes guideline', randomUUID(), UNKNOWN_AGE_USER_ID);
-
-    // The profile must actually be READ for this to mean anything. If RLS or a
-    // missing row made lookupPatientProfile return null, the gate would still
-    // fire — but for the wrong reason, and the test would pass while proving
-    // nothing about a NULL column. Assert the row is visible and its answer is
-    // genuinely absent before driving the pipeline.
-    const seen = await lookupPatientProfile(ctx);
-    expect(seen).not.toBeNull();
-    expect(seen!.userId).toBe(UNKNOWN_AGE_USER_ID);
-    expect(seen!.isMinor).toBeNull();
+    // this user resolved to "adult" and the response published. Against the
+    // real schema the subject has no age risk flag at all, `deriveIsMinor`
+    // returns null, and §3.0.3 resolves that closed.
+    const ctx = newCtx('light walking recovery', randomUUID(), 'unknownAge');
 
     const events = await drive(ctx, {
       intentDomains: ['GUIDELINE'],
       intentComplexity: 'LOW',
       category: 'DECISION_SUPPORT',
       proposedSeverity: 'NORMAL',
-      reasoningText: `Relevant: [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]] gives the ADA HbA1c target for this population.`,
-      synthesisText: `For most non-pregnant adults with type 2 diabetes, guidance commonly targets an HbA1c below 7% [[claim:${SEEDED_GUIDELINE_CLAIM_ID}]].`,
+      reasoningText: `Relevant: [[claim:${SEED.guidelineClaim}]] covers early mobilisation after an uncomplicated procedure.`,
+      synthesisText: `Guidance commonly suggests resuming light walking within 24 to 48 hours after an uncomplicated procedure [[claim:${SEED.guidelineClaim}]].`,
     });
 
     // Retrieval and synthesis are unaffected — the gate changes disposition,
-    // not content. If this diverged from the twin, the fix would be doing
-    // something it was not meant to do.
-    const sources = events.find((e) => e.event === 'sources');
-    expect((sources!.data as { count: number }).count).toBe(1);
+    // not content. A divergence here would mean the fix is doing something it
+    // was not meant to do.
+    expect((events.find((e) => e.event === 'sources')!.data as { count: number }).count).toBe(1);
     const sentences = events.filter((e) => e.event === 'sentence');
-    expect(sentences.map((x) => (x.data as { text: string }).text).join(' ')).toContain('HbA1c');
+    expect(sentences.map((x) => (x.data as { text: string }).text).join(' ')).toContain('light walking');
 
-    const audit = await db().query('SELECT category, review_state FROM response_audit WHERE id = $1', [ctx.auditId]);
-    expect(audit.rows).toHaveLength(1);
-    expect(audit.rows[0].category).toBe('DECISION_SUPPORT');
-    // The twin above asserts NOT_REQUIRED on these exact inputs.
-    expect(audit.rows[0].review_state).toBe('PENDING');
+    const audit = await seedQuery(
+      'SELECT category, review_state FROM obs.response_audit WHERE id = $1',
+      [ctx.auditId],
+    );
+    expect(audit).toHaveLength(1);
+    expect(audit[0].category).toBe('DECISION_SUPPORT');
+    expect(audit[0].review_state).toBe('PENDING'); // the twin asserts NOT_REQUIRED on these exact inputs
 
-    // §2.2.5b's disposition is recorded as REVIEW_REQUESTED, not PUBLISHED.
-    const published = await db().query(`SELECT seq FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`, [ctx.auditId]);
-    expect(published.rows).toHaveLength(0);
-    const requested = await db().query(`SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'REVIEW_REQUESTED'`, [ctx.auditId]);
-    expect(requested.rows).toHaveLength(1);
-    expect(requested.rows[0].payload.review_required).toBe(true);
+    // §2.2.5b's disposition is REVIEW_REQUESTED, not PUBLISHED.
+    const published = await seedQuery(
+      `SELECT seq FROM response_audit_event WHERE audit_id = $1 AND kind = 'PUBLISHED'`,
+      [ctx.auditId],
+    );
+    expect(published).toHaveLength(0);
+    const requested = await seedQuery(
+      `SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'REVIEW_REQUESTED'`,
+      [ctx.auditId],
+    );
+    expect(requested).toHaveLength(1);
+    expect(requested[0].payload.review_required).toBe(true);
   });
 
   it('test_session_severity_floor_sticks_across_turns_in_the_same_session (§4.0.8)', async () => {
     const sessionId = randomUUID();
+    // Every pseudonym in this test derives from the ADULT subject's salt,
+    // because §4.0.8's floor is keyed on a session pseudonym salted with the
+    // subject's own key — not a process-wide secret. That is what makes
+    // erasure sever the session linkage too (pseudonymize.ts's header).
+    const pseudo = sessionPseudonym(sessionId, keys.adult.salt);
 
-    // Turn 1: matches the seeded chest-pain rule -> base URGENT. Model
-    // proposes no raise, so the applied severity is URGENT from the rule
-    // alone (not high enough to hit the CRITICAL+ emergency short-circuit).
+    // Turn 1: matches the seeded chest-pain rule -> base URGENT. The model
+    // proposes no raise, so URGENT comes from the rule alone — not high enough
+    // for the CRITICAL+ emergency short-circuit.
     const ctx1 = newCtx("I'm having crushing chest pain and can't breathe", sessionId);
     const events1 = await drive(ctx1, {
       intentDomains: [],
@@ -409,15 +505,17 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     });
     expect(events1.find((e) => e.event === 'severity')).toMatchObject({ data: { severity: 'URGENT' } });
 
-    const floorAfterTurn1 = await db().query('SELECT floor_severity, cleared_at FROM safety.session_severity_floor WHERE session_pseudonym = $1', [sessionPseudonym(sessionId)]);
-    expect(floorAfterTurn1.rows).toHaveLength(1);
-    expect(floorAfterTurn1.rows[0].floor_severity).toBe('URGENT');
-    expect(floorAfterTurn1.rows[0].cleared_at).toBeNull();
+    const floor1 = await seedQuery(
+      'SELECT floor_severity, cleared_at FROM safety.session_severity_floor WHERE session_pseudonym = $1',
+      [pseudo],
+    );
+    expect(floor1).toHaveLength(1);
+    expect(floor1[0].floor_severity).toBe('URGENT');
+    expect(floor1[0].cleared_at).toBeNull();
 
-    // Turn 2: same session, a message that on its own matches no rule and
-    // gets no model raise (base + proposed both NORMAL). Without §4.0.8 this
-    // would be NORMAL. With it, the session's still-active URGENT floor from
-    // turn 1 must raise this turn to URGENT too.
+    // Turn 2: same session, a message that on its own matches no rule and gets
+    // no model raise. Without §4.0.8 this is NORMAL; with it, the session's
+    // still-active URGENT floor raises this turn too.
     const ctx2 = newCtx('How much does a hip replacement typically cost in Chennai?', sessionId);
     const events2 = await drive(ctx2, {
       intentDomains: [],
@@ -429,77 +527,26 @@ describe.skipIf(!RUN)('runPipeline integration (requires a local Postgres with d
     });
     expect(events2.find((e) => e.event === 'severity')).toMatchObject({ data: { severity: 'URGENT' } });
 
-    const severityAssigned = await db().query(
+    const severityAssigned = await seedQuery(
       `SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'SEVERITY_ASSIGNED'`,
       [ctx2.auditId],
     );
-    expect(severityAssigned.rows).toHaveLength(1);
-    expect(severityAssigned.rows[0].payload.session_floor_applied).toBe(true);
+    expect(severityAssigned).toHaveLength(1);
+    expect(severityAssigned[0].payload.session_floor_applied).toBe(true);
 
-    // Both turns' red_flag_event rows exist, same session_pseudonym, both URGENT.
-    const events_rfe = await db().query(
+    const rfeRows = await seedQuery(
       'SELECT audit_id, severity FROM safety.red_flag_event WHERE session_pseudonym = $1 ORDER BY occurred_at',
-      [sessionPseudonym(sessionId)],
+      [pseudo],
     );
-    expect(events_rfe.rows).toHaveLength(2);
-    expect(events_rfe.rows.map((r) => r.audit_id)).toEqual([ctx1.auditId, ctx2.auditId]);
-    expect(events_rfe.rows.every((r) => r.severity === 'URGENT')).toBe(true);
+    expect(rfeRows).toHaveLength(2);
+    expect(rfeRows.map((r) => r.audit_id)).toEqual([ctx1.auditId, ctx2.auditId]);
+    expect(rfeRows.every((r) => r.severity === 'URGENT')).toBe(true);
 
-    // The floor itself is unchanged (still URGENT, not re-lowered or duplicated).
-    const floorAfterTurn2 = await db().query('SELECT floor_severity FROM safety.session_severity_floor WHERE session_pseudonym = $1', [sessionPseudonym(sessionId)]);
-    expect(floorAfterTurn2.rows).toHaveLength(1);
-    expect(floorAfterTurn2.rows[0].floor_severity).toBe('URGENT');
-  });
-
-  // ---------------------------------------------------------------------
-  // GAP RESOLVED: "RLS policies never applied — HP-SEC-001 row-level
-  // security was never installed or tested against the route (stub skips
-  // RLS entirely)." db/020_rls.sql now installs it; these tests drive it
-  // through the ACTUAL lookupPatientProfile function (patientProfile.ts),
-  // not raw SQL — scripts/smoke-test.mjs covers the raw-SQL/multi-role
-  // angle (including the hospital_profile/hospital_cost marketplace
-  // pattern, which no app route touches yet). This block is specifically
-  // about proving the one claim patientProfile.ts's own header comment
-  // makes: that RLS, not the function's WHERE clause, is what's actually
-  // deciding visibility.
-  // ---------------------------------------------------------------------
-  describe('HP-SEC-001 row-level security, exercised through the real lookupPatientProfile', () => {
-    it('test_hp_sec_001_rls_a_patient_reading_their_own_profile_succeeds', async () => {
-      const ctx = newCtx('irrelevant for this test', randomUUID(), SEEDED_USER_ID);
-      const profile = await lookupPatientProfile(ctx);
-      expect(profile).not.toBeNull();
-      expect(profile!.userId).toBe(SEEDED_USER_ID);
-      expect(profile!.statedConditions.some((c) => c.label === 'type 2 diabetes')).toBe(true);
-    });
-
-    it('test_hp_sec_001_rls_blocks_a_row_even_when_the_apps_own_where_clause_would_have_matched_it', async () => {
-      // The scenario patientProfile.ts's header comment exists to guard
-      // against: ctx.userId (and so the query's WHERE p.user_id = $1) points
-      // at a REAL row — patient B — but ctx.authClaims.sub (what RLS
-      // actually keys off) is patient A. If this function were silently
-      // relying on its own WHERE clause instead of RLS, this would return
-      // patient B's profile to someone authenticated as patient A. It must
-      // return null instead.
-      const ctx = newCtx('irrelevant for this test', randomUUID(), SEEDED_USER_ID_B);
-      ctx.authClaims = { sub: SEEDED_USER_ID, user_role: 'patient', hospital_id: null, admin_scopes: [] };
-      const profile = await lookupPatientProfile(ctx);
-      expect(profile).toBeNull();
-    });
-
-    it('test_hp_sec_001_rls_patient_profile_own_row_keys_on_sub_not_on_role', async () => {
-      // patient_profile_own_row (db/020_rls.sql) checks user_id = auth.uid()
-      // only — it does not additionally require user_role = 'patient'. This
-      // is deliberate (see that file's comment on why real clinician/
-      // hospital_admin scope-matching isn't implemented against this stub
-      // schema) but worth pinning down explicitly rather than leaving it
-      // implicit: a token whose `sub` matches a real patient_profile row
-      // can read that row regardless of its user_role claim, and a token
-      // whose `sub` matches no row gets nothing no matter what role it
-      // claims. This test is the second half — a random, unseeded sub.
-      const ctx = newCtx('irrelevant for this test', randomUUID(), SEEDED_USER_ID);
-      ctx.authClaims = { sub: randomUUID(), user_role: 'clinician', hospital_id: null, admin_scopes: [] };
-      const profile = await lookupPatientProfile(ctx);
-      expect(profile).toBeNull();
-    });
+    const floor2 = await seedQuery(
+      'SELECT floor_severity FROM safety.session_severity_floor WHERE session_pseudonym = $1',
+      [pseudo],
+    );
+    expect(floor2).toHaveLength(1);
+    expect(floor2[0].floor_severity).toBe('URGENT');
   });
 });

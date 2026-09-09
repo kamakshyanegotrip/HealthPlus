@@ -86,10 +86,14 @@ BEGIN
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state)
+       cited_claim_ids, review_state, data_region)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_day + (i || ' minutes')::interval,
             'INFORMATIONAL', 'j34-fixture', 'NORMAL',
-            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED');
+            -- data_region joined this table in migration 044 (SEC-2). v_region
+            -- is the same value every other fixture row here uses, so the
+            -- metrics this gate computes stay inside one region — which is now
+            -- what the views enforce too, since 044 made them run as their caller.
+            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED', v_region);
   END LOOP;
 
   -- 3 blocks, all §3.1 -> 3/10
@@ -114,12 +118,12 @@ BEGIN
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state)
+       cited_claim_ids, review_state, data_region)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_day, 'INFORMATIONAL',
             -- NOT_REQUIRED, not APPROVED: §2.3.4b's assert_reviewer_in_scope()
             -- refuses an approval without a named, registered reviewer, and
             -- this fixture is measuring queue turnaround, not review validity.
-            'j34-fixture', 'NORMAL', 0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED')
+            'j34-fixture', 'NORMAL', 0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED', v_region)
     RETURNING id INTO v_audit;
 
     INSERT INTO obs.review_queue_item
@@ -193,10 +197,10 @@ BEGIN
     INSERT INTO obs.response_audit
       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
        agg_confidence, policy_version, model_version, prompt_version,
-       cited_claim_ids, review_state)
+       cited_claim_ids, review_state, data_region)
     VALUES (gen_random_uuid(), gen_random_bytes(8), v_quiet + (i || ' minutes')::interval,
             'INFORMATIONAL', 'j34-fixture', 'NORMAL',
-            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED');
+            0.70, 'p1', 'm1', 'pr1', '{}', 'NOT_REQUIRED', v_region);
   END LOOP;
 END $$;
 SQL

@@ -128,18 +128,54 @@ export interface RedFlagResult {
   unavailability: import('./pipeline/unavailability').ServiceUnavailability | null;
 }
 
+/**
+ * principal.patient_risk_flag's ten keys (migration 018), closed by a CHECK
+ * constraint on the column. AGE_UNDER_18 is §2.4.3's; the rest are §2.4.1
+ * Elevated-Risk Topic List territory, which SR-1 leaves to the clinical lead.
+ * Typed as a closed union so a typo cannot silently never match.
+ */
+export type RiskFlagKey =
+  | 'AGE_UNDER_18'
+  | 'AGE_75_PLUS'
+  | 'PREGNANCY'
+  | 'IMMUNOSUPPRESSION'
+  | 'ACTIVE_MALIGNANCY'
+  | 'ANTICOAGULATION'
+  | 'TRANSPLANT_RECIPIENT'
+  | 'POST_OP_UNDER_30D'
+  | 'DIALYSIS'
+  | 'ANAPHYLAXIS_HISTORY';
+
 export interface PatientProfile {
   userId: string;
   dataRegion: string;
-  ageBand: string | null;
+  /**
+   * principal.patient_profile.residency_country — the residency ADR-004 §3's
+   * admission gate checked when this profile was created. Not the same as
+   * dataRegion (which is where the data lives) and not the same as
+   * ctx.statedCountry (which is where the person says they are right now, and
+   * is what §4.5.1(b) routes an emergency on). Three different questions.
+   */
+  residencyCountry: string | null;
+  /**
+   * Active (uncleared) rows from principal.patient_risk_flag. Plaintext keys,
+   * no decryption involved — which is why the §2.4.3 gate below survives an
+   * attribute that cannot be decrypted.
+   */
+  riskFlags: RiskFlagKey[];
   statedConditions: Array<{ label: string; provenance: 'stated' | 'inferred' }>; // §3.8.2
   preferences: Record<string, unknown> | null;
-  // §2.4.3 — forces mandatory Decision Support review, blocks Category C
-  // absolutely. THREE-VALUED, and the third value is the point: `null` means
-  // minority was never established for this subject, which is NOT the same as
-  // "adult". §3.0.3 makes the absence of an establishing fact a prohibition
-  // rather than a permission, so `null` resolves the gate closed. See
-  // `minorGateRequiresReview` and HP-SR-001 §4.
+  /**
+   * §2.4.3 — forces mandatory Decision Support review, blocks Category C
+   * absolutely. THREE-VALUED, and the third value is the point: `null` means
+   * minority was never established for this subject, which is NOT the same as
+   * "adult". §3.0.3 makes the absence of an establishing fact a prohibition
+   * rather than a permission, so `null` resolves the gate closed.
+   *
+   * DERIVED from riskFlags, not stored: the real schema has no is_minor column,
+   * and that is an improvement — the stub's `NOT NULL DEFAULT false` could not
+   * represent "unknown" at all. See `deriveIsMinor` and HP-SR-001 §4.
+   */
   isMinor: boolean | null;
 }
 
@@ -176,4 +212,52 @@ export interface PipelineContext {
     hospital_id: string | null;
     admin_scopes: string[];
   };
+  /**
+   * ADR-003 §2.4's per-subject key, resolved ONCE at the top of the request
+   * (route.ts, right after auth) and carried from there. Two reasons it lives
+   * on the context rather than being fetched where it is needed:
+   *
+   *   * every pseudonym written during one turn must derive from the same
+   *     salt, and a per-call lookup is a per-call opportunity to derive one
+   *     from a different (or newly minted) key;
+   *   * principal.subject_key_material is a SECURITY DEFINER call per
+   *     invocation, and there are nine pseudonym sites in a single turn.
+   *
+   * REQUIRED, not optional. An optional key would resolve to `undefined` on
+   * exactly the paths nobody remembered to wire, and pseudonymize.ts would
+   * throw there at runtime instead of here at compile time.
+   *
+   * The DEK on this object redacts itself under JSON.stringify and
+   * util.inspect — see makeSubjectKey — because this context is passed to code
+   * that serialises its arguments into a database column.
+   */
+  subjectKey: import('./subjectKey').SubjectKey;
+  /**
+   * THE ORDERING INVERSION, CARRIED (migration 039 §"the ordering inversion").
+   *
+   * obs.ai_call and obs.fabrication_block FK to obs.response_audit(id), and
+   * both are written DURING the turn while the audit row is written at the END
+   * of it — category, confidence and review state are not known until then,
+   * and c_min_conf / c_category_c_disabled_v1 mean a skeleton row cannot be
+   * inserted early. So both are recorded with audit_id NULL and their ids
+   * collected here; upsertResponseAudit calls obs.attach_pending immediately
+   * after the parent row lands.
+   *
+   * Mutable arrays on the context, rather than return values threaded back
+   * through five call sites, because the writers are three modules deep
+   * (anthropic.ts inside synthesis inside route) and a threaded return value
+   * is a return value someone drops.
+   */
+  pending: PendingTelemetry;
+}
+
+/** See PipelineContext.pending. */
+export interface PendingTelemetry {
+  aiCalls: string[];
+  blocks: string[];
+}
+
+/** The one construction site, so no caller invents a different empty shape. */
+export function newPendingTelemetry(): PendingTelemetry {
+  return { aiCalls: [], blocks: [] };
 }

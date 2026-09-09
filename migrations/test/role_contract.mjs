@@ -99,21 +99,107 @@ const ENTRY_POINTS = [
     reason: 'the scheduled metrics process; obs.record_metric_sample EXECUTE is granted to metrics_role and to nothing else',
   },
   {
+    prefix: 'chat-pipeline/scripts/seed-real.ts',
+    role: 'postgres',
+    reason:
+      "R10e's integration seed, and the ONE file here that is deliberately not application code — it never runs in a deployment. It builds its own pool from SEED_DATABASE_URL, refuses to start without it, and never touches db(), because hp_app holds INSERT on nothing it writes (principal, safety, evidence) and must keep holding none; the seed's own header carries the has_table_privilege output that establishes that. The connection the operator supplies is the OBJECT OWNER's, which in this cluster and in CI is `postgres`. Declaring it is near-vacuous — a superuser passes every probe — and that is stated rather than hidden: the value here is not the probe, it is that the file cannot be waved through without a named role and a reason. `hp_owner` would be the truthful name if it owned anything, and it does not: every object in this schema is owned by `postgres` (migrations run as it), which is also why FORCE RLS is inert in every gate but r10d_attr.sh §4",
+  },
+  {
     prefix: 'src/jobs/',
     role: 'dqe_role',
     reason: "src/db/pool.ts is per-role since R10-role-routing: jobPool('dqe') carries DATABASE_URL_DQE, and migration 037 gave dqe_role LOGIN because this became its caller. Until the operator sets that password the pool falls back to DATABASE_URL — recorded by poolRoleBindings(), not silent — so this declaration is the SPECIFICATION the deployment must match, which is exactly what it is for",
   },
 ];
 
-function deriveRole(file, src) {
+/**
+ * Comment lines, removed before the pool detection below reads the file.
+ *
+ * FOUND BY R10g. `chat-pipeline/scripts/seed-real.ts` connects on its own owner
+ * pool and never calls `db()` — but its header comment SAYS "THE SEED DOES NOT
+ * USE `db()`", and the detector matched the prose. It then reported that a file
+ * declared as the owner "uses hp_app", which is the exact opposite of what the
+ * comment says and of what the code does.
+ *
+ * Deliberately conservative: whole-line `//` and `*` continuations, and block
+ * comments. NOT trailing `//` on a code line, because a line can hold a URL
+ * (`postgres://…`) and cutting at the first `//` would delete real code after
+ * it — hiding a `db()` call is the failure this check exists to prevent, so the
+ * stripper must never be able to cause one. Prose about a call site lives in
+ * doc comments, which this removes; a trailing comment that also contains
+ * `db()` on a line of real code is a shape nobody writes.
+ */
+function stripComments(src) {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*)/.test(line))
+    .join('\n');
+}
+
+/**
+ * The roles `runAsUser(...)` actually runs as, per call site.
+ *
+ * FOUND BY R10g, and it had been wrong since R10d. `runAsUser` grew a third
+ * parameter — `role: DbRole = 'app'` — so that the profile read could run on
+ * the reasoner pool, which is the only role holding EXECUTE on
+ * `principal.fetch_attribute_envelope` after migration 040. This check still
+ * treated every `runAsUser(` as `hp_app`, so it probed `patientProfile.ts` as
+ * a role that file deliberately does not use, and reported two permission
+ * denials that are the schema working exactly as designed.
+ *
+ * That is the worse direction for a gate to be wrong in. A false failure gets
+ * baselined, and a baselined entry is a real failure that no longer shows.
+ *
+ * The third argument is separated from the call head by the whole callback
+ * body, so a flat regex cannot find it — this walks to the call's own balanced
+ * closing paren (skipping strings and template literals, which can contain
+ * unbalanced brackets) and reads the last argument. No explicit role means the
+ * default, which is `app`.
+ */
+function runAsUserRoles(src) {
+  const roles = new Set();
+  const call = /\brunAsUser\s*\(/g;
+  let m;
+  while ((m = call.exec(src)) !== null) {
+    let depth = 1;
+    let i = call.lastIndex;
+    let quote = null;
+    while (i < src.length && depth > 0) {
+      const ch = src[i];
+      if (quote) {
+        if (ch === '\\') i++;
+        else if (ch === quote) quote = null;
+      } else if (ch === "'" || ch === '"' || ch === '`') {
+        quote = ch;
+      } else if (ch === '(') depth++;
+      else if (ch === ')') depth--;
+      i++;
+    }
+    if (depth !== 0) {
+      // Unbalanced: refuse to guess. Falls through to the default below, which
+      // is the same answer the old code always gave, so this can only be as
+      // wrong as the thing it replaces — never more.
+      roles.add(POOL_ROLE.app);
+      continue;
+    }
+    const args = src.slice(call.lastIndex, i - 1);
+    const explicit = args.match(/,\s*'(app|redflag|reasoner)'\s*,?\s*$/);
+    roles.add(POOL_ROLE[explicit ? explicit[1] : 'app']);
+  }
+  return roles;
+}
+
+function deriveRole(file, rawSrc) {
   const declared = ENTRY_POINTS.find((e) => file.startsWith(e.prefix));
+  const src = stripComments(rawSrc);
   const found = new Set();
   for (const m of src.matchAll(/\bdb\(\s*'([a-z]+)'\s*\)/g)) {
     const role = POOL_ROLE[m[1]];
     if (!role) return { error: `db('${m[1]}') names no pool this check knows; add it to POOL_ROLE` };
     found.add(role);
   }
-  if (/\bdb\(\s*\)/.test(src) || /\brunAsUser\s*\(/.test(src)) found.add('hp_app');
+  if (/\bdb\(\s*\)/.test(src)) found.add('hp_app');
+  for (const role of runAsUserRoles(src)) found.add(role);
 
   // A declaration and a derivation that disagree is worth surfacing, not
   // silently resolving: one of the two is wrong about how the code deploys.

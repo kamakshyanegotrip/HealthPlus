@@ -314,6 +314,19 @@ jobs:
           set -euo pipefail
           bash migrations/test/r10d_attr.sh
 
+      # R10f. The constraint REFUSALS rescued from chat-pipeline/scripts/
+      # smoke-test.mjs, which the cutover retires.
+      #
+      # Five of that file's assertions had no equivalent anywhere in this
+      # directory, and they are the valuable kind: each drives a CHECK to its
+      # refusal rather than fitting a happy-path row through it. Deleting the
+      # stub without porting them would have removed five safety constraints
+      # from CI while every other gate stayed green.
+      - name: "R10f - the safety constraints refuse what they exist to refuse"
+        run: |
+          set -euo pipefail
+          bash migrations/test/r10f_constraints.sh
+
       - name: "R13 - GRANT/RLS contract (grants that cannot be exercised)"
         run: |
           set -euo pipefail

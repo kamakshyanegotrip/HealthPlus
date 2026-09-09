@@ -26,13 +26,16 @@ const IS_TEST = /\.test\.(ts|tsx|mjs|js)$/;
 
 // Named exclusions, each of which must earn its place.
 //
-// scripts/smoke-test.mjs is a test OF the stub schema, by design — it asserts
-// against db/000..020 and is deleted at R10g along with them. Every one of its
-// SQL literals fails against the real schema for the same uninteresting
-// reason, and baselining ten copies of "this is the stub smoke test" would
-// bury the failures that actually mean something. Delete this exclusion when
-// R10g deletes the file.
-export const EXCLUDE = new Set(['chat-pipeline/scripts/smoke-test.mjs']);
+// EMPTY, as of R10g. It held one entry — chat-pipeline/scripts/smoke-test.mjs,
+// a test OF the stub schema whose every SQL literal failed against the real one
+// for the same uninteresting reason. R10g deleted the file and the stub with
+// it, so the exclusion is gone rather than kept "just in case": an exclusion
+// nothing needs is an exclusion that will one day hide something.
+//
+// Adding an entry here means asserting that a file's SQL is not meant to
+// resolve against this schema. That is a strong claim and there is currently no
+// file it is true of.
+export const EXCLUDE = new Set([]);
 
 export function walk(dir, out = []) {
   let entries;

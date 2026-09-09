@@ -7,7 +7,7 @@ import type { IntentComplexityResult, KnowledgeDomain, PipelineContext } from '.
 export async function classifyIntentComplexity(ctx: PipelineContext): Promise<IntentComplexityResult> {
   const prompt = loadPrompt('INTENT_COMPLEXITY');
   const { text } = await callClaude({
-    meta: { auditId: ctx.auditId, purpose: 'CATEGORY_CLASSIFY', model: MODELS.HAIKU, promptVersion: prompt.version },
+    meta: { ctx, purpose: 'CATEGORY_CLASSIFY', model: MODELS.HAIKU, promptVersion: prompt.version },
     system: prompt.text,
     messages: [{ role: 'user', content: ctx.message }],
     maxTokens: 400,

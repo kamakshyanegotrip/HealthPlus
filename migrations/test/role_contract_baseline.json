@@ -1,22 +1,5 @@
 {
-  "note": "Queries that do not resolve AS THE ROLE THEIR MODULE CONNECTS AS. See role_contract.mjs. Entries may only be REMOVED — never edited to hide a regression, and never added without a reason. A baselined site that starts passing fails the build, so this list can only shrink. 16 at R13-roleci; 15 after RF6-claim; 3 after R10-role-routing.",
+  "note": "Queries that do not resolve AS THE ROLE THEIR MODULE CONNECTS AS. See role_contract.mjs. Entries may only be REMOVED — never edited to hide a regression, and never added without a reason. A baselined site that starts passing fails the build, so this list can only shrink. 16 at R13-roleci; 15 after RF6-claim; 3 after R10-role-routing; EMPTY as of R10g — migration 039's obs write functions gave the last two sites a verb they are allowed to call, and both now resolve as hp_app.",
   "source": "HP-RECON-004 — the request path has no role",
-  "entries": [
-    {
-      "id": "9db2615e7e4a",
-      "file": "chat-pipeline/src/lib/anthropic.ts",
-      "role": "hp_app",
-      "error": "permission denied for schema obs",
-      "why": "obs.ai_call INSERT is granted to redflag_role and to nothing else, but the request path logs COMPOSE and CATEGORY_CLASSIFY calls too, so moving anthropic.ts onto the red-flag pool would be the wrong shape. Needs obs.record_ai_call(...). ALSO BLOCKED ON A DECISION: ai_call.audit_id FKs to obs.response_audit(id), and every AI call is logged BEFORE the audit row exists (HP-RECON-006 §2). Decided 8 Sep: log NULL and backfill after the audit row lands.",
-      "item": "HP-RECON-006 §2 — the obs write functions, with the ordering fix"
-    },
-    {
-      "id": "fb9dfe30d551",
-      "file": "chat-pipeline/src/lib/pipeline/emissionValidator.ts",
-      "role": "hp_app",
-      "error": "permission denied for schema obs",
-      "why": "obs.fabrication_block has no INSERT grant to any application role and RLS is on with one metrics-only SELECT policy. Needs obs.record_fabrication_block(...) — a DEFINER function, per the idiom obs.record_metric_sample already sets, rather than a direct grant.",
-      "item": "HP-RECON-004 §4 — the obs write functions"
-    }
-  ]
+  "entries": []
 }

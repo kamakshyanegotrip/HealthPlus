@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { db, DATA_REGION } from './db';
 import { estimateCostUsd } from './pricing';
-import type { AiCallOutcome, AiCallPurpose, RedFlagSeverity } from './types';
+import type { AiCallOutcome, AiCallPurpose, PipelineContext, RedFlagSeverity } from './types';
 
 // The subset of the Anthropic SDK surface this module actually calls —
 // narrow enough that a test double doesn't need to satisfy the full
@@ -34,7 +34,15 @@ function getClient(): AnthropicLike {
 }
 
 export interface LoggedCallMeta {
-  auditId: string;
+  /**
+   * Was a bare `auditId: string`. It carries the context now because
+   * obs.record_ai_call no longer TAKES an audit id: the row is written with
+   * audit_id NULL and its id collected on ctx.pending for upsertResponseAudit to
+   * backfill (migration 039 §3). The audit id is still here — through the ctx —
+   * because the structured cost log below is keyed on it, and that log is
+   * written before the audit row exists.
+   */
+  ctx: Pick<PipelineContext, 'auditId' | 'pending'>;
   purpose: AiCallPurpose;
   model: string;
   promptVersion: string;
@@ -53,16 +61,18 @@ export interface LoggedCallMeta {
  */
 async function logAiCall(meta: LoggedCallMeta, outcome: AiCallOutcome, inputTokens: number, outputTokens: number, latencyMs: number) {
   const cost = estimateCostUsd(meta.model, inputTokens, outputTokens);
-  await db().query(
-    `INSERT INTO obs.ai_call
-       (id, audit_id, occurred_at, purpose, provider, model_version, prompt_version,
-        retrieval_version, input_tokens, output_tokens, latency_ms, outcome,
-        retrieved_claim_ids, proposed_severity, applied_severity, data_region)
-     VALUES (gen_random_uuid(), $1, now(), $2, 'anthropic', $3, $4,
-             $5, $6, $7, $8, $9,
-             $10, $11, $12, $13)`,
+  // AUDIT_ID IS NOT PASSED, and its absence is the fix rather than an omission.
+  // obs.ai_call.audit_id is a real FK to obs.response_audit(id), and that row is
+  // written at the END of the turn — so every one of these inserts named a
+  // parent that did not exist yet and would have failed with
+  // `ai_call_audit_id_fkey` the first time it ran against the real schema. The
+  // row is written unattached and re-parented by obs.attach_pending once the
+  // audit row lands (migration 039's header states the trade in full).
+  const { rows } = await db().query<{ record_ai_call: string }>(
+    `SELECT obs.record_ai_call(
+       $1::ai_call_purpose, $2, $3, $4, $5, $6, $7, $8::ai_call_outcome,
+       $9, $10::red_flag_severity, $11::red_flag_severity, $12) AS record_ai_call`,
     [
-      meta.auditId,
       meta.purpose,
       meta.model,
       meta.promptVersion,
@@ -77,12 +87,14 @@ async function logAiCall(meta: LoggedCallMeta, outcome: AiCallOutcome, inputToke
       DATA_REGION,
     ],
   );
+  const id = rows[0]?.record_ai_call;
+  if (id) meta.ctx.pending.aiCalls.push(id);
   // Cost isn't a DB column (see pricing.ts) — surface it in structured logs
   // so it's still visible to whatever log-based cost dashboard exists.
   console.log(
     JSON.stringify({
       event: 'ai_call',
-      auditId: meta.auditId,
+      auditId: meta.ctx.auditId,
       purpose: meta.purpose,
       model: meta.model,
       inputTokens,

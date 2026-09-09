@@ -67,7 +67,7 @@ export function beginSynthesis(
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: userContent }];
 
   return streamClaude({
-    meta: { auditId: ctx.auditId, purpose: 'COMPOSE', model, promptVersion: PROMPT_VERSION, retrievedClaimIds: claims.map((c) => c.claimId) },
+    meta: { ctx, purpose: 'COMPOSE', model, promptVersion: PROMPT_VERSION, retrievedClaimIds: claims.map((c) => c.claimId) },
     system,
     messages,
     maxTokens: 2000,

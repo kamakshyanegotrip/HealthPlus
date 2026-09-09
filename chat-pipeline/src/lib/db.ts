@@ -42,8 +42,6 @@ const ROLE_CONFIG: Record<DbRole, { env: string; max: number }> = {
 };
 
 const pools = new Map<DbRole, Pool>();
-/** Which roles fell back to DATABASE_URL. Read by `dbRoleBindings()`. */
-const fellBack = new Set<DbRole>();
 
 export const DATA_REGION = process.env.DATA_REGION ?? 'IN';
 
@@ -53,16 +51,23 @@ const REGION_GUC = 'app.data_region';
  * The pool for a role. Defaults to `app`, so every existing call site keeps
  * the behaviour it had.
  *
- * **The fallback is deliberate and it is recorded.** When a role has no
- * connection string of its own it uses `DATABASE_URL`, because the stub schema
- * (`chat-pipeline/db/`) grants `hp_app` directly and has no worker roles at
- * all — the pipeline's own tests must keep running until R10g retires it.
+ * **THE FALLBACK IS GONE, AND R10g IS WHY.** A role without its own connection
+ * string used to fall back to `DATABASE_URL`, because the stub schema
+ * (`chat-pipeline/db/`) granted `hp_app` directly and had no worker roles at
+ * all. That file's own comment said what the fallback was worth: "correct
+ * against the stub and wrong against the real schema, and the difference has to
+ * be visible rather than inferred."
  *
- * A silent fallback would be the same species of bug this project keeps
- * finding, so it is not silent: `dbRoleBindings()` reports it, and a
- * deployment gate can assert that production configured both. Falling back
- * is correct against the stub and wrong against the real schema, and the
- * difference has to be visible rather than inferred.
+ * R10g deleted the stub, so the only schema left is the one where it is wrong.
+ * Falling back now means running the retrieval path as `hp_app` — a role that
+ * holds no EXECUTE on `evidence.policy_for` and no SELECT on the confidence
+ * tables — and the symptom is a `permission denied` from three frames inside a
+ * PL/pgSQL function, which reads as a broken grant rather than as a missing
+ * environment variable. Refusing at pool construction names the actual problem
+ * and names it at start-up rather than on the first flagged message.
+ *
+ * `dbRoleBindings()` stays, and now reports only that each constructed pool has
+ * its own string, because that is the only state it can be in.
  */
 export function db(role: DbRole = 'app'): Pool {
   const existing = pools.get(role);
@@ -76,9 +81,16 @@ export function db(role: DbRole = 'app'): Pool {
   }
 
   const cfg = ROLE_CONFIG[role];
-  const own = process.env[cfg.env];
-  if (!own && role !== 'app') fellBack.add(role);
-  const connectionString = own ?? process.env.DATABASE_URL;
+  const connectionString = process.env[cfg.env];
+  if (!connectionString) {
+    throw new Error(
+      `db: ${cfg.env} is not set, and the '${role}' pool has no fallback. Each role ` +
+        'connects as itself (R13-conn); running this pool on another role\'s ' +
+        'connection would either fail with a permission error from inside a ' +
+        'PL/pgSQL function or, worse, succeed with privileges this role must not ' +
+        'have. Set it, or do not use this pool.',
+    );
+  }
 
   const pool = new Pool({
     connectionString,
@@ -118,16 +130,25 @@ export function db(role: DbRole = 'app'): Pool {
 }
 
 /**
- * Which roles have their own connection string and which fell back.
+ * Which roles are configured, for a deployment check to assert against.
  *
- * Exists so a deployment check can assert the real thing rather than trusting
- * that four secrets were set. Reports only roles whose pool has actually been
- * constructed — a role nothing has used yet has bound to nothing.
+ * It used to report which pools had FALLEN BACK to DATABASE_URL, and reported
+ * only pools that had been constructed. Neither is meaningful any more: there
+ * is no fallback (see `db`), so a constructed pool is a configured one by
+ * definition and the answer was always `true`.
+ *
+ * What is still worth asking is whether a deployment set all three strings, and
+ * that must be answerable BEFORE the first request rather than after — a role
+ * whose pool nothing has touched yet is exactly the one whose missing secret
+ * you want to hear about at start-up. So this reads the environment for every
+ * role rather than the pool map for the ones already built.
  */
-export function dbRoleBindings(): { role: DbRole; separate: boolean }[] {
-  return (Object.keys(ROLE_CONFIG) as DbRole[])
-    .filter((r) => pools.has(r))
-    .map((r) => ({ role: r, separate: !fellBack.has(r) }));
+export function dbRoleBindings(): { role: DbRole; configured: boolean; constructed: boolean }[] {
+  return (Object.keys(ROLE_CONFIG) as DbRole[]).map((r) => ({
+    role: r,
+    configured: Boolean(process.env[ROLE_CONFIG[r].env]),
+    constructed: pools.has(r),
+  }));
 }
 
 /**
@@ -155,8 +176,21 @@ export function dbRoleBindings(): { role: DbRole; separate: boolean }[] {
 export async function runAsUser<T>(
   claims: { sub: string; user_role: string; hospital_id?: string | null; admin_scopes?: string[] },
   fn: (client: PoolClient) => Promise<T>,
+  /**
+   * WHICH POOL, and therefore which ROLE, this transaction runs as. Defaults to
+   * `app` so every existing caller is unchanged.
+   *
+   * R10d-attr added the parameter: the profile read is reasoner_role's work —
+   * it is the only application role holding EXECUTE on
+   * principal.fetch_attribute_envelope after migration 040, and the only one
+   * granted the profile and risk-flag reads by 041. Running it on the hp_app
+   * pool would fail with `permission denied`, which is the good outcome; the
+   * bad one is a future grant to hp_app made to "fix" that, widening the role
+   * that handles untrusted input to reach health attributes.
+   */
+  role: DbRole = 'app',
 ): Promise<T> {
-  const client = await db().connect();
+  const client = await db(role).connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT set_config($1, $2, true)', ['request.jwt.claims', JSON.stringify(claims)]);

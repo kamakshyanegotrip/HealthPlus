@@ -1,27 +1,5 @@
 {
-  "note": "Queries that do not resolve against the real schema TODAY, each with the reason and the register item that closes it. See query_contract.mjs. Entries may only be REMOVED — never edited to hide a regression, and never added without a reason. A baselined query that starts passing fails the build, so this list can only shrink.",
+  "note": "Queries that do not resolve against the real schema TODAY, each with the reason and the register item that closes it. See query_contract.mjs. Entries may only be REMOVED — never edited to hide a regression, and never added without a reason. A baselined query that starts passing fails the build, so this list can only shrink. EMPTY as of R10g: 8 at the survey, 3 after the schema half landed, 0 once the cutover deleted the stub — every one of them was the same finding, that the query named the real schema and CI ran the stub. The list being empty is the cutover's own measure of done.",
   "source": "HP-RECON-002 — the R10 cutover survey",
-  "entries": [
-    {
-      "id": "8f69eadcb2fe",
-      "file": "chat-pipeline/src/lib/pipeline/auditLog.ts",
-      "error": "relation \"response_audit\" does not exist",
-      "why": "The real schema files this under obs.response_audit; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no obs.response_audit at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs.",
-      "item": "R10d, which rides with the cutover"
-    },
-    {
-      "id": "ac2d2c9c5f3c",
-      "file": "chat-pipeline/src/lib/pipeline/auditLog.ts",
-      "error": "relation \"response_content\" does not exist",
-      "why": "The real schema files this under obs.response_content; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no obs.response_content at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs.",
-      "item": "R10d, which rides with the cutover"
-    },
-    {
-      "id": "19a3fe957d59",
-      "file": "chat-pipeline/src/lib/pipeline/patientProfile.ts",
-      "error": "relation \"patient_profile\" does not exist",
-      "why": "The real schema files this under principal.patient_profile; the stub keeps it unqualified in public. The query is correct apart from the prefix, and cannot simply be qualified today: the stub has no principal.patient_profile at all — db/000 forward-declares one for FK purposes and DROPs it at line 187 — so qualifying for production breaks the stub, which is what CI currently runs. app_user, patient_attribute and subject_key are likewise principal.*.",
-      "item": "R10d, which rides with the cutover"
-    }
-  ]
+  "entries": []
 }
