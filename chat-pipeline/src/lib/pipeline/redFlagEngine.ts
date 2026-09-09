@@ -169,7 +169,7 @@ async function proposeModelSeverity(ctx: PipelineContext, baseSeverity: RedFlagS
   try {
     const { text } = await callClaude({
       meta: {
-        auditId: ctx.auditId,
+        ctx,
         purpose: 'RED_FLAG_PROPOSE',
         model: MODELS.HAIKU,
         promptVersion: prompt.version,
@@ -392,7 +392,7 @@ export interface RedFlagEventTiming {
  * Returns the new row's id (for `set_by_event_id`), or null when it no-oped.
  */
 export async function recordRedFlagEvent(
-  ctx: Pick<PipelineContext, 'auditId' | 'userId' | 'sessionId' | 'dataRegion'>,
+  ctx: Pick<PipelineContext, 'auditId' | 'userId' | 'sessionId' | 'dataRegion' | 'subjectKey'>,
   result: RedFlagResult,
   actionTaken: RedFlagActionTaken,
   timing: RedFlagEventTiming,
@@ -413,7 +413,7 @@ export async function recordRedFlagEvent(
   // synthesis step) — every MONITOR+ event suppresses conservatively, which
   // is the safe direction of error until there's something real to gate.
   const commercialSuppressed = true;
-  const sessionPseudo = sessionPseudonym(ctx.sessionId);
+  const sessionPseudo = sessionPseudonym(ctx.sessionId, ctx.subjectKey.salt);
 
   const { rows } = await db('redflag').query<{ id: string }>(
     `INSERT INTO safety.red_flag_event
@@ -428,7 +428,7 @@ export async function recordRedFlagEvent(
      RETURNING id`,
     [
       ctx.auditId,
-      subjectPseudonym(ctx.userId),
+      subjectPseudonym(ctx.userId, ctx.subjectKey.salt),
       sessionPseudo,
       result.severity,
       result.ruleId,
@@ -491,10 +491,10 @@ export interface SessionFloor {
  * WARNING+ must not be treated as NORMAL again just because one later
  * message in it happens to look ordinary on its own.
  */
-export async function getSessionFloor(ctx: Pick<PipelineContext, 'sessionId'>): Promise<SessionFloor | null> {
+export async function getSessionFloor(ctx: Pick<PipelineContext, 'sessionId' | 'subjectKey'>): Promise<SessionFloor | null> {
   const { rows } = await db('redflag').query<{ floor_severity: RedFlagSeverity; cleared_at: string | null }>(
     `SELECT floor_severity, cleared_at FROM safety.session_severity_floor WHERE session_pseudonym = $1`,
-    [sessionPseudonym(ctx.sessionId)],
+    [sessionPseudonym(ctx.sessionId, ctx.subjectKey.salt)],
   );
   const row = rows[0];
   if (!row) return null;
@@ -521,12 +521,31 @@ export function applySessionFloor(severity: RedFlagSeverity, floor: SessionFloor
  * `principal.clinician` table — see db/000's header); c_clear_attributed
  * still enforces that a clearance is never anonymous.
  */
-export async function clearSessionSeverityFloor(sessionId: string, clinicianId: string): Promise<void> {
+export async function clearSessionSeverityFloor(
+  sessionId: string,
+  clinicianId: string,
+  /**
+   * THE SUBJECT'S salt (principal.subject_key.salt), not the clinician's.
+   * Session pseudonyms are salted per subject — see pseudonymize.ts — so a
+   * session id alone no longer identifies a floor row. This is a real
+   * requirement placed on §4.0.8's unbuilt clinician tool and it is stated as a
+   * parameter rather than left to be discovered: that tool must resolve the
+   * SUBJECT behind a session, and call principal.subject_key_material for them,
+   * before it can clear anything.
+   *
+   * The consequence for an ERASED subject is deliberate. No key, no salt, no
+   * pseudonym, no row to find — their floors become unclearable, because they
+   * have also become unattributable to a person. That is what erasure means
+   * here, and the alternative (a lookup path that still works after erasure)
+   * would mean the linkage was never really severed.
+   */
+  subjectSalt: Buffer,
+): Promise<void> {
   await db('redflag').query(
     `UPDATE safety.session_severity_floor
         SET cleared_at = now(), cleared_by = $2
       WHERE session_pseudonym = $1 AND cleared_at IS NULL`,
-    [sessionPseudonym(sessionId), clinicianId],
+    [sessionPseudonym(sessionId, subjectSalt), clinicianId],
   );
 }
 
@@ -604,7 +623,7 @@ export function loadSafetyTemplate(resolvedBody: string | null): LoadedSafetyTem
  * queue of one.
  */
 export async function recordRedFlagLog(
-  ctx: Pick<PipelineContext, 'auditId' | 'userId' | 'sessionId' | 'dataRegion' | 'receivedAt'>,
+  ctx: Pick<PipelineContext, 'auditId' | 'userId' | 'sessionId' | 'dataRegion' | 'receivedAt' | 'subjectKey'>,
   result: RedFlagResult,
   args: {
     eventId: string | null;
@@ -635,8 +654,8 @@ export async function recordRedFlagLog(
       [
         args.eventId,
         ctx.auditId,
-        subjectPseudonym(ctx.userId),
-        sessionPseudonym(ctx.sessionId),
+        subjectPseudonym(ctx.userId, ctx.subjectKey.salt),
+        sessionPseudonym(ctx.sessionId, ctx.subjectKey.salt),
         result.severity,
         result.proposedSeverityByModel,
         result.severity,

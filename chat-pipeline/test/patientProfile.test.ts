@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { minorGateRequiresReview } from '../src/lib/pipeline/patientProfile';
-import type { PatientProfile } from '../src/lib/types';
+import { minorGateRequiresReview, deriveIsMinor } from '../src/lib/pipeline/patientProfile';
+import type { PatientProfile, RiskFlagKey } from '../src/lib/types';
 
 /**
  * HP-SR-001 §4 — §2.4.3's minor gate, and the two cases it used to get wrong.
@@ -17,7 +17,8 @@ import type { PatientProfile } from '../src/lib/types';
 const adult: PatientProfile = {
   userId: '11111111-1111-1111-1111-111111111111',
   dataRegion: 'IN',
-  ageBand: '30-39',
+  residencyCountry: 'IN',
+  riskFlags: ['AGE_75_PLUS'],
   statedConditions: [],
   preferences: null,
   isMinor: false,
@@ -76,5 +77,52 @@ describe('minorGateRequiresReview — §2.4.3 / §3.0.3', () => {
     for (const c of cases) {
       if (supersededGate(c)) expect(minorGateRequiresReview(c)).toBe(true);
     }
+  });
+});
+
+/**
+ * R10d-attr. `isMinor` is no longer a column — the real schema has no such
+ * field — so the three-valued answer is DERIVED from principal.patient_risk_flag.
+ * These pin the derivation itself, separately from the gate that consumes it,
+ * because the gate cannot distinguish a wrong `null` from a right one.
+ */
+describe('deriveIsMinor — §2.4.3 from principal.patient_risk_flag', () => {
+  it('is true when AGE_UNDER_18 is active', () => {
+    expect(deriveIsMinor(['AGE_UNDER_18'])).toBe(true);
+  });
+
+  it('is false when AGE_75_PLUS is active — arithmetic, not clinical judgment', () => {
+    expect(deriveIsMinor(['AGE_75_PLUS'])).toBe(false);
+  });
+
+  it('is NULL when no age flag is present, which is every subject today', () => {
+    // Nothing in the system writes risk flags yet. So this is not an edge case,
+    // it is the ordinary case, and it is why §3.0.3 forces review universally
+    // until CL6's safeguarding work starts populating them.
+    expect(deriveIsMinor([])).toBeNull();
+    expect(deriveIsMinor(['PREGNANCY', 'DIALYSIS'])).toBeNull();
+  });
+
+  it('resolves CONTRADICTORY age flags closed, not open', () => {
+    // Both set is bad data about a person's age, which is exactly the input
+    // §3.0.3 says to resolve in the safe direction. Order must not matter.
+    expect(deriveIsMinor(['AGE_UNDER_18', 'AGE_75_PLUS'])).toBe(true);
+    expect(deriveIsMinor(['AGE_75_PLUS', 'AGE_UNDER_18'])).toBe(true);
+  });
+
+  it('ignores flags that say nothing about age', () => {
+    const clinical: RiskFlagKey[] = [
+      'PREGNANCY', 'IMMUNOSUPPRESSION', 'ACTIVE_MALIGNANCY', 'ANTICOAGULATION',
+      'TRANSPLANT_RECIPIENT', 'POST_OP_UNDER_30D', 'DIALYSIS', 'ANAPHYLAXIS_HISTORY',
+    ];
+    expect(deriveIsMinor(clinical)).toBeNull();
+    expect(deriveIsMinor([...clinical, 'AGE_UNDER_18'])).toBe(true);
+    expect(deriveIsMinor([...clinical, 'AGE_75_PLUS'])).toBe(false);
+  });
+
+  it('composes with the gate so that an unflagged subject still forces review', () => {
+    const unflagged: PatientProfile = { ...adult, riskFlags: [], isMinor: deriveIsMinor([]) };
+    expect(unflagged.isMinor).toBeNull();
+    expect(minorGateRequiresReview(unflagged)).toBe(true);
   });
 });

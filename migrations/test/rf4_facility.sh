@@ -82,7 +82,19 @@ SQL
 # Run the REAL exported function — not a reimplementation of its query, which
 # could drift from it exactly as PR #4's fake drifted from provider_org.
 probe() { # $1 subdivision-or-null, $2 city-or-null
-  DATABASE_URL="$DB_URL" npx --prefix chat-pipeline tsx -e "
+  # DATABASE_URL_REDFLAG, and not only DATABASE_URL.
+  #
+  # `resolveNearestFacility` runs on `db('redflag')` — R10-role-routing put
+  # safety.emergency_facility_reference's SELECT on redflag_role. Until R10g
+  # that pool FELL BACK to DATABASE_URL when it had no string of its own, so
+  # this gate had been probing as whatever DATABASE_URL names (the owner) and
+  # not as the role, silently, since the day the routing landed. R10g removed
+  # the fallback — `db()` now refuses to construct a pool with no string — and
+  # this gate went red, which is the fallback's cost arriving at last.
+  #
+  # Both are set: the same connection string, but named, so the probe exercises
+  # the pool the application actually uses.
+  DATABASE_URL="$DB_URL" DATABASE_URL_REDFLAG="$DB_URL" npx --prefix chat-pipeline tsx -e "
     import { resolveNearestFacility } from './chat-pipeline/src/lib/pipeline/templateSlots';
     const sub = ${1};
     const city = ${2};

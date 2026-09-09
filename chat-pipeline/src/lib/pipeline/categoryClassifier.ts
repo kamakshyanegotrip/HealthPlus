@@ -78,7 +78,7 @@ export function parseAndResolveCategory(rawText: string): { category: ResponseCa
 export async function classifyCategory(ctx: PipelineContext): Promise<CategoryClassification> {
   const prompt = loadPrompt('CATEGORY_CLASSIFIER');
   const { text } = await callClaude({
-    meta: { auditId: ctx.auditId, purpose: 'CATEGORY_CLASSIFY', model: MODELS.HAIKU, promptVersion: prompt.version },
+    meta: { ctx, purpose: 'CATEGORY_CLASSIFY', model: MODELS.HAIKU, promptVersion: prompt.version },
     system: prompt.text,
     messages: [{ role: 'user', content: ctx.message }],
     maxTokens: 300,

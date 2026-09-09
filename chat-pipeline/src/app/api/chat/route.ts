@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { PipelineContext, ResponseCategory, RetrievedClaim } from '@/lib/types';
+import { newPendingTelemetry } from '@/lib/types';
+import { getOrMintSubjectKey } from '@/lib/subjectKey';
 import { requireAuth, AuthError } from '@/lib/auth';
 import { classifyIntentComplexity } from '@/lib/pipeline/intentComplexity';
 import { classifyCategory, reconcileAfterRetrieval } from '@/lib/pipeline/categoryClassifier';
@@ -77,6 +79,26 @@ export async function POST(req: Request): Promise<Response> {
     return Response.json({ error: 'invalid request', details: parsed.error.flatten() }, { status: 400 });
   }
 
+  // ADR-003 §2.4's per-subject key, resolved ONCE for the whole turn — every
+  // pseudonym written below derives from this salt and the response ciphertext
+  // is encrypted under this DEK. Minted on the subject's first turn.
+  //
+  // BEFORE THE STREAM OPENS, deliberately. A failure here is a failure to
+  // establish who this turn is about, and there is nothing safe to do with a
+  // turn like that: pseudonymize.ts would refuse, obs.response_content could not
+  // be written, and the audit trail would be a response with no subject. Failing
+  // as an HTTP error is honest; failing three steps into an SSE stream, after the
+  // user has already seen sentences, is not. The one case this deliberately
+  // rejects rather than works around is a DESTROYED key — an erased subject
+  // whose token still authenticates (HP-ESC 2.3.4g).
+  let subjectKey;
+  try {
+    subjectKey = await getOrMintSubjectKey(auth.userId);
+  } catch (err) {
+    console.error('subject key resolution failed', { auditId, userId: auth.userId, err });
+    return Response.json({ error: 'this account cannot be served right now' }, { status: 503 });
+  }
+
   const ctx: PipelineContext = {
     sessionId: parsed.data.sessionId,
     userId: auth.userId,
@@ -84,6 +106,8 @@ export async function POST(req: Request): Promise<Response> {
     dataRegion: auth.dataRegion ?? process.env.DATA_REGION ?? 'IN',
     auditId,
     receivedAt: firstByteAt.toISOString(),
+    subjectKey,
+    pending: newPendingTelemetry(),
     authClaims: {
       sub: auth.userId,
       user_role: auth.userRole,
@@ -188,7 +212,9 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
       classifierVersion: classification.classifierVersion,
       severity: 'NORMAL',
       ruleId: null,
+      ruleVersion: null,
       templateId: null,
+      templateVersion: null,
       aggConfidence: 1.0, // static, non-clinical copy; no model uncertainty
       modelVersion: 'n/a-safety-unavailable',
       promptVersion: 'n/a-safety-unavailable',
@@ -302,12 +328,55 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
       classifierVersion: classification.classifierVersion,
       severity: redFlag.severity,
       ruleId: redFlag.ruleId,
+      ruleVersion: redFlag.ruleVersion,
       templateId: redFlag.templateId,
+      templateVersion: redFlag.templateVersion,
       aggConfidence: 1.0, // a static, clinician-authored template carries no model uncertainty
       modelVersion: 'n/a-static-template',
       promptVersion: 'n/a-static-template',
       citedClaimIds: [],
-      reviewRequired: true, // §4.0.5: review is concurrent/post-display, not a precondition — still required
+      /**
+       * FALSE, AND THE REAL SCHEMA IS WHAT DECIDES IT.
+       *
+       * This said `true` with the comment "§4.0.5: review is concurrent/
+       * post-display, not a precondition — still required". Against the real
+       * schema that write does not fail a policy or a lint; it is REFUSED:
+       *
+       *   new row for relation "response_audit" violates check constraint
+       *   "c_emergency_not_gated"
+       *   CHECK (severity NOT IN ('CRITICAL','EMERGENCY')
+       *          OR review_state <> 'PENDING')
+       *
+       * So at CRITICAL or EMERGENCY the audit projection may not sit in
+       * PENDING at all, and `reviewRequired: true` is exactly what produced
+       * PENDING. The stub had no such constraint, which is why this stood.
+       *
+       * WHAT THE CONSTRAINT MEANS, rather than what it costs. On this
+       * projection PENDING means "held, awaiting a reviewer" — that is what
+       * §2.2.5b's gate writes and what the review queue reads. §4.0.5 forbids
+       * an emergency display being gated on anything, so a row that is both
+       * CRITICAL and PENDING is a contradiction the schema refuses to store.
+       * It is the pair to c_emergency_display_not_gated, which requires
+       * template_displayed_at to be SET on the same rows.
+       *
+       * THE REVIEW OBLIGATION IS NOT LOST, AND IT IS NOT LEFT TO THIS FIELD.
+       * safety.red_flag_event carries two triggers — trg_raise_alert_for_event
+       * raises the clinician alert, and trg_event_requires_alert refuses the
+       * event row unless one exists. recordRedFlagEvent runs three lines below,
+       * so the obligation is created by the database, on an alert row with an
+       * SLA and a delivery worker behind it (RF6), rather than by a column on a
+       * projection that nothing pages on. That is a stronger record than the
+       * one being given up, which is the reason to follow the schema here
+       * rather than argue with it.
+       *
+       * Recorded for SR review rather than settled in a comment: §4.0.5's
+       * "still required" is now discharged entirely through the alert path, so
+       * a response published under an emergency template never appears in the
+       * review queue. If the clinical lead wants it in both places, that is a
+       * schema question (a review_state value that is not PENDING and not
+       * NOT_REQUIRED), not an application one.
+       */
+      reviewRequired: false,
     });
     await persistResponseContent(ctx, templateText);
     // §4.0.7: written after upsertResponseAudit so the FK into
@@ -326,7 +395,13 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
       ctx,
       category: 'INFORMATIONAL',
       severity: redFlag.severity,
-      reviewRequired: true,
+      // Matches the audit row written above, and must. sideEffectDispatcher
+      // logs a review obligation at ERROR level precisely because the audit
+      // row is the only record of one; claiming an obligation the row cannot
+      // hold would make that log say something untrue. The emergency
+      // obligation travels on the clinician alert instead — see the long note
+      // on `reviewRequired` in the upsertResponseAudit call above.
+      reviewRequired: false,
       postHocSampleEligible: false,
       templateRendered: true,
     });
@@ -347,7 +422,9 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
       classifierVersion: classification.classifierVersion,
       severity: redFlag.severity,
       ruleId: redFlag.ruleId,
+      ruleVersion: redFlag.ruleVersion,
       templateId: null,
+      templateVersion: null,
       aggConfidence: 1.0,
       modelVersion: 'n/a-static-refusal',
       promptVersion: 'n/a-static-refusal',
@@ -409,7 +486,9 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
       classifierVersion: classification.classifierVersion,
       severity: redFlag.severity,
       ruleId: redFlag.ruleId,
+      ruleVersion: redFlag.ruleVersion,
       templateId: null,
+      templateVersion: null,
       aggConfidence: 1.0,
       modelVersion: 'n/a-static-refusal',
       promptVersion: 'n/a-static-refusal',
@@ -527,7 +606,9 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     classifierVersion: classification.classifierVersion,
     severity: redFlag.severity,
     ruleId: redFlag.ruleId,
+    ruleVersion: redFlag.ruleVersion,
     templateId: redFlag.templateId,
+    templateVersion: redFlag.templateVersion,
     aggConfidence,
     modelVersion: reasoning.modelUsed,
     promptVersion: process.env.PROMPT_VERSION_COMPOSE ?? 'compose-2026.08.1',

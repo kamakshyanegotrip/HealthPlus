@@ -50,7 +50,7 @@ export async function buildReasoningBrief(
     : '(none retrieved)';
 
   const { text } = await callClaude({
-    meta: { auditId: ctx.auditId, purpose: 'COMPOSE', model, promptVersion: prompt.version, retrievedClaimIds: claims.map((c) => c.claimId) },
+    meta: { ctx, purpose: 'COMPOSE', model, promptVersion: prompt.version, retrievedClaimIds: claims.map((c) => c.claimId) },
     system,
     messages: [
       {

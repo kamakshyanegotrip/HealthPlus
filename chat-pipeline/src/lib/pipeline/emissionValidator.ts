@@ -176,16 +176,17 @@ async function logFabricationBlock(opts: {
   messageTemplateId: string;
 }) {
   try {
-    await db().query(
-      `INSERT INTO obs.fabrication_block
-         (id, occurred_at, audit_id, prohibition_class, claim_kind, tier, category,
-          policy_tier, policy_kind, policy_category, policy_effective_from,
-          query_hash, retrieved_source_state, message_template_id, data_region)
-       VALUES (gen_random_uuid(), now(), $1, $2, $3, $4, $5,
-               $6, $7, $8, $9,
-               $10, $11, $12, $13)`,
+    // Written with audit_id NULL and collected for backfill, for the same
+    // reason obs.ai_call is: a block happens DURING validation, and the audit
+    // row it would reference is written after the stream completes. §3.13.1
+    // requires a block to be logged, and an unattached record of it is strictly
+    // better than a foreign-key violation instead of one.
+    const { rows } = await db().query<{ record_fabrication_block: string }>(
+      `SELECT obs.record_fabrication_block(
+         $1, $2::claim_kind, $3::source_tier, $4::response_category,
+         $5::source_tier, $6::claim_kind, $7::response_category, $8,
+         $9, $10::jsonb, $11, $12) AS record_fabrication_block`,
       [
-        opts.ctx.auditId,
         opts.prohibitionClass,
         opts.claimKind,
         opts.tier,
@@ -200,6 +201,8 @@ async function logFabricationBlock(opts: {
         DATA_REGION,
       ],
     );
+    const id = rows[0]?.record_fabrication_block;
+    if (id) opts.ctx.pending.blocks.push(id);
   } catch (err) {
     // §3.13.1 requires blocks to be logged — a logging failure must not
     // silently disappear. Surface it loudly even though we still block the

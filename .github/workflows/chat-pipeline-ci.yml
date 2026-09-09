@@ -31,13 +31,17 @@ name: Chat Pipeline CI
 # repo's own SQL migrations carry ("reading SQL does not catch bugs that
 # executing it does") applied one level up, to CI config.
 
+# R10g: `migrations/**` is in the path filter now, and has to be. The DB job
+# below applies the real schema, so a migration that breaks the pipeline is a
+# change this workflow must run on — under the old filter it would have merged
+# green because it touched no file under chat-pipeline/.
 on:
   push:
     branches: [main]
-    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
+    paths: ['chat-pipeline/**', 'migrations/**', '.github/workflows/chat-pipeline-ci.yml']
   pull_request:
     branches: [main]
-    paths: ['chat-pipeline/**', '.github/workflows/chat-pipeline-ci.yml']
+    paths: ['chat-pipeline/**', 'migrations/**', '.github/workflows/chat-pipeline-ci.yml']
 
 defaults:
   run:
@@ -88,13 +92,32 @@ jobs:
       PGUSER: postgres
       PGPASSWORD: postgres
       PGDATABASE: hp_test
+      # R13-conn: one LOGIN role per worker role, one pool each. hp_app is the
+      # role that takes untrusted user input; it cannot read health attributes
+      # or write safety rows, and the separate URLs are what make that true at
+      # runtime rather than only in the grant tables. Passwords are set by the
+      # CI step below, never by a migration — "a password in a migration is a
+      # password in git".
       DATABASE_URL: postgres://hp_app:hp_app_pw@localhost:5432/hp_test
+      DATABASE_URL_REASONER: postgres://reasoner_role:reasoner_pw@localhost:5432/hp_test
+      DATABASE_URL_REDFLAG: postgres://redflag_role:redflag_pw@localhost:5432/hp_test
+      # The seed's own OWNER connection. Deliberately not DATABASE_URL: the
+      # seed writes to principal, safety and evidence, and hp_app holds INSERT
+      # on none of them by design.
+      SEED_DATABASE_URL: postgres://postgres:postgres@localhost:5432/hp_test
       DATA_REGION: IN
       # Fixed, non-secret local/CI-only values — never the real deployment
       # secrets. A real deployment supplies these via its own secrets
       # manager (see chat-pipeline/DEPLOY.md); this workflow only ever
       # talks to the ephemeral service-container Postgres above.
-      SUBJECT_HMAC_KEY: 'base64:Y2ktb25seS1kdW1teS1obWFjLWtleS0zMmIh'
+      #
+      # SUBJECT_KEY_WRAPPING_KEY replaced SUBJECT_HMAC_KEY at R10. The old one
+      # was a single process-wide HMAC secret standing in for the per-subject
+      # key table; under it erasure deleted nothing, because every pseudonym
+      # stayed recomputable from a user_id and one env var. This one wraps a
+      # per-subject DEK the database mints, and it must be EXACTLY 32 bytes —
+      # subjectKey.ts refuses anything else rather than deriving quietly.
+      SUBJECT_KEY_WRAPPING_KEY: 'base64:aGVhbHRocGx1cy1jaS1vbmx5LXdyYXBwaW5nLWtleSE='
       SUPABASE_JWT_SECRET: 'ci-only-dummy-jwt-secret'
       PROMPT_VERSION_COMPOSE: 'compose-2026.08.1'
     steps:
@@ -107,16 +130,50 @@ jobs:
       - run: npm ci
       - name: Create hp_test database
         run: psql -d postgres -c "CREATE DATABASE hp_test;"
-      - name: Apply stub schema (db/001 roles, db/000, db/010, db/020 RLS, db/999 seed)
+      # R10g — THE CUTOVER. This applied five files from chat-pipeline/db/ and
+      # now applies migrations/. Those five were a STUB of an upstream schema
+      # that did not exist yet when this pipeline was written, and they had
+      # drifted from the real one in twelve places (HP-RECON-001). Everything
+      # this workflow proved, it proved against the stub.
+      #
+      # Working directory is chat-pipeline/, so the runner is one level up.
+      - name: Apply the real schema (migrations/, filename order)
+        working-directory: .
+        run: node migrations/run_migrations.mjs
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/hp_test
+      # PASSWORDS ARE SET HERE AND NOWHERE ELSE.
+      #
+      # migrations/034 creates these LOGIN roles and deliberately gives them no
+      # password: "a password in a migration is a password in git", and ALTER
+      # ROLE ... PASSWORD is cluster-wide, so a migration setting one would
+      # change the credential on every database in the cluster including
+      # production's. migrations-ci sidesteps the question entirely by using
+      # SET SESSION AUTHORIZATION, but this workflow runs the APPLICATION,
+      # which connects with a real libpq connection string and cannot.
+      #
+      # These values are CI-only and the container they apply to is destroyed
+      # with the job. A deployment sets them in its own secrets manager.
+      - name: Set CI-only passwords on the application login roles
         run: |
-          psql -d hp_test -v ON_ERROR_STOP=1 -f db/001_roles.sql
-          psql -d hp_test -v ON_ERROR_STOP=1 -f db/000_stub_upstream.sql
-          psql -d hp_test -v ON_ERROR_STOP=1 -f db/010_chat_pipeline_support.sql
-          psql -d hp_test -v ON_ERROR_STOP=1 -f db/020_rls.sql
-          psql -d hp_test -v ON_ERROR_STOP=1 -f db/999_seed_smoke_test.sql
-      - name: "Backfill test-only pseudo-embeddings (exercises claim_search()'s vector branch — see scripts/pseudo-embed.mjs)"
-        run: node scripts/generate-embeddings.mjs
-      - name: DB smoke test (scripts/smoke-test.mjs — raw SQL + RLS role impersonation, connects as hp_app)
-        run: npm run test:db
-      - name: Orchestration integration test (runs the real runPipeline against Postgres, Anthropic client mocked)
+          set -euo pipefail
+          psql -d hp_test -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE hp_app        WITH PASSWORD 'hp_app_pw';" \
+            -c "ALTER ROLE reasoner_role WITH PASSWORD 'reasoner_pw';" \
+            -c "ALTER ROLE redflag_role  WITH PASSWORD 'redflag_pw';"
+      # R10e — the seed, which is TypeScript rather than SQL because
+      # principal.patient_attribute stores ciphertext the application's own key
+      # encrypts. A .sql seed can write bytes into those columns but not bytes
+      # the pipeline can decrypt, so the fixture is built by the code under
+      # test. It also replaces scripts/generate-embeddings.mjs: the seeded
+      # retrieval_chunk carries its own 384-dim placeholder embedding.
+      #
+      # SEED_DATABASE_URL is an OWNER connection and DATABASE_URL is not, and
+      # the split is deliberate — hp_app holds INSERT on nothing the seed
+      # writes, which is correct and must stay correct (HP-RB-001 §2).
+      - name: "Seed the real schema (scripts/seed-real.ts)"
+        run: npx tsx scripts/seed-real.ts
+      # Both DB-backed suites: the orchestration branches (the real runPipeline,
+      # Anthropic mocked) and the profile read decrypted end to end.
+      - name: Integration tests against the real schema
         run: npm run test:integration

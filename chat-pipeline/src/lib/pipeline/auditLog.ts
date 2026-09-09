@@ -1,6 +1,6 @@
-import { randomBytes, createCipheriv } from 'node:crypto';
 import { db, DATA_REGION } from '../db';
 import { subjectPseudonym, sessionPseudonym } from '../pseudonymize';
+import { encryptForSubject } from '../subjectKey';
 import type { PipelineContext, RedFlagSeverity, ResponseCategory } from '../types';
 
 /**
@@ -68,7 +68,21 @@ export interface FinalAuditFields {
   classifierVersion: string;
   severity: RedFlagSeverity;
   ruleId: string | null;
+  /**
+   * REQUIRED, and required for a reason that is not tidiness.
+   * obs.response_audit carries COMPOSITE foreign keys — (rule_id, rule_version)
+   * -> safety.red_flag_rule and (template_id, template_version) ->
+   * safety.safety_template. Under MATCH SIMPLE (PostgreSQL's default) a
+   * composite FK with ANY null column is NOT CHECKED AT ALL. Passing the id
+   * without the version therefore does not produce a partial check; it produces
+   * no check, and the audit row could name a template that has never existed.
+   *
+   * RedFlagOutcome has carried both versions the whole time. They were dropped
+   * on the floor here, which is why nothing complained.
+   */
+  ruleVersion: number | null;
   templateId: string | null;
+  templateVersion: number | null;
   aggConfidence: number;
   modelVersion: string;
   promptVersion: string;
@@ -78,12 +92,28 @@ export interface FinalAuditFields {
 }
 
 /**
- * Upserts the LAYER 1 immutable trace row (Phase_1.1_Migration_Pack_ADR-003
- * §2.3/§2.4 naming — no personal data, pseudonymous subject reference only,
- * hash-chained by its own trigger). This is distinct from the
- * `response_audit_event` log above: that's the append-only per-step event
- * stream, this is the one-row-per-response summary the Annex A.5 CHECK
- * constraints actually apply to.
+ * Writes the C-30 PROJECTION row (obs.response_audit) — the one-row-per-response
+ * summary the Annex A.5 CHECK constraints apply to. Distinct from the
+ * `response_audit_event` log above: that is the append-only, hash-chained record
+ * of truth, this is derived from it and rebuildable. Migration 036 dropped
+ * prev_hash/row_hash from this table for exactly that reason — a projection that
+ * carried a chain invited the belief that the chain meant something here.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS A FUNCTION CALL AND NOT AN INSERT
+ *
+ * hp_app holds no table privilege anywhere in `obs`. Against the real schema
+ * this INSERT was not a policy gap that CREATE POLICY closes — obs.response_audit
+ * had RLS off and no grants to any application role, so there was simply no way
+ * for the request path to write its own audit trail (HP-RECON-004 §3). Migration
+ * 039 gives it six SECURITY DEFINER verbs instead, following the idiom the schema
+ * already used for metrics_role and safety.raise_alert.
+ *
+ * THE BACKFILL LIVES HERE, not at the four call sites in route.ts. Every exit
+ * point writes this row and every exit point has pending telemetry to attach, so
+ * attaching it anywhere else is four chances to forget one — and the one you
+ * forget is the branch nobody exercises. The audit row and the re-parenting of
+ * its telemetry are one act; this is where that act is.
  */
 export async function upsertResponseAudit(f: FinalAuditFields) {
   // c_category_c_disabled_v1 / c_no_clinical_when_flagged / c_min_conf are
@@ -94,21 +124,20 @@ export async function upsertResponseAudit(f: FinalAuditFields) {
   // (route.ts short-circuits first), but if it somehow does, the database
   // is the backstop, not this code.
   await db().query(
-    `INSERT INTO response_audit
-       (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
-        template_id, agg_confidence, policy_version, model_version, prompt_version,
-        cited_claim_ids, review_state, clinical_domain)
-     VALUES ($1, $2, now(), $3, $4, $5,
-             $6, $7, $8, $9, $10,
-             $11, $12, $13)
-     ON CONFLICT (id) DO NOTHING`, // the immutable trace is written once, at publication
+    `SELECT obs.record_response_audit(
+       $1, $2, $3::response_category, $4, $5::red_flag_severity,
+       $6, $7, $8, $9, $10,
+       $11, $12, $13, $14, $15::review_state, $16)`,
     [
       f.ctx.auditId,
-      subjectPseudonym(f.ctx.userId),
+      subjectPseudonym(f.ctx.userId, f.ctx.subjectKey.salt),
       f.category,
       f.classifierVersion,
       f.severity,
+      f.ruleId,
+      f.ruleVersion,
       f.templateId,
+      f.templateVersion,
       f.aggConfidence.toFixed(2),
       process.env.POLICY_VERSION ?? 'unspecified',
       f.modelVersion,
@@ -118,6 +147,56 @@ export async function upsertResponseAudit(f: FinalAuditFields) {
       f.clinicalDomain ?? null,
     ],
   );
+
+  await attachPendingTelemetry(f.ctx);
+}
+
+/**
+ * obs.attach_pending, and the only caller of it.
+ *
+ * The arrays are CLEARED whether or not the attach succeeded. Retrying an attach
+ * cannot help: `AND audit_id IS NULL` in the function means a row attaches
+ * exactly once, so a second pass over the same ids reports zero attached and
+ * would look like the failure it is not.
+ *
+ * A short count is reported and not thrown. The response has already been
+ * streamed to the user by the time this runs; telemetry that ended up
+ * unattributed is a data-quality problem to see in the logs, not a reason to
+ * turn a delivered answer into an error. Those rows remain findable in the
+ * database with `WHERE audit_id IS NULL`, which is what migration 039 §5 traded
+ * for keeping the foreign key.
+ */
+async function attachPendingTelemetry(ctx: PipelineContext) {
+  const { aiCalls, blocks } = ctx.pending;
+  const expected = aiCalls.length + blocks.length;
+  if (expected === 0) return;
+
+  try {
+    const { rows } = await db().query<{ attach_pending: number }>(
+      'SELECT obs.attach_pending($1, $2, $3) AS attach_pending',
+      [ctx.auditId, aiCalls, blocks],
+    );
+    const attached = rows[0]?.attach_pending ?? 0;
+    if (attached !== expected) {
+      // Not "nothing to do" — the ids were collected during THIS request. A
+      // short count means some of them were already parented to a different
+      // audit row, which is either a context reused across turns or a bug in
+      // how the ids are collected.
+      console.error('CRITICAL: attach_pending attached %d of %d rows', attached, expected, {
+        auditId: ctx.auditId,
+        aiCalls: aiCalls.length,
+        blocks: blocks.length,
+      });
+    }
+  } catch (err) {
+    console.error('CRITICAL: attach_pending failed; telemetry stays unattributed', {
+      auditId: ctx.auditId,
+      err,
+    });
+  } finally {
+    aiCalls.length = 0;
+    blocks.length = 0;
+  }
 }
 
 /**
@@ -126,25 +205,30 @@ export async function upsertResponseAudit(f: FinalAuditFields) {
  * `subject_key` (LAYER 3) so erasure is a key-destruction operation, not a
  * row-deletion one, per HP-LB-001's audit-vs-erasure reconciliation.
  *
- * The AES-256-GCM here is a working placeholder for that per-subject key
- * lookup — it derives a key from SUBJECT_HMAC_KEY rather than reading
- * `subject_key`, which doesn't have committed DDL in this project yet. Wire
- * this to the real per-subject key + rotation once §17 lands; do not ship
- * this derivation as the production key path.
+ * ---------------------------------------------------------------------------
+ * THE PLACEHOLDER IS GONE, AND IT COULD NOT HAVE SHIPPED ANYWAY.
+ *
+ * This function used to derive its AES key from SUBJECT_HMAC_KEY and pass
+ * `key_id: null`, with its own comment saying "do not ship this derivation as
+ * the production key path." Against the real schema that write is not merely
+ * inadvisable, it is impossible: obs.response_content.key_id is NOT NULL with an
+ * FK to principal.subject_key, and until migration 038 there was no way to
+ * create a row in that table at all. The placeholder survived because the stub
+ * schema (db/000) made key_id nullable — which is the exact class of divergence
+ * R10g deletes the stub to end.
+ *
+ * The key now comes from ctx.subjectKey, resolved once per request, and the row
+ * names the key it was actually encrypted under. That is what makes erasure
+ * work: principal.erase_subject nulls the wrapped DEK, and this ciphertext
+ * becomes permanently unreadable while the row itself — and the audit trail
+ * around it — survives.
  */
 export async function persistResponseContent(ctx: PipelineContext, plaintext: string) {
-  const key = subjectPseudonym(ctx.userId).subarray(0, 32); // placeholder — see doc comment
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  const ciphertext = Buffer.concat([iv, authTag, enc]);
+  const ciphertext = encryptForSubject(ctx.subjectKey, plaintext);
 
   await db().query(
-    `INSERT INTO response_content (audit_id, subject_id, data_region, ciphertext, key_id)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (audit_id) DO NOTHING`,
-    [ctx.auditId, ctx.userId, DATA_REGION, ciphertext, null],
+    'SELECT obs.record_response_content($1, $2, $3, $4, $5)',
+    [ctx.auditId, ctx.userId, DATA_REGION, ciphertext, ctx.subjectKey.keyId],
   );
 }
 
