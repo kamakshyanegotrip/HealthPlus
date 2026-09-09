@@ -125,7 +125,6 @@ pattern (PROVISIONAL until a named reviewer adopts it — the same shape as
   `clinically_adopted = false` by default (AMB-17 is still the real blocker; both
   `matchDeterministicRules()` and `loadSafetyTemplate()` already fail safe on empty).
 - `subject_key` — LAYER 3 per HP-SCHEMA-001 §17.1, wired to `response_content.key_id`.
-- `side_effect_job` — the durable queue `sideEffectDispatcher.ts` enqueues into.
 - `evidence.claim_aggregate()` and `claim_search()` — a working, if unrefined,
   implementation: FTS-only fallback plus an RRF-fused hybrid path once a query
   embedding is supplied. The RRF `k=60` constant is a common default, not a value from
@@ -397,15 +396,16 @@ sites) was deliberately left FTS-only, two-argument, unchanged — wiring a fake
 plausible embedding into the real request path would be a worse failure mode than the
 current, honestly-flagged fallback.
 
-**Deployment and ops configuration now exists**, closing the "producer only" gap
-`sideEffectDispatcher.ts` had documented about itself since the first delivery.
-`worker/side-effect-worker.mjs` is the first-ever consumer of `side_effect_job`: it
-claims rows with `SELECT ... FOR UPDATE SKIP LOCKED`, dispatches by `kind`, and
-requeues-then-fails after `WORKER_MAX_ATTEMPTS`. Genuinely tested, not just written: run
-standalone against real local Postgres, it drained a real job to `DONE` and separately
-proved the retry path (an unrecognized kind requeued twice, `FAILED` on the third
-attempt, checked against the actual `attempts`/`status` columns afterward).
-`worker/Dockerfile` and `worker/fly.toml` are written and every command inside the
+**Deployment and ops configuration exists** for the one worker that does real work.
+`worker/side-effect-worker.mjs` and the `side_effect_job` queue it drained are **gone**:
+that table lived only in `db/010` and never existed in the real schema, and all three of
+the worker's handlers were `console.log('would ...')` — a review path's shape rather than
+a review path. Its one real responsibility, §4.0.5 emergency notification, had already
+moved to RF6 (migration 029), where the database raises the alert itself and
+`worker/alert-worker.mjs` delivers it. Where the review obligation is recorded now is
+documented in `src/lib/pipeline/sideEffectDispatcher.ts`'s header: `obs.response_audit
+.review_state = 'PENDING'`, written before the dispatcher runs.
+`worker/Dockerfile` and `worker/fly.toml` now build and run `alert-worker.mjs`, and every command inside the
 Dockerfile was run directly outside a container — but the image itself was never built
 (no Docker daemon reachable in this sandbox) and never deployed (no Fly.io account).
 `vercel.json` sets the route's `maxDuration` but was never deployed either (no Vercel
@@ -536,12 +536,14 @@ Postgres instance set up above, with the Anthropic client mocked (no live API ca
 npm run test:integration
 ```
 
-Run the side-effect worker against the same database (drains `side_effect_job` rows
-enqueued by `sideEffectDispatcher.ts`; `--once` drains what's pending and exits instead
-of polling forever):
+Run the RF6 alert worker against the same database (claims clinician alerts through
+`safety.claim_alert_batch` and records DELIVERED or UNDELIVERABLE; `--once` drains what's
+pending and exits instead of polling forever). `DATA_REGION` is required — migration 035
+scoped the claim by region, and a worker without one drains an empty batch and reports
+healthy silence on the §4.1 path:
 
 ```bash
-DATABASE_URL=postgres://hp_app:hp_app_pw@127.0.0.1:5432/hp_test node worker/side-effect-worker.mjs --once
+DATA_REGION=IN DATABASE_URL=postgres://hp_app:hp_app_pw@127.0.0.1:5432/hp_test node worker/alert-worker.mjs --once
 ```
 
 Make a real, billed call to the live Anthropic API (needs `ANTHROPIC_API_KEY` — see

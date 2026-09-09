@@ -723,14 +723,18 @@ async function main() {
   });
 
   // ---- side effect dispatcher --------------------------------------------
-  await check('sideEffectDispatcher.enqueueJob INSERT', async () => {
-    await pool.query(
-      `INSERT INTO side_effect_job (id, kind, payload, data_region, enqueued_at, status)
-       VALUES (gen_random_uuid(), $1, $2::jsonb, $3, now(), 'PENDING')`,
-      ['CLINICIAN_REVIEW', JSON.stringify({ auditId: AUDIT_ID }), 'IN'],
-    );
-    return 'insert ok';
-  });
+  //
+  // REMOVED, not relocated. This asserted an INSERT into `side_effect_job` — a
+  // table that exists only in db/010 and has never existed in the real schema,
+  // which is why the query contract carried five baselined failures against it.
+  // sideEffectDispatcher.ts no longer writes any queue: the review obligation
+  // lives in obs.response_audit.review_state, written before the dispatcher
+  // runs, and every skipped dispatch logs at error level. There is nothing left
+  // here for a SQL smoke test to exercise.
+  //
+  // The check that mattered was never this INSERT anyway. It proved a row could
+  // be written to a queue whose only consumer logged 'would create a review-queue
+  // entry' and marked the job DONE.
 
   await pool.end();
   console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);
