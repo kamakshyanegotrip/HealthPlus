@@ -1,35 +1,32 @@
 name: Chat Pipeline CI
 
-# GAP RESOLVED: "No CI wiring — tests exist but aren't hooked into any
-# continuous-integration pipeline." This wires every check the chat-pipeline
-# job already has (typecheck, unit tests, the §6.4 eval gate, the DB-level
-# smoke test, and the full orchestration integration test) into GitHub
-# Actions, gated on a real Postgres 16 + pgvector service container — not a
-# mock. No live Anthropic call is made anywhere in this workflow (see
-# chat-pipeline/README.md's honest note on why); every DB-touching step runs
-# against the stub schema in chat-pipeline/db/, same as local dev.
+# Typecheck, unit tests and the §6.4 eval gate, then the DB-backed suites
+# against a real Postgres 16 + pgvector service container — not a mock. No live
+# Anthropic call is made anywhere in this workflow; the client is stubbed
+# through anthropic.ts's __setAnthropicClientForTesting (see
+# chat-pipeline/README.md's honest note on what that leaves untested).
 #
-# This file lives at the repo root (.github/workflows/) rather than nested
-# under chat-pipeline/ — GitHub Actions only discovers workflows there.
-# Because this repo holds more than one HealthPlus job (see HP-OIR-002's
-# files at the repo root), every step below runs with its working directory
-# pinned to chat-pipeline/, and both triggers are scoped to
-# chat-pipeline/** so a change to a different job's files doesn't run this
-# workflow pointlessly.
+# R10g REWROTE THE DB JOB. It used to apply five files from chat-pipeline/db/ —
+# a STUB of an upstream schema that did not exist when this pipeline was
+# written, and which HP-RECON-001 found had drifted from the real one in twelve
+# places. Everything this workflow proved, it proved against that stub. It now
+# applies migrations/ and seeds with scripts/seed-real.ts, and the stub is
+# deleted. The DB-level smoke test went with it: migrations/test/ covers that
+# ground against the real schema and as the real roles, and the five assertions
+# it had that nothing else did — all constraint REFUSALS — moved to
+# migrations/test/r10f_constraints.sh.
 #
-# HONEST NOTE, carried over from when this file was first drafted (before it
-# had a real repo to live in): it's been checked with actionlint (v1.7.12,
-# zero findings) and every command it runs — npm ci, typecheck, unit tests,
-# the eval gate, all five db/*.sql migrations in order, the smoke test, and
-# the integration test — has actually been executed successfully against a
-# real Postgres 16 + pgvector instance, provisioned the same way this
-# workflow provisions its service container (fresh database, fresh
-# hp_app/hp_reader roles via db/001_roles.sql, no pre-existing state). Treat
-# the first real run on an actual push/PR here as the first true
-# end-to-end test of the runner environment itself (network egress, image
-# pull, service-container health-check timing) — the same caveat this
-# repo's own SQL migrations carry ("reading SQL does not catch bugs that
-# executing it does") applied one level up, to CI config.
+# THE ROLES ARE THE POINT OF THE DB JOB. It connects as hp_app, reasoner_role
+# and redflag_role, each on its own connection string, because R13-conn's
+# guarantee is a runtime property and not a fact about the grant tables. Running
+# it as the owner would make it pass while the deployment failed — which is
+# exactly what happened to two functions the cutover found (HP-R10-001 §1, §2).
+#
+# This file lives at the repo root (.github/workflows/) rather than nested under
+# chat-pipeline/ — GitHub Actions only discovers workflows there. Because this
+# repo holds more than one HealthPlus job, every step runs with its working
+# directory pinned to chat-pipeline/, except the schema step, which is one level
+# up and says so.
 
 # R10g: `migrations/**` is in the path filter now, and has to be. The DB job
 # below applies the real schema, so a migration that breaks the pipeline is a
@@ -67,13 +64,14 @@ jobs:
         run: npm run eval
 
   db-integration:
-    name: DB smoke test + orchestration integration test
+    name: Real schema + orchestration integration tests
     runs-on: ubuntu-latest
     services:
       postgres:
-        # Plain postgres:16 does not carry the pgvector extension db/000
-        # needs (`CREATE EXTENSION vector`) — pgvector/pgvector ships it
-        # pre-built on top of the same postgres:16 base image.
+        # Plain postgres:16 does not carry the pgvector extension the
+        # evidence schema needs (`CREATE EXTENSION vector`, and
+        # evidence.retrieval_chunk.embedding is a 384-dim vector) —
+        # pgvector/pgvector ships it pre-built on the same postgres:16 base.
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
@@ -136,12 +134,30 @@ jobs:
       # drifted from the real one in twelve places (HP-RECON-001). Everything
       # this workflow proved, it proved against the stub.
       #
-      # Working directory is chat-pipeline/, so the runner is one level up.
+      # APPLIED WITH psql, NOT migrations/run_migrations.mjs.
+      #
+      # The runner was tried first and failed on this job's first run:
+      #
+      #   Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'pg' imported from
+      #   /home/runner/work/HealthPlus/HealthPlus/migrations/run_migrations.mjs
+      #
+      # `npm ci` above installs into chat-pipeline/node_modules, and Node's ESM
+      # resolution searches upward from the MODULE's own directory — migrations/
+      # — not from the working directory, so it never looks there. Installing pg
+      # at the repo root as well would work and would also mean two node_modules
+      # trees whose pg versions can drift apart.
+      #
+      # This is the loop migrations-ci.yml already uses, verbatim. Two workflows
+      # applying the same schema by two different mechanisms is how they come to
+      # disagree about it, and psql needs nothing installed to run a .sql file.
       - name: Apply the real schema (migrations/, filename order)
         working-directory: .
-        run: node migrations/run_migrations.mjs
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/hp_test
+        run: |
+          set -euo pipefail
+          for f in $(ls migrations/*.sql | sort); do
+            echo "--> $f"
+            psql -v ON_ERROR_STOP=1 -q -f "$f"
+          done
       # PASSWORDS ARE SET HERE AND NOWHERE ELSE.
       #
       # migrations/034 creates these LOGIN roles and deliberately gives them no
