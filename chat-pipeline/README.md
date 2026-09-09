@@ -7,6 +7,21 @@ reasoning, streamed synthesis, a structural emission validator, audit persistenc
 a fire-and-forget side-effect dispatch — streamed to the client over Server-Sent
 Events.
 
+> **Two things to know before reading further.**
+>
+> **1. `migrations/` at the repo root is the only schema.** `chat-pipeline/db/` was a *stub* of
+> an upstream schema that did not exist when this pipeline was written. HP-RECON-001 found the
+> two had drifted apart in twelve places, and R10g deleted the stub along with
+> `scripts/smoke-test.mjs` and the `db:migrate:stub` script. **Most of this README is a build
+> log** — the "What changed since the Nth delivery" sections record how the code got here, and
+> they still describe that stub as if it were current, because it was when they were written.
+> Read them as history. **`## Running`, near the end, is the only part that is an instruction**,
+> and it is current. For deployment, see `../DEPLOY.md`.
+>
+> **2. Every message currently ends in the unavailability notice**, and that is the system
+> working, not a bug. Charter §4 is unadopted until CL2–CL5 are signed, so no clinically adopted
+> red-flag rule set exists and §0.6 resolves the gate closed. See `## Running`.
+
 This isn't a generic chatbot pipeline with health-flavored names bolted on. It's built
 directly against this project's own governance artifacts — Evidence & Safety Charter
 v1.0 (HP-ESC), DR-001 (v1 scope decision), HP-ADR-001 (stack), HP-RB-001 (audit
@@ -485,34 +500,70 @@ for local debugging only.
 ## Running
 
 ```bash
-cp .env.example .env.local   # fill in DATABASE_URL, ANTHROPIC_API_KEY, SUBJECT_HMAC_KEY, SUPABASE_JWT_SECRET
+cp .env.example .env.local   # see the table below for what to fill in
 npm install
 npm run dev
 ```
 
-Bring up a local stub schema and run the DB-level checks (needs a local Postgres 16
-with the `vector` extension available — `apt install postgresql-16-pgvector` on
-Debian/Ubuntu). `db/001_roles.sql` creates the `hp_app`/`hp_reader` roles the rest of
-the chain connects as — HP-RB-001 §2 requires the app never connect as owner or
-superuser, so run this against a superuser connection once per database:
+### The database
+
+**`migrations/` at the repo root is the only schema.** `chat-pipeline/db/` was a *stub* of an
+upstream schema that did not exist when this pipeline was written; HP-RECON-001 found the two
+had drifted apart in twelve places, and R10g deleted it along with `scripts/smoke-test.mjs`,
+`scripts/generate-embeddings.mjs` and the `db:migrate:stub` script. Anything ELSEWHERE in this
+README that mentions `db/000`, `db/010`, `db/020`, `db/999` or the smoke test is a historical
+record of how the code got here, not an instruction — see the note at the top.
+
+Needs a local Postgres 16 with the `vector` extension (`apt install postgresql-16-pgvector`
+on Debian/Ubuntu). Apply the schema as the OWNER, then set passwords on the login roles the
+application connects as — no migration sets a password, because `ALTER ROLE ... PASSWORD` is
+cluster-wide and a password in a migration is a password in git:
 
 ```bash
 createdb hp_test
-export PGDATABASE=hp_test   # psql -f below picks this up; or pass -d hp_test each time
-psql -f db/001_roles.sql                    # creates hp_app / hp_reader roles (idempotent)
-psql -f db/000_stub_upstream.sql
-psql -f db/010_chat_pipeline_support.sql
-psql -f db/020_rls.sql                      # HP-SEC-001 RLS policies + hp_auth schema
-psql -f db/999_seed_smoke_test.sql          # sample data
-node scripts/generate-embeddings.mjs        # backfills pseudo-embeddings so claim_search()'s vector branch is exercised
-npm run test:db                             # scripts/smoke-test.mjs, connects as hp_app
+DATABASE_URL='postgresql://postgres@localhost:5432/hp_test' node ../migrations/run_migrations.mjs
+
+psql -d hp_test \
+  -c "ALTER ROLE hp_app        WITH PASSWORD 'hp_app_pw';" \
+  -c "ALTER ROLE reasoner_role WITH PASSWORD 'reasoner_pw';" \
+  -c "ALTER ROLE redflag_role  WITH PASSWORD 'redflag_pw';"
 ```
 
-Or run the whole chain above in one shot:
+Seed it. The seed is TypeScript, not SQL, and that is a consequence of the schema rather than
+a preference: `principal.patient_attribute` stores ciphertext under the application's own key,
+so a `.sql` seed can write bytes into those columns but not bytes the pipeline can decrypt. It
+runs on its own OWNER connection because `hp_app` holds INSERT on nothing it writes:
 
 ```bash
-npm run db:migrate:stub
+DATA_REGION=IN \
+SUBJECT_KEY_WRAPPING_KEY='base64:aGVhbHRocGx1cy1jaS1vbmx5LXdyYXBwaW5nLWtleSE=' \
+SEED_DATABASE_URL='postgresql://postgres@localhost:5432/hp_test' \
+npx tsx scripts/seed-real.ts
 ```
+
+### Environment
+
+| Variable | Required | Notes |
+|---|---|---|
+| `DATABASE_URL` | yes | `hp_app` — never an owner or superuser (HP-RB-001 §2) |
+| `DATABASE_URL_REASONER` | yes | `reasoner_role`. **No fallback since R10g** — the pool refuses to construct without it |
+| `DATABASE_URL_REDFLAG` | yes | `redflag_role`. Same |
+| `DATA_REGION` | yes | `IN`; validated as two uppercase letters |
+| `SUBJECT_KEY_WRAPPING_KEY` | yes | `base64:` + **exactly 32 bytes**. Replaced `SUBJECT_HMAC_KEY`, which was a process-wide secret under which erasure deleted nothing |
+| `SUPABASE_JWT_SECRET` | yes | |
+| `ANTHROPIC_API_KEY` | yes, for live calls | not needed by the integration tests |
+| `POLICY_VERSION`, `PROMPT_VERSION_COMPOSE` | recommended | written into every audit row |
+
+`RED_FLAG_RULESET_VERSION` is gone — `safety.adopted_rule_set(jurisdiction, language)` replaced
+it at R3. An env var could name a rule set that was never adopted; the function cannot.
+
+### What you will actually see
+
+**Every message ends in the unavailability notice**, and that is the system working. Charter §4
+is unadopted until CL2–CL5 are signed, so there is no clinically adopted rule set,
+`resolveAdoptionGate()` returns FAIL_CLOSED, and §0.6 treats "we never scanned" as distinct
+from "we scanned and found nothing". `scripts/seed-real.ts` seeds a rule set so the tests can
+exercise the rest of the pipeline; a real deployment has none until a clinician signs one.
 
 Run the unit tests (no DB or network needed):
 
@@ -543,7 +594,7 @@ scoped the claim by region, and a worker without one drains an empty batch and r
 healthy silence on the §4.1 path:
 
 ```bash
-DATA_REGION=IN DATABASE_URL=postgres://hp_app:hp_app_pw@127.0.0.1:5432/hp_test node worker/alert-worker.mjs --once
+DATA_REGION=IN DATABASE_URL=postgres://alert_role:alert_pw@127.0.0.1:5432/hp_test node worker/alert-worker.mjs --once
 ```
 
 Make a real, billed call to the live Anthropic API (needs `ANTHROPIC_API_KEY` — see
@@ -554,7 +605,7 @@ sandbox):
 ANTHROPIC_API_KEY=sk-ant-... DATABASE_URL=postgres://hp_app:hp_app_pw@127.0.0.1:5432/hp_test npm run smoke:live
 ```
 
-See `DEPLOY.md` for Vercel (web) and Fly.io (worker) deployment instructions.
+See `../DEPLOY.md` — the run-book for all four processes, in the order they come up.
 
 Exercise the route for real once a real Postgres + Anthropic key are configured:
 
