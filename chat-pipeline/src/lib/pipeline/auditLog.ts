@@ -127,7 +127,7 @@ export async function upsertResponseAudit(f: FinalAuditFields) {
     `SELECT obs.record_response_audit(
        $1, $2, $3::response_category, $4, $5::red_flag_severity,
        $6, $7, $8, $9, $10,
-       $11, $12, $13, $14, $15::review_state, $16)`,
+       $11, $12, $13, $14, $15::review_state, $16, $17)`,
     [
       f.ctx.auditId,
       subjectPseudonym(f.ctx.userId, f.ctx.subjectKey.salt),
@@ -145,6 +145,19 @@ export async function upsertResponseAudit(f: FinalAuditFields) {
       f.citedClaimIds,
       f.reviewRequired ? 'PENDING' : 'NOT_REQUIRED',
       f.clinicalDomain ?? null,
+      // SEC-2 / migration 044. obs.response_audit was the one obs table carrying
+      // a subject pseudonym with no data_region, no RLS and no policy, while
+      // metrics_role held SELECT on it.
+      //
+      // DATA_REGION, not ctx.dataRegion, and the difference is the point: the
+      // region is a property of the DEPLOYMENT (HP-ADR-004 §2), and taking it
+      // from a request-scoped object is how a request comes to name its own
+      // region. It is the same value db() puts in the connection's startup
+      // packet, and the function REFUSES the row if the two disagree — a check
+      // written in the function body rather than as a WITH CHECK policy because
+      // record_response_audit is SECURITY DEFINER and a policy would not bind
+      // inside it (migration 035 hit the same wall).
+      DATA_REGION,
     ],
   );
 

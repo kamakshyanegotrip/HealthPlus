@@ -34,21 +34,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The region this gate's fixture belongs to. Taken from the table that states
+# this gate's precondition rather than from region_registry ordered by
+# active_from — three gates have been bitten by a neighbouring fixture's region
+# sorting first.
+REGION=$(psql -qtAc "SELECT data_region FROM public.residency_admission
+                      WHERE admission_state = 'ADMITTED' ORDER BY residency_country LIMIT 1" | tr -d '[:space:]')
+[ -n "$REGION" ] || fail "no ADMITTED residency exists; cannot place this fixture in a region."
+
 # ---------------------------------------------------------------------------
 # 1. THE ROW IS WRITABLE, WITH EXACTLY THE COLUMNS auditLog.ts SUPPLIES.
 #
 #    Deliberately the application's own column list — not a minimal one that
 #    would pass while the real insert still failed.
+#
+#    data_region joined that list in migration 044 (SEC-2). It is NOT NULL, so
+#    this insert began failing the moment the column landed — which is the
+#    correct consequence of adding one and is why this gate names the
+#    application's columns rather than a convenient subset.
 # ---------------------------------------------------------------------------
 echo "1. obs.response_audit accepts the insert the application actually issues"
 psql -v ON_ERROR_STOP=1 -q -c "
   INSERT INTO obs.response_audit
     (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
      template_id, agg_confidence, policy_version, model_version, prompt_version,
-     cited_claim_ids, review_state, clinical_domain)
+     cited_claim_ids, review_state, clinical_domain, data_region)
   VALUES (gen_random_uuid(), gen_random_bytes(8), now(), 'DECISION_SUPPORT',
           '$MARK', 'NORMAL', NULL, 0.82, 'p1', 'm1', 'pr1', '{}',
-          'NOT_REQUIRED', NULL)" \
+          'NOT_REQUIRED', NULL, '$REGION')" \
   || fail "obs.response_audit still refuses the application's insert. Migration 036
 dropped prev_hash/row_hash precisely so this would work; if it is still failing,
 either 036 did not apply or something else on this table is NOT NULL with no

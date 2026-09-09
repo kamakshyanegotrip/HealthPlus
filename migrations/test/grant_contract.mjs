@@ -370,6 +370,35 @@ const RULES = [
          AND table_schema NOT IN ('pg_catalog','information_schema')`,
   },
   {
+    id: 'N-view-runs-as-owner',
+    title: 'A view honours the row-level security of the tables it reads',
+    why:
+      'A view without `security_invoker` runs as ITS OWNER, and the owner of every view ' +
+      'here is the owner of the tables underneath it — so the view BYPASSES every policy ' +
+      'on its base tables. Rules B, I and M all reason about a policy existing and being ' +
+      'reachable. None of them asks whether the policy applies on the path the reader ' +
+      'actually takes, and for the metrics and alert roles that path is a view. ' +
+      'Measured before migration 044 fixed it: two obs.fabrication_block rows, one IN and ' +
+      'one ZZ, read as metrics_role with app.data_region = IN — a direct table read ' +
+      'returned 1 row and obs.v_metric_block_rate returned 2. p_fb_region_scoped and ' +
+      'p_rqi_region_scoped had never applied to anything that reads them. ' +
+      'This rule is standing rather than a one-time assertion in 044 because 044 can only ' +
+      'see the views that existed when it ran; the next migration to add one would ' +
+      'reintroduce the leak silently. ' +
+      'A view over nothing but reference data is still reported. Making it run as its ' +
+      'caller costs nothing there, and deciding case by case is how the exception list ' +
+      'becomes the rule.',
+    sql: `
+      SELECT coalesce(pg_get_userbyid(c.relowner), '?')::text AS role,
+             n.nspname || '.' || c.relname AS object,
+             'view runs as its owner; RLS on its base tables does not apply'::text AS detail
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relkind = 'v'
+         AND n.nspname NOT IN ('pg_catalog','information_schema')
+         AND NOT coalesce(array_to_string(c.reloptions, ',') LIKE '%security_invoker=true%', false)`,
+  },
+  {
     id: 'I-pseudonym-readable-unbounded',
     title: 'A role that can read a table of pseudonyms reads it through a row boundary',
     why:

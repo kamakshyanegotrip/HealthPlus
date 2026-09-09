@@ -112,9 +112,9 @@ must_reject "§2.3.2 a persisted CLINICAL_DECISION response" "c_category_c_disab
   INSERT INTO obs.response_audit
     (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
      agg_confidence, policy_version, model_version, prompt_version,
-     cited_claim_ids, review_state)
+     cited_claim_ids, review_state, data_region)
   VALUES ('$A', sha256('x'::bytea), now(), 'CLINICAL_DECISION', 'c', 'NORMAL', 0.99,
-          'pv', 'm', 'p', '{}', 'NOT_REQUIRED')"
+          'pv', 'm', 'p', '{}', 'NOT_REQUIRED', '$REGION')"
 
 # ---------------------------------------------------------------------------
 # §3. §1.9.4 — the per-category confidence floors.
@@ -129,9 +129,9 @@ must_reject "§1.9.4 a DECISION_SUPPORT response below the confidence floor" "c_
   INSERT INTO obs.response_audit
     (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
      agg_confidence, policy_version, model_version, prompt_version,
-     cited_claim_ids, review_state)
+     cited_claim_ids, review_state, data_region)
   VALUES ('$A', sha256('x'::bytea), now(), 'DECISION_SUPPORT', 'c', 'NORMAL', 0.50,
-          'pv', 'm', 'p', '{}', 'NOT_REQUIRED')"
+          'pv', 'm', 'p', '{}', 'NOT_REQUIRED', '$REGION')"
 
 # ---------------------------------------------------------------------------
 # §4. §4.0.2 — a red-flag EVENT is a thing that happened, not a thing that
@@ -165,9 +165,10 @@ must_reject "§4.0.2 a NORMAL-severity red-flag event" "c_event_at_least_monitor
 psql -v ON_ERROR_STOP=1 -q <<SQL
 INSERT INTO obs.response_audit
   (id, subject_pseudonym, occurred_at, category, classifier_version, severity,
-   agg_confidence, policy_version, model_version, prompt_version, cited_claim_ids, review_state)
+   agg_confidence, policy_version, model_version, prompt_version, cited_claim_ids,
+   review_state, data_region)
 VALUES ('$A', sha256('r10f'::bytea), now(), 'INFORMATIONAL', 'c', 'NORMAL', 0.90,
-        'pv', 'm', 'p', '{}', 'NOT_REQUIRED');
+        'pv', 'm', 'p', '{}', 'NOT_REQUIRED', '$REGION');
 INSERT INTO public.response_audit_event (audit_id, kind, occurred_at, actor, payload)
 VALUES ('$A', 'PUBLISHED', now(), 'system', '{"path":"r10f"}'::jsonb);
 SQL
