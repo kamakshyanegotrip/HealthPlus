@@ -542,6 +542,38 @@ async function main() {
     process.exit(1);
   }
 
+  // AND THE CONNECTING ROLE MUST BE ABLE TO SEE THE WHOLE GRANT MODEL.
+  //
+  // DATABASE_URL takes precedence over PGUSER above, and every other suite in
+  // this repository sets DATABASE_URL to hp_app. Running this gate in a shell
+  // where that is exported connects it as hp_app — and
+  // information_schema.role_table_grants filters to rows the CURRENT USER has
+  // USAGE on the grantee for, so as hp_app the grants of confirmation_ui_role
+  // and hp_reader simply are not there.
+  //
+  // The rules then find nothing, and the file's own arithmetic turns that into
+  // an instruction: "3 BASELINE ENTRY(S) NO LONGER VIOLATE. Remove them." Two
+  // of the three were real; the third was invisibility. Acting on it would have
+  // deleted a live finding from a baseline that "may only shrink" — the worst
+  // direction a gate can be wrong in, and it happened on this gate's first run
+  // inside a shell that had DATABASE_URL set for something else.
+  //
+  // Checked as the property that actually matters rather than as "am I
+  // superuser": can this session see every governed role's grants?
+  const { rows: [vis] } = await client.query(`
+    SELECT current_user AS whoami,
+           (SELECT array_agg(r ORDER BY r) FROM unnest(ARRAY${APP_ROLES.replace(/[()]/g, (c) => (c === '(' ? '[' : ']'))}) r
+             WHERE EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
+               AND NOT pg_has_role(current_user, r, 'USAGE')) AS blind_to`);
+  if (vis.blind_to) {
+    console.error(`Connected as "${vis.whoami}", which cannot see the grants of: ${vis.blind_to.join(', ')}.`);
+    console.error('\ninformation_schema.role_table_grants hides rows whose grantee the current user');
+    console.error('is not a member of, so every rule below would under-report — and this gate');
+    console.error('would then instruct you to REMOVE baseline entries that still violate.');
+    console.error('\nRun it as the owner: unset DATABASE_URL and use PGHOST/PGUSER/PGDATABASE.');
+    process.exit(1);
+  }
+
   const found = [];
   for (const rule of RULES) {
     const { rows } = await client.query(rule.sql);

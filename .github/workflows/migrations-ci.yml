@@ -327,6 +327,27 @@ jobs:
           set -euo pipefail
           bash migrations/test/r10f_constraints.sh
 
+      # HP-RB-001 §10's item 9, written eleven months after the runbook asked
+      # for it: "no event type emits a non-whitelisted payload key". Static, so
+      # it needs no database — it reads the call sites, because the runbook's
+      # question is about what the code CAN emit and most of those paths (the
+      # emergency template, both clinical-decision refusals, the validator
+      # block) are exercised by no test.
+      #
+      # The two controls that existed before it are the same ten-name BLACKLIST
+      # twice, and a blacklist on an append-only, undeletable log answers the
+      # wrong question: `chief_complaint` passes both. This gate also compares
+      # those two lists to each other, which nothing did.
+      - name: "RB-001.9 - no audit payload key outside the whitelist"
+        run: |
+          set -euo pipefail
+          node migrations/test/rb001_payload_keys.mjs
+
+      # DATABASE_URL is deliberately NOT set for this step, and grant_contract
+      # now refuses to run if it points anywhere but the owner:
+      # information_schema.role_table_grants hides grants whose grantee the
+      # connecting role is not a member of, so as hp_app the gate under-reports
+      # and then instructs you to remove baseline entries that still violate.
       - name: "R13 - GRANT/RLS contract (grants that cannot be exercised)"
         run: |
           set -euo pipefail

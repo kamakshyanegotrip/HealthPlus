@@ -77,8 +77,19 @@ node migrations/run_migrations.mjs
 did not exist when the pipeline was written; it had drifted in twelve places and R10g deleted
 it. Any document still mentioning it is stale.)
 
-Migrations `042`–`046` each assert their own effect and will fail the run rather than report a
+Migrations `042`–`047` each assert their own effect and will fail the run rather than report a
 success they did not achieve.
+
+> **Order matters once, and only here.** Migration `047` puts the region inside the audit log's
+> hash chain and recomputes the existing rows to match. That is legitimate exactly while nobody
+> has been told what the old chain head was — so `047` **refuses to run** if
+> `public.audit_anchor` holds any row, and says so rather than rewriting anyway.
+>
+> Practical consequence: **apply the schema before writing the genesis anchor** (HP-RB-001 §10,
+> item 6). On a database that has never held an audit event — which is every new deployment —
+> there is nothing to rewrite and the order is moot. On one that has, the anchor is the point of
+> no return. Re-applying `047` afterwards is safe: it only refuses when it would actually change
+> bytes.
 
 **Check:**
 
@@ -290,10 +301,24 @@ SELECT has_schema_privilege('queue_role', s, 'USAGE')
 
 -- 6. §4 adoption — expected EMPTY until CL2-CL5 are signed. See §0.
 SELECT * FROM safety.adopted_rule_set('IN','en');
+
+-- 7. The audit chain verifies end to end.  MUST return 0 bad, and this is the
+--    query the nightly job should run (HP-RB-001 §7 — it used to live only in
+--    that document; migration 047 made it an object so it can be executed).
+SELECT count(*) FILTER (WHERE NOT hash_ok OR NOT link_ok) AS bad,
+       count(*) AS events
+  FROM public.verify_audit_chain();
+
+-- 8. Nothing pseudonym-bearing is left unscoped by region.  MUST return 0.
+SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+ WHERE c.relkind='r' AND NOT c.relrowsecurity
+   AND c.oid IN (SELECT attrelid FROM pg_attribute
+                  WHERE attname IN ('subject_pseudonym','subject_ref') AND attnum > 0);
 ```
 
 Checks 3 and 4 are the two that were false in production shape until migrations 044 and 045,
-and neither was visible to any test running as the owner.
+and neither was visible to any test running as the owner. Check 8 was 1 until migration 047 —
+the one table left was the immutable audit log itself.
 
 ---
 
@@ -306,6 +331,12 @@ and neither was visible to any test running as the owner.
   obligation and nothing reads it; `obs.review_queue_item.clinical_domain` is NOT NULL and
   nothing produces one (R10b, parked pending the clinical lead).
 - **Backup/restore rehearsal** (V10) — do this before the first real record, not after.
+- **The external anchor and the nightly verification job** (HP-RB-001 §6-§7, items 5-7 of that
+  runbook's order-of-execution list). The *query* is no longer missing — `public.verify_audit_chain()`
+  exists and §3 check 7 runs it — but nothing schedules it, and no anchor bucket exists. A hash
+  chain inside a database proves nothing against whoever controls that database; what makes it
+  evidence is publishing its head somewhere you do not control. Note the ordering in Step 1:
+  the first anchor is what freezes the chain's canonical form.
 - **Secrets rotation.** Rotating `SUBJECT_KEY_WRAPPING_KEY` needs a plan: it wraps every
   subject DEK, so a rotation must re-wrap them, not merely replace the key.
 - **CI deployment automation.** The workflows run tests only; a deploy step would need
@@ -320,13 +351,18 @@ Following the distinction this repo's other documents draw.
 **Verified by execution** against a real Postgres 16 + pgvector, on a database built only from
 `migrations/`:
 
-- all 49 migrations apply clean, and re-apply
+- all 50 migrations apply clean, and re-apply
 - pg-boss starts as `queue_role` and fails as every application role
 - the whole pipeline runs end to end, as `hp_app`/`reasoner_role`/`redflag_role` over password
   auth, and produces the §0 unavailability result on an unsigned schema
-- fifteen gates in `migrations/test/`, both DB-backed suites, 120 unit tests
+- seventeen gates in `migrations/test/`, both DB-backed suites, 120 unit tests, the 51-case
+  eval gate — every one of them twice in a row, against the same database, so a gate that only
+  works once shows up as a gate that only works once (one did)
 - the alert worker's both outcomes and its region scoping (`rf6_alert_delivery.sh`)
 - the metrics job and its BLOCK verdict (`j34_metrics.sh`)
+- the audit chain: 19 events written by the pipeline itself verify 0 bad / 19, and the migration
+  that rewrote it refuses to run once `public.audit_anchor` holds a row — checked in both
+  directions, on a log with rows and on one without
 
 **Unverified — needs your accounts.** No Vercel, Fly.io or Supabase account exists in the
 environment this was written in, and container registries are blocked there, so: `vercel deploy`,
