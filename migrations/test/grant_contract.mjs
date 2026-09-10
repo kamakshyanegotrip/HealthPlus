@@ -363,6 +363,43 @@ const RULES = [
          AND has_function_privilege('public', p.oid, 'EXECUTE')`,
   },
   {
+    id: 'P-named-grant-beside-public',
+    title: 'An INVOKER function whose ACL names a role does not also grant PUBLIC',
+    why:
+      'Rule L catches the severe case: a SECURITY DEFINER function callable by everyone ' +
+      'hands every role the OWNER\'s reach. This is the same mistake one severity down, ' +
+      'and it is the mistake that is easy to keep making, because an INVOKER function ' +
+      'runs as its caller and so the over-grant conveys no privilege the caller lacked. ' +
+      'What it conveys instead is a FALSE STATEMENT: a reader auditing ' +
+      '"GRANT EXECUTE ON safety.adopted_rule_set TO redflag_role" concludes that ' +
+      'redflag_role is who may call it, and the ACL says redflag_role AND EVERYONE. ' +
+      'Eighteen functions were in that state when this rule was written, including the ' +
+      '§0.6 adoption gate, the retrieval entry point and the region function every RLS ' +
+      'policy compares against; migration 049 is the cleanup. ' +
+      'FOUND BY EXECUTION, and only by execution: migration 048 granted a new function ' +
+      'to redflag_role, the grant was REVOKED to prove it was load-bearing, and the call ' +
+      'still succeeded. A grant that cannot be revoked is not a grant. ' +
+      'SCOPED TO FUNCTIONS WITH A NON-DEFAULT ACL, deliberately. 103 of this schema\'s ' +
+      '104 invoker functions are PUBLIC-executable because that is PostgreSQL\'s default ' +
+      'and nobody has said otherwise; sweeping those is a decision about the whole ' +
+      'schema, not a defect list. The defect is a GRANT somebody wrote that does not ' +
+      'mean what it says.',
+    sql: `
+      SELECT 'PUBLIC'::text AS role,
+             n.nspname||'.'||p.proname AS object,
+             'EXECUTE held by PUBLIC beside a named grant'::text AS detail
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE p.prokind = 'f'
+         AND NOT p.prosecdef
+         AND p.proacl IS NOT NULL
+         AND n.nspname NOT IN ('pg_catalog','information_schema')
+         AND EXISTS (SELECT 1 FROM unnest(p.proacl) a WHERE a::text LIKE '=X/%')
+         AND EXISTS (SELECT 1 FROM unnest(p.proacl) a
+                      WHERE a::text NOT LIKE '=X/%'
+                        AND a::text NOT LIKE (pg_get_userbyid(p.proowner) || '=%'))`,
+  },
+  {
     id: 'G-public-holds-nothing',
     title: 'PUBLIC holds no table privilege in any application schema',
     why:

@@ -195,6 +195,15 @@ BEGIN;
   ALTER FUNCTION principal.fetch_attribute_envelope(uuid,text,uuid,boolean)
     OWNER TO hp_force_rls_probe;
   GRANT USAGE ON SCHEMA principal, app, public TO hp_force_rls_probe;
+  -- AND EXECUTE ON THE SESSION-CONTEXT FUNCTIONS, which this probe used to get
+  -- from PUBLIC. Migration 049 revoked that, and this gate is what noticed —
+  -- with a finding that is NOT confined to the test: a SECURITY DEFINER function
+  -- runs as ITS OWNER, so the moment schema ownership moves off `postgres` (the
+  -- production shape this section exists to simulate), the new owner needs
+  -- explicit EXECUTE on app.current_user_id() and app.current_region(). It is
+  -- implicit today only because postgres owns those functions too.
+  GRANT EXECUTE ON FUNCTION app.current_user_id(), app.current_region()
+    TO hp_force_rls_probe;
   SET SESSION AUTHORIZATION reasoner_role;
   SELECT 'unset='  || count(*) FROM principal.fetch_attribute_envelope('$S','REASONING');
   SELECT set_config('app.user_id','$S',true) IS NOT NULL;

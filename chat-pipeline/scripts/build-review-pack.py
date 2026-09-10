@@ -768,6 +768,20 @@ QS = [
      "Sheet A's WARNING rules and sheet D's fourteen topics both push volume into the review queue. RF-W-07 (any pregnancy) and RF-W-08 (any child) are deliberately broad — if capacity cannot absorb them, that is a reason to narrow them NOW."),
     ("§2.1", "Which instrument governs — the Telemedicine Practice Guidelines 2020, or a successor?",
      "CGP-001 §2 marks the current status ⚠️ unverified. It determines what the platform may do at all."),
+    ("§2.2.5b(1)", "§2.2.5b trigger 1 fires on the EIGHT CLINICAL profile flags, not on the two age flags. Confirm or reverse.",
+     "The literal reading — any of the ten §4.6 flags forces review — was implemented first and then "
+     "disproved by running it: `deriveIsMinor` can only return FALSE via AGE_75_PLUS, so an established "
+     "adult always carried a flag and an unestablished one always failed the §2.4.3 minor gate. NO SUBJECT "
+     "COULD EVER PUBLISH, by construction. The two age flags are therefore left to §2.4.3, which already "
+     "reads exactly those two. This is a NARROWING of a safety gate and needs your signature or your "
+     "objection; the underlying cause is that the schema has no way to record 'age established, 18-74'."),
+    ("§4.6.1", "What is a 'symptom-related message', and should the profile flags raise the severity floor at all yet?",
+     "§4.6.1 says the ten flags 'raise the floor severity by one level FOR SYMPTOM-RELATED MESSAGES'. That is "
+     "NOT IMPLEMENTED — redFlagEngine.ts never sees the profile, so the flags raise nothing today. It cannot be "
+     "implemented fail-closed either: raising the floor for EVERY message would put a flagged user's question "
+     "about hospital prices at WARNING, and §4.0.6 then suppresses all commercial content — breaking the "
+     "product for exactly the population it exists to serve. The definition of 'symptom-related' is the "
+     "missing piece and it is yours."),
     ("§4.3.3", "A self-harm EMERGENCY template cannot exist alongside the general one. Should it?",
      "Found by trying to seed it: safety_template has UNIQUE (severity, jurisdiction, language, version), "
      "and §4.3.3 resolves a template by exactly that key. So the ladder has no dimension for WHICH KIND of "

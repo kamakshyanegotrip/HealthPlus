@@ -11,12 +11,13 @@ import { scanRedFlags, loadSafetyTemplate, recordRedFlagEvent, deriveActionTaken
 import { resolveTemplateForSeverity } from '@/lib/pipeline/templateResolution';
 import { makePrepareTemplate } from '@/lib/pipeline/templateSlots';
 import { resolveEmergencyNumber } from '@/lib/pipeline/unavailability';
-import { lookupPatientProfile, minorGateRequiresReview } from '@/lib/pipeline/patientProfile';
+import { lookupPatientProfile, minorGateRequiresReview, highRiskProfileRequiresReview } from '@/lib/pipeline/patientProfile';
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
 import { beginSynthesis } from '@/lib/pipeline/synthesis';
 import { validateStream } from '@/lib/pipeline/emissionValidator';
 import { recordAuditEvent, upsertResponseAudit, persistResponseContent } from '@/lib/pipeline/auditLog';
+import { checkElevatedTopics, topicGateRequiresReview, topicAuditTrigger } from '@/lib/pipeline/elevatedTopic';
 import { dispatchSideEffects } from '@/lib/pipeline/sideEffectDispatcher';
 import { SEVERITY_ORDER } from '@/lib/types';
 
@@ -469,6 +470,19 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // two things this deliberately does NOT fix live on the helper.
   const minorForcesReview = minorGateRequiresReview(profile);
 
+  // §2.2.5b TRIGGER 1 — "the user carries a flagged high-risk profile (§4.6)".
+  // HP-SR-001 recorded this as absent; it was worse than absent, because the
+  // flags were being READ and then discarded. Nine of the ten never reached a
+  // decision. See highRiskProfileRequiresReview for why it is ANY flag and what
+  // that costs in reviewer load.
+  const highRiskProfileForcesReview = highRiskProfileRequiresReview(profile);
+
+  // §2.2.5b TRIGGER 2 — the Elevated-Risk Topic List (§2.4.1). Three-valued:
+  // an unadopted list forces review rather than passing silently. Runs on the
+  // redflag pool because hp_app deliberately reaches nothing in `safety`.
+  const topicCheck = await checkElevatedTopics(ctx);
+  const topicForcesReview = topicGateRequiresReview(topicCheck);
+
   // ---- 5. Knowledge Lookup Layer, parallel, direct SQL, no LLM -------------
   const byDomain = await lookupKnowledge(ctx, intent.requiresKnowledgeDomains, category);
   const claims = flattenClaims(byDomain);
@@ -593,12 +607,29 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     send('notice', { message: 'This response cited no source claims and has been queued for review rather than marked published.' });
   }
 
-  const reviewRequired =
-    minorForcesReview ||
-    SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['WARNING'] ||
-    (aggConfidence >= 0.7 && aggConfidence <= 0.74) || // §2.2.5b band
-    belowFloor ||
-    !hasCitations;
+  // §1.8.3 / §2.2.5b TRIGGER 5 — a Tier 1 vs Tier 2 conflict that no rule broke.
+  // The database has detected these since migration 024 and returned the
+  // conflict's id on every retrieved row; knowledgeLookup discarded the column
+  // until now. `demotionRequired` is the stronger signal (the aggregate was
+  // actually pulled down), and `conflictId` alone still counts: §1.8.1(d)'s
+  // SURFACED_TO_USER is a decision to show a disagreement, not to settle it.
+  const conflictedClaims = citedClaims.filter((c) => c.demotionRequired || c.conflictId !== undefined);
+  const tierConflictForcesReview = conflictedClaims.length > 0;
+
+  // ALL FIVE OF §2.2.5b's TRIGGERS, for the first time, plus the two this team
+  // added (belowFloor, uncited) which are good ones and are kept.
+  const reviewTriggers = [
+    minorForcesReview ? 'MINOR_GATE' : null,                       // §2.4.3
+    highRiskProfileForcesReview ? 'HIGH_RISK_PROFILE' : null,      // §2.2.5b(1)
+    topicAuditTrigger(topicCheck),                                 // §2.2.5b(2)
+    SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['WARNING'] ? 'SEVERITY' : null, // §2.2.5b(3)
+    aggConfidence >= 0.7 && aggConfidence <= 0.74 ? 'CONFIDENCE_BAND' : null,          // §2.2.5b(4)
+    tierConflictForcesReview ? 'TIER_CONFLICT' : null,             // §2.2.5b(5) / §1.8.3
+    belowFloor ? 'BELOW_FLOOR' : null,                             // team addition
+    !hasCitations ? 'UNCITED' : null,                              // team addition
+  ].filter((t): t is string => t !== null);
+
+  const reviewRequired = reviewTriggers.length > 0;
 
   await upsertResponseAudit({
     ctx,
@@ -631,6 +662,11 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
 
   await recordAuditEvent(ctx, reviewRequired ? 'REVIEW_REQUESTED' : 'PUBLISHED', 'system', {
     review_required: reviewRequired,
+    // WHICH triggers, not just THAT one fired. Without this the audit row cannot
+    // answer the question §2.2.5b will actually be audited on — was the topic
+    // list checked, or was there none? — and "review_required: false" reads the
+    // same whether five triggers were evaluated or two were never implemented.
+    review_triggers: reviewTriggers,
     agg_confidence: Number(aggConfidence.toFixed(2)),
     blocked_sentence_count: blockedCount,
     uncited: !hasCitations,

@@ -327,6 +327,17 @@ jobs:
           set -euo pipefail
           bash migrations/test/r10f_constraints.sh
 
+      # SR-1 — §2.2.5b's five pre-publication review triggers. Three of the five
+      # did not exist; migrations 048/049 and elevatedTopic.ts closed them. This
+      # covers the DATABASE half only and says so in its own header: the
+      # classifier and the trigger arithmetic are TypeScript and are covered by
+      # chat-pipeline's reviewTriggers.test.ts and by the integration suite's
+      # test_elevated_topic_forces_review.
+      - name: "SR-1 - the five §2.2.5b review triggers (database half)"
+        run: |
+          set -euo pipefail
+          bash migrations/test/sr1_review_triggers.sh
+
       # HP-RB-001 §10's item 9, written eleven months after the runbook asked
       # for it: "no event type emits a non-whitelisted payload key". Static, so
       # it needs no database — it reads the call sites, because the runbook's

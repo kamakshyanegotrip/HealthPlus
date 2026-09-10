@@ -68,6 +68,21 @@ export interface RetrievedClaim {
   text: string; // the claim text as stored; the model may reference but not rewrite it
   jurisdiction?: string;
   population?: string; // §1.9.7 — null population blocks publication for range/stat claims
+  /**
+   * §1.8.3 — the id of an unresolved Tier 1 / Tier 2 conflict this claim is in,
+   * from `evidence.aggregate_claim()`. Undefined when there is none.
+   *
+   * "Unresolved" is the database's definition, not a looser one: a conflict
+   * settled by tier, recency or jurisdiction does NOT appear here, and
+   * SURFACED_TO_USER does, because showing a disagreement is not deciding it.
+   */
+  conflictId?: string;
+  /**
+   * True when §1.8.3 actually pulled this claim's aggregate confidence down to
+   * the conflicting side's. Strictly stronger than `conflictId` being set, and
+   * the schema agrees: c_demotion_names_conflict forbids a demotion without one.
+   */
+  demotionRequired: boolean;
   domain: KnowledgeDomain;
 }
 
