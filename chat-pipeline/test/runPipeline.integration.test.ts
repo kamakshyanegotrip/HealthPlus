@@ -383,12 +383,18 @@ describe.skipIf(!RUN)('runPipeline integration (real schema — migrations/ + sc
       category: 'DECISION_SUPPORT',
       proposedSeverity: 'NORMAL',
       reasoningText: `Relevant: [[claim:${SEED.guidelineClaim}]] covers early mobilisation after an uncomplicated procedure.`,
-      // The citation marker must land BEFORE the sentence-ending punctuation:
-      // splitIntoSentences splits on `[.!?]\s+` followed by uppercase/digit/
-      // quote/`[`, so a marker after a trailing period becomes its own
-      // "sentence" and leaves the numeric claim uncited — and therefore
-      // blocked. That is emissionValidator's documented sentence-boundary
-      // trade-off, not a bug.
+      // The marker lands before the sentence-ending punctuation here.
+      //
+      // THIS COMMENT USED TO SAY THE OTHER PLACEMENT WAS A DOCUMENTED TRADE-OFF
+      // RATHER THAN A BUG. It was a bug, and HP-JOB-011 §5 fixed it: the old
+      // splitter's `(?=[A-Z0-9"'\[])` lookahead treated a period-then-marker as
+      // a sentence boundary, so a marker written where Annex B.1 actually asks
+      // for it — "immediately after the sentence" — was credited to the NEXT
+      // sentence, leaving the claim-bearing one uncited and attaching a
+      // citation to prose it does not support (§3.9.2). Both placements now
+      // attribute correctly; see splitIntoSentences' header and
+      // test/section42.composition.test.ts's
+      // `test_citations_attach_to_the_sentence_that_made_the_claim`.
       synthesisText: `Guidance commonly suggests resuming light walking within 24 to 48 hours after an uncomplicated procedure [[claim:${SEED.guidelineClaim}]].`,
     });
 
@@ -431,6 +437,107 @@ describe.skipIf(!RUN)('runPipeline integration (real schema — migrations/ + sc
 
     const rfe = await seedQuery('SELECT id FROM safety.red_flag_event WHERE audit_id = $1', [ctx.auditId]);
     expect(rfe).toHaveLength(0);
+  });
+
+  /**
+   * HP-JOB-011 — the mixed-turn branch, and its twin.
+   *
+   * These two are deliberately a PAIR, in the same style as the age pair below:
+   * both are classified CLINICAL_DECISION by the same mocked classifier, and
+   * the only thing that differs is whether the message also asks for something
+   * the platform is permitted to answer. A divergence in outcome is therefore
+   * attributable to §2.3.6(c) and to nothing else.
+   *
+   * Both messages are built from words present verbatim in the seeded chunk
+   * body, for the `simple`-tsvector reason the normal-completion test above
+   * explains — websearch_to_tsquery ANDs the terms, so one absent word silently
+   * returns zero rows.
+   */
+  it('test_branch_2b_mixed_clinical_decision_turn: an answerable dimension alongside a deferred one publishes as DECISION_SUPPORT (§2.3.6(c))', async () => {
+    // "activity"/"walking" -> EXERCISE, which is Category C (§2.4.1a, blueprint
+    // §15) and has no seeded claim, so it defers. "recovery" -> RECOVERY_PERIOD,
+    // which the seeded GUIDELINE claim answers. Before HP-JOB-011 the whole
+    // turn returned CLINICAL_DECISION_REFUSAL and never reached retrieval.
+    const ctx = newCtx('light walking activity and recovery');
+    const events = await drive(ctx, {
+      intentDomains: ['GUIDELINE'],
+      intentComplexity: 'LOW',
+      category: 'CLINICAL_DECISION',
+      proposedSeverity: 'NORMAL',
+      reasoningText: `Relevant: [[claim:${SEED.guidelineClaim}]].`,
+      synthesisText:
+        `I cannot tell you which activities are safe for you — that is for a clinician who has assessed you. ` +
+        `What the published guidance says is that most people resume light walking within 24 to 48 hours after an uncomplicated procedure [[claim:${SEED.guidelineClaim}]], ` +
+        `and that timeline is what the rest of your plan has to fit around.`,
+    });
+
+    // THE HEADLINE: not the flat refusal.
+    const sentences = events.filter((e) => e.event === 'sentence');
+    const combined = sentences.map((s) => (s.data as { text: string }).text).join(' ');
+    expect(combined).not.toBe(CLINICAL_DECISION_REFUSAL);
+    expect(combined).toContain('light walking');
+
+    // Retrieval ran at all, which the old branch never allowed for this category.
+    const sources = events.find((e) => e.event === 'sources');
+    expect(sources).toBeDefined();
+    expect((sources!.data as { count: number }).count).toBe(1);
+
+    // The deferral is declared, not implicit.
+    const coverage = events.find((e) => e.event === 'coverage');
+    expect(coverage).toBeDefined();
+    expect((coverage!.data as { deferred: string[] }).deferred).toContain('EXERCISE');
+
+    // §2.2.4's long form, as chrome. Nothing rendered either disclaimer before
+    // HP-JOB-011.
+    const disclosure = events.find((e) => e.event === 'disclosure');
+    expect(disclosure).toBeDefined();
+    expect((disclosure!.data as { clause: string }).clause).toBe('2.2.4');
+    expect((disclosure!.data as { disclaimer: string }).disclaimer).toContain('Costs shown are indicative estimates, not quotations.');
+
+    // Published under DECISION_SUPPORT — never CLINICAL_DECISION, which
+    // c_category_c_disabled_v1 would reject outright.
+    const audit = await seedQuery('SELECT category, cited_claim_ids FROM obs.response_audit WHERE id = $1', [ctx.auditId]);
+    expect(audit).toHaveLength(1);
+    expect(audit[0].category).toBe('DECISION_SUPPORT');
+    expect(audit[0].cited_claim_ids).toContain(SEED.guidelineClaim);
+
+    // §2.0.4 — "the resulting safeguards" persisted. The audit row has to
+    // record that the classifier said CLINICAL_DECISION and which dimensions
+    // were deferred, or it records a category downgrade with no account of why
+    // it was allowed.
+    const evt = await seedQuery(
+      `SELECT payload FROM response_audit_event
+        WHERE audit_id = $1 AND kind IN ('PUBLISHED','REVIEW_REQUESTED')
+        ORDER BY seq DESC LIMIT 1`,
+      [ctx.auditId],
+    );
+    expect(evt).toHaveLength(1);
+    expect(evt[0].payload.classified_category).toBe('CLINICAL_DECISION');
+    expect(evt[0].payload.deferred_dimensions).toContain('EXERCISE');
+  });
+
+  it('test_branch_2c_pure_clinical_decision_turn_still_takes_the_flat_refusal: the twin of 2b with the answerable dimension removed', async () => {
+    // Same classifier verdict, same seed, one word fewer. Nothing answerable is
+    // asked for, so the cheap gate short-circuits before any retrieval and the
+    // pre-HP-JOB-011 behaviour stands unchanged. This is the assertion that the
+    // new path did not quietly widen the old one.
+    const ctx = newCtx('light walking activity');
+    const events = await drive(ctx, {
+      intentDomains: [],
+      intentComplexity: 'LOW',
+      category: 'CLINICAL_DECISION',
+      proposedSeverity: 'NORMAL',
+    });
+
+    const sentences = events.filter((e) => e.event === 'sentence');
+    expect(sentences).toHaveLength(1);
+    expect((sentences[0]!.data as { text: string }).text).toBe(CLINICAL_DECISION_REFUSAL);
+    // No retrieval, no coverage plan, no model call for the refusal text.
+    expect(events.find((e) => e.event === 'sources')).toBeUndefined();
+    expect(events.find((e) => e.event === 'coverage')).toBeUndefined();
+
+    const audit = await seedQuery('SELECT category FROM obs.response_audit WHERE id = $1', [ctx.auditId]);
+    expect(audit[0].category).toBe('INFORMATIONAL');
   });
 
   it('test_unknown_age_forces_review: the SAME response that publishes for a confirmed adult is held for review when age was never established (§2.4.3 / §3.0.3)', async () => {

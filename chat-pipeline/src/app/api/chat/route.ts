@@ -15,6 +15,9 @@ import { lookupPatientProfile, minorGateRequiresReview, highRiskProfileRequiresR
 import { lookupKnowledge, flattenClaims } from '@/lib/pipeline/knowledgeLookup';
 import { buildReasoningBrief } from '@/lib/pipeline/clinicalReasoning';
 import { beginSynthesis } from '@/lib/pipeline/synthesis';
+import { resolveConstraints, applyConstraints } from '@/lib/pipeline/constraintSet';
+import { planCoverage, detectDimensions, DEFERRABLE_DIMENSIONS } from '@/lib/pipeline/coveragePlan';
+import { disclosureFor } from '@/lib/pipeline/disclosure';
 import { validateStream } from '@/lib/pipeline/emissionValidator';
 import { recordAuditEvent, upsertResponseAudit, persistResponseContent } from '@/lib/pipeline/auditLog';
 import { checkElevatedTopics, topicGateRequiresReview, topicAuditTrigger } from '@/lib/pipeline/elevatedTopic';
@@ -409,13 +412,37 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     return;
   }
 
-  // ---- §2.3.6 — CLINICAL_DECISION short-circuit ---------------------------
-  // Structurally required: safety.response_category_state.CLINICAL_DECISION
-  // .enabled = false and c_category_c_disabled_v1 makes this the only legal
-  // outcome for that category in v1. No knowledge lookup, no generation —
-  // the refusal text is pre-approved, not model-authored, matching the
-  // Charter's posture for anything shown without the normal validator path.
-  if (classification.category === 'CLINICAL_DECISION') {
+  // ---- §2.3.6 — CLINICAL_DECISION handling (HP-JOB-011) -------------------
+  //
+  // Category C is never published: safety.response_category_state
+  // .CLINICAL_DECISION.enabled = false, and c_category_c_disabled_v1 makes
+  // that structural rather than conventional. Neither is touched here.
+  //
+  // WHAT CHANGED. §2.3.6 has three parts and this pipeline implemented two.
+  // (a) say plainly it cannot interpret the individual's situation and (b)
+  // explain who can were the static CLINICAL_DECISION_REFUSAL below. (c) —
+  // "offer the adjacent permitted help ... reproducing published criteria
+  // with citation, or preparing a question list for the user's clinician" —
+  // was not implemented at all, so a question that asked for four things we
+  // cannot determine ALONGSIDE six we can (blueprint §42's worked example is
+  // exactly that shape) lost all ten to §2.0.2's monotonic-upward rule.
+  //
+  // Now: a turn classified CLINICAL_DECISION is planned (coveragePlan.ts). If
+  // any dimension is answerable from admitted evidence, the turn publishes as
+  // DECISION_SUPPORT with its Category C dimensions deferred in §2.3.6 form —
+  // taking DECISION_SUPPORT's safeguards IN FULL, including §2.2.4's
+  // disclaimer and every §2.2.5b review trigger. If nothing is answerable, the
+  // flat refusal below runs exactly as it always did.
+  //
+  // The cheap gate first: a question asking ONLY for determinations we cannot
+  // make never reaches retrieval, so a pure Category C turn costs no more than
+  // it did before this change.
+  const wasClinicalDecision = classification.category === 'CLINICAL_DECISION';
+  const anyAnswerableDimensionRequested =
+    !wasClinicalDecision ||
+    detectDimensions(ctx.message, intent.requiresKnowledgeDomains).some((k) => !DEFERRABLE_DIMENSIONS.has(k));
+
+  if (wasClinicalDecision && !anyAnswerableDimensionRequested) {
     send('sentence', { text: CLINICAL_DECISION_REFUSAL, citedClaimIds: [] });
     await upsertResponseAudit({
       ctx,
@@ -454,7 +481,17 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     return;
   }
 
-  const category = classification.category as Exclude<ResponseCategory, 'CLINICAL_DECISION'>;
+  // The category this turn will PUBLISH under. A turn the classifier called
+  // CLINICAL_DECISION publishes as DECISION_SUPPORT with its Category C
+  // components deferred — never as CLINICAL_DECISION, which has no publishable
+  // form in v1. Retrieval below is gated on THIS value, so `evidence.policy_for`
+  // is always evaluated at DECISION_SUPPORT: strictly narrower than Category C
+  // would allow, never wider. Nothing about the deferral path widens what is
+  // retrievable, and coveragePlan.ts's header states the four walls a reviewer
+  // can check that against.
+  const category: Exclude<ResponseCategory, 'CLINICAL_DECISION'> = wasClinicalDecision
+    ? 'DECISION_SUPPORT'
+    : (classification.category as Exclude<ResponseCategory, 'CLINICAL_DECISION'>);
 
   // ---- 4. Patient profile lookup (direct DB read) --------------------------
   const profile = await lookupPatientProfile(ctx);
@@ -485,9 +522,80 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
 
   // ---- 5. Knowledge Lookup Layer, parallel, direct SQL, no LLM -------------
   const byDomain = await lookupKnowledge(ctx, intent.requiresKnowledgeDomains, category);
-  const claims = flattenClaims(byDomain);
+  const retrievedClaims = flattenClaims(byDomain);
+
+  // ---- 5a. Constraint ladder and coverage plan (HP-JOB-011) ---------------
+  // The ladder decides WHICH published content is shown; it never decides what
+  // is true of the patient. constraintSet.ts's header carries that distinction
+  // in full — it is the line between Category B selection and the Category C
+  // §11/§15 engines §2.4.1a prohibits.
+  const constraints = resolveConstraints(profile, {
+    redFlagSeverityAtLeastWarning: SEVERITY_ORDER[redFlag.severity] >= SEVERITY_ORDER['WARNING'],
+  });
+  const application = applyConstraints(constraints, retrievedClaims);
+
+  // The composer and the validator both see the ADMITTED set, not the retrieved
+  // one. A claim the ladder withheld must not be citable: if it were still in
+  // claimsById the validator would happily pass a sentence citing content the
+  // composer was never shown, which is a citation to something not retrieved
+  // for this response in everything but name (§3.9.2).
+  const claims = application.admitted;
   const claimsById = new Map<string, RetrievedClaim>(claims.map((c) => [c.claimId, c]));
-  send('sources', { count: claims.length, domains: Array.from(byDomain.keys()) });
+  send('sources', {
+    count: claims.length,
+    domains: Array.from(byDomain.keys()),
+    withheldByConstraint: application.suppressed.length,
+  });
+
+  const plan = planCoverage({
+    message: ctx.message,
+    intentDomains: intent.requiresKnowledgeDomains,
+    admittedClaims: claims,
+    categoryWasClinicalDecision: wasClinicalDecision,
+  });
+  send('coverage', {
+    dimensions: plan.dimensions.map((d) => ({ key: d.key, disposition: d.disposition })),
+    deferred: plan.deferredDimensions,
+  });
+
+  // §2.3.6 fallback. The cheap gate above let this turn through because it
+  // ASKED for something answerable; retrieval then found nothing to answer it
+  // with. A plan of nothing but DEFERRED and NO_EVIDENCE would compose into
+  // "I can't help with any of this", at length and with a model call — worse
+  // for the patient than the short pre-approved refusal, and more expensive.
+  if (wasClinicalDecision && !plan.publishable) {
+    send('sentence', { text: CLINICAL_DECISION_REFUSAL, citedClaimIds: [] });
+    await upsertResponseAudit({
+      ctx,
+      category: 'INFORMATIONAL',
+      classifierVersion: classification.classifierVersion,
+      severity: redFlag.severity,
+      ruleId: redFlag.ruleId,
+      ruleVersion: redFlag.ruleVersion,
+      templateId: null,
+      templateVersion: null,
+      aggConfidence: 1.0,
+      modelVersion: 'n/a-static-refusal',
+      promptVersion: 'n/a-static-refusal',
+      citedClaimIds: [],
+      reviewRequired: false,
+    });
+    await persistResponseContent(ctx, CLINICAL_DECISION_REFUSAL);
+    await recordRedFlagEvent(ctx, redFlag, deriveActionTaken(redFlag.severity, false), {
+      firstByteAt: new Date(ctx.receivedAt),
+      scannerStartedAt: new Date(redFlag.scannerStartedAt),
+    });
+    await recordAuditEvent(ctx, 'PUBLISHED', 'system', { path: 'clinical_decision_refusal_unplannable' });
+    void dispatchSideEffects({
+      ctx,
+      category: 'INFORMATIONAL',
+      severity: redFlag.severity,
+      reviewRequired: false,
+      postHocSampleEligible: true,
+      templateRendered: false,
+    });
+    return;
+  }
 
   // §2.0.2 monotonic-upward re-check now that retrieval has actually run.
   const retrievalImpliesClinical = claims.some((c) => c.kind === 'TEST_INTERPRETATION');
@@ -526,7 +634,17 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   const reasoning = await buildReasoningBrief(ctx, intent, category, claims);
 
   // ---- 7. Personalized recommendation synthesis, streamed -----------------
-  const { stream: anthropicStream, finalize } = beginSynthesis(ctx, intent, category, profile, claims, reasoning);
+  const { stream: anthropicStream, finalize } = beginSynthesis(
+    ctx,
+    intent,
+    category,
+    profile,
+    claims,
+    reasoning,
+    plan,
+    constraints,
+    application,
+  );
 
   async function* textDeltas(): AsyncIterable<string> {
     for await (const event of anthropicStream) {
@@ -596,6 +714,24 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   const aggConfidence = hasCitations ? Math.min(...citedClaims.map((c) => c.confidence)) : 1.0;
   const persistedCategory: Exclude<ResponseCategory, 'CLINICAL_DECISION'> = hasCitations ? category : 'INFORMATIONAL';
 
+  // §2.1.5 / §2.2.4 — the mandatory disclaimer, as UI chrome rather than model
+  // output (HP-JOB-011). Emitted HERE, after `persistedCategory` is settled,
+  // because the clause that applies is the one the audit row records: a
+  // response downgraded to INFORMATIONAL for citing nothing must not carry
+  // §2.2.4's "this comparison is decision support" text over the top of it.
+  //
+  // Before this, no surface rendered either disclaimer. Every response this
+  // pipeline has produced shipped without one.
+  //
+  // `firstContact: true` unconditionally, and that is a decision rather than an
+  // oversight: §3.11.4 requires the automated-system notice "on request and at
+  // first contact in every session", the pipeline holds no per-session turn
+  // counter, and showing it every turn over-satisfies the clause at the cost of
+  // one line of chrome. Narrowing it needs either a client-side session memory
+  // or a turn count on the session row — a product decision, not something to
+  // approximate from an audit query here.
+  send('disclosure', disclosureFor(persistedCategory, { firstContact: true }));
+
   const minConfidenceFloor = persistedCategory === 'INFORMATIONAL' ? 0.65 : 0.7; // Annex A.5 c_min_conf
   const belowFloor = hasCitations && aggConfidence < minConfidenceFloor;
   if (belowFloor) {
@@ -642,7 +778,10 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     templateVersion: redFlag.templateVersion,
     aggConfidence,
     modelVersion: reasoning.modelUsed,
-    promptVersion: process.env.PROMPT_VERSION_COMPOSE ?? 'compose-2026.08.1',
+    // Kept in step with synthesis.ts's own default. These drifting apart means
+    // the audit row names a prompt version that never ran, which §6.4 makes
+    // load-bearing — test/section42.composition.test.ts pins them together.
+    promptVersion: process.env.PROMPT_VERSION_COMPOSE ?? 'compose-2026.09.1',
     citedClaimIds: Array.from(citedClaimIds),
     reviewRequired,
   });
@@ -670,6 +809,18 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
     agg_confidence: Number(aggConfidence.toFixed(2)),
     blocked_sentence_count: blockedCount,
     uncited: !hasCitations,
+    // HP-JOB-011. §2.0.4 requires the category, the classifier version, the
+    // inputs AND "the resulting safeguards" to be persisted. When a turn the
+    // classifier called CLINICAL_DECISION publishes as DECISION_SUPPORT, the
+    // safeguard that made that legitimate is the deferral of these specific
+    // dimensions — so the audit row has to name them, or it records a category
+    // downgrade with no account of why it was permitted.
+    classified_category: classification.category,
+    deferred_dimensions: plan.deferredDimensions,
+    covered_dimensions: plan.dimensions.map((d) => `${d.key}:${d.disposition}`),
+    constraints_applied: constraints.constraints.map((c) => c.key),
+    claims_withheld_by_constraint: application.suppressed.length,
+    disclaimer_clause: persistedCategory === 'DECISION_SUPPORT' ? '2.2.4' : '2.1.5',
   });
 
   // ---- 10. Side-effect dispatcher — fired, NOT awaited ---------------------

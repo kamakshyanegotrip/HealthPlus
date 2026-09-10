@@ -72,19 +72,52 @@ const REASSURANCE_PATTERNS = [
 const NUMERIC_CLAIM_PATTERN = /(\$|₹|€|£)\s?\d|\d+(\.\d+)?\s?%|\bmg\b|\bmcg\b|\b\d{4}\b.*(guideline|study|approv)/i;
 const ELIGIBILITY_LANGUAGE = /\b(you are|you'?re) (eligible|not eligible|cleared|contraindicated|suitable|not suitable)\b/i;
 
+/**
+ * DEFECT FIXED HERE — HP-JOB-011 §5, found by running the composer against the
+ * §42 fixture rather than by reading this function.
+ *
+ * The old pattern was `/([.!?])\s+(?=[A-Z0-9"'\[])/g`. That lookahead includes
+ * `\[`, so a period followed by a citation marker was a sentence boundary and
+ * THE MARKER STARTED THE NEXT SENTENCE. Annex B.1 instructs the composer to
+ * "tag it inline IMMEDIATELY AFTER THE SENTENCE", which is exactly the shape
+ * that broke:
+ *
+ *   "Hospital A is accredited. [[claim:X]] Hospital B is too. [[claim:Y]]"
+ *
+ *   old -> ["Hospital A is accredited.",          <- cites NOTHING
+ *           "[[claim:X]] Hospital B is too."]     <- cites X, which is about A
+ *
+ * Two consequences, both live on every response this pipeline has produced:
+ *
+ *   * The sentence carrying the claim arrives uncited. If it contains a figure,
+ *     NUMERIC_CLAIM_PATTERN blocks it as unsourced — the composer did source it,
+ *     and the split threw the source away.
+ *   * The following sentence is credited with a citation that does not support
+ *     it, which is §3.9.2 ("MUST NOT attach a real citation to a claim that
+ *     citation does not support") arriving through the tokenizer rather than
+ *     through the model. It also feeds `citedClaimIds`, so the audit record and
+ *     `aggConfidence` are both computed over the wrong set.
+ *
+ * The fix absorbs any run of trailing markers into the sentence they follow,
+ * and stops treating `[[claim:` as a sentence opener while still allowing a
+ * genuine bracket to start one. Both marker placements — trailing (what Annex
+ * B.1 asks for) and inline-before-the-period — now attribute correctly, which
+ * matters because a live model does both.
+ *
+ * Still a naive splitter otherwise: crude abbreviation and decimal guards, no
+ * real tokenizer. That part of the original comment stands.
+ */
 export function splitIntoSentences(buffer: string): { complete: string[]; rest: string } {
-  // Naive sentence splitter: split on ./!/? followed by whitespace, but not
-  // after a single capital letter + period (crude abbreviation guard) or
-  // inside a decimal number. Good enough for a reference implementation;
-  // swap for a proper sentence tokenizer before production.
-  const sentenceEnd = /([.!?])\s+(?=[A-Z0-9"'\[])/g;
+  const sentenceEnd = /([.!?])((?:\s*\[\[claim:[^\]]*\]\])*)\s+(?=[A-Z0-9"']|\[(?!\[claim:))/g;
   const parts: string[] = [];
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = sentenceEnd.exec(buffer)) !== null) {
     const isDecimal = /\d\.$/.test(buffer.slice(0, match.index + 1)) && /^\d/.test(buffer.slice(match.index + 2));
     if (isDecimal) continue;
-    parts.push(buffer.slice(lastIndex, match.index + 1).trim());
+    // End of the sentence = the terminator plus any trailing marker run.
+    const sentenceEndIndex = match.index + (match[1]?.length ?? 0) + (match[2]?.length ?? 0);
+    parts.push(buffer.slice(lastIndex, sentenceEndIndex).trim());
     lastIndex = match.index + match[0].length;
   }
   return { complete: parts.filter(Boolean), rest: buffer.slice(lastIndex) };

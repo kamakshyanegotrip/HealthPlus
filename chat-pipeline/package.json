@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:integration": "RUN_PIPELINE_INTEGRATION=1 vitest run test/runPipeline.integration.test.ts test/patientProfile.db.test.ts",
     "eval": "tsx eval/run-eval.ts",
+    "eval:composer": "RUN_LIVE_COMPOSER_EVAL=1 vitest run test/section42.composition.test.ts",
     "smoke:live": "tsx scripts/live-anthropic-smoke.ts",
     "db:seed": "tsx scripts/seed-real.ts"
   },
