@@ -35,6 +35,20 @@ name against a sign-off that did not happen.
 verified and left running; what it will serve is CL5-ADD-001's unavailability copy, which was
 written for exactly this state. The day CL2–CL5 are signed, the gate opens with no code change.
 
+> **And on that day, expect the opposite failure — by design.** §2.2.5b trigger 2 checks each
+> message against the §2.4.1 Elevated-Risk Topic List. Migration `048` ships that list with the
+> Charter's fourteen topics carrying **empty terms and none adopted**, so the trigger cannot be
+> evaluated, §3.0.3 resolves it closed, and every response is held at `review_state = 'PENDING'`
+> with `review_triggers` containing `ELEVATED_TOPIC_UNEVALUABLE`. That is not a bug and it is
+> not the same state as "checked, nothing matched" — the audit row distinguishes them precisely
+> so an auditor can tell them apart later.
+>
+> The topic list is **not** on CGP-001 §9's ninety-day schedule, so *"rule set signed, topic
+> list not"* is the expected intermediate state rather than an edge case. Adopting a topic
+> requires a named clinician (`adopted_by` → `principal.clinician`) and at least one term, the
+> same way a red-flag rule does. Until then the system answers nothing before the gate and holds
+> everything after it, and both are the fail-closed reading.
+
 ---
 
 ## §1. The four processes
@@ -77,7 +91,7 @@ node migrations/run_migrations.mjs
 did not exist when the pipeline was written; it had drifted in twelve places and R10g deleted
 it. Any document still mentioning it is stale.)
 
-Migrations `042`–`047` each assert their own effect and will fail the run rather than report a
+Migrations `042`–`049` each assert their own effect and will fail the run rather than report a
 success they did not achieve.
 
 > **Order matters once, and only here.** Migration `047` puts the region inside the audit log's
@@ -329,7 +343,13 @@ the one table left was the immutable audit log itself.
   is recorded UNDELIVERABLE. Choosing one is RF6-channel and it needs your account.
 - **A reviewer console.** `obs.response_audit.review_state = 'PENDING'` records the §2.2.5b
   obligation and nothing reads it; `obs.review_queue_item.clinical_domain` is NOT NULL and
-  nothing produces one (R10b, parked pending the clinical lead).
+  nothing produces one (R10b, parked pending the clinical lead). Every held response logs
+  `REVIEW REQUIRED AND NOT QUEUED` for this reason — CI's own integration logs show it. All
+  five §2.2.5b triggers are implemented and fire correctly; what is missing is the human at
+  the other end, and with the topic list unadopted (§0) that queue is *every* response.
+- **An adopted Elevated-Risk Topic List.** Migration `048` seeds the fourteen §2.4.1 topics with
+  no terms and no signature, and `safety.adopted_topic_list()` returns nothing until a clinician
+  signs. Sheet D of the CGP-004 review pack is where the terms come from. See §0.
 - **Backup/restore rehearsal** (V10) — do this before the first real record, not after.
 - **The external anchor and the nightly verification job** (HP-RB-001 §6-§7, items 5-7 of that
   runbook's order-of-execution list). The *query* is no longer missing — `public.verify_audit_chain()`
@@ -351,13 +371,13 @@ Following the distinction this repo's other documents draw.
 **Verified by execution** against a real Postgres 16 + pgvector, on a database built only from
 `migrations/`:
 
-- all 50 migrations apply clean, and re-apply
+- all 52 migration files (`001`–`049`) apply clean, and re-apply
 - pg-boss starts as `queue_role` and fails as every application role
 - the whole pipeline runs end to end, as `hp_app`/`reasoner_role`/`redflag_role` over password
   auth, and produces the §0 unavailability result on an unsigned schema
-- seventeen gates in `migrations/test/`, both DB-backed suites, 120 unit tests, the 51-case
-  eval gate — every one of them twice in a row, against the same database, so a gate that only
-  works once shows up as a gate that only works once (one did)
+- eighteen gates in `migrations/test/`, both DB-backed suites (12 tests, 0 skipped), 127 unit
+  tests, the 51-case eval gate — every one of them twice in a row, against the same database,
+  so a gate that only works once shows up as a gate that only works once (one did)
 - the alert worker's both outcomes and its region scoping (`rf6_alert_delivery.sh`)
 - the metrics job and its BLOCK verdict (`j34_metrics.sh`)
 - the audit chain: 19 events written by the pipeline itself verify 0 bad / 19, and the migration
