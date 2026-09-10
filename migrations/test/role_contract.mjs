@@ -105,6 +105,29 @@ const ENTRY_POINTS = [
       "R10e's integration seed, and the ONE file here that is deliberately not application code — it never runs in a deployment. It builds its own pool from SEED_DATABASE_URL, refuses to start without it, and never touches db(), because hp_app holds INSERT on nothing it writes (principal, safety, evidence) and must keep holding none; the seed's own header carries the has_table_privilege output that establishes that. The connection the operator supplies is the OBJECT OWNER's, which in this cluster and in CI is `postgres`. Declaring it is near-vacuous — a superuser passes every probe — and that is stated rather than hidden: the value here is not the probe, it is that the file cannot be waved through without a named role and a reason. `hp_owner` would be the truthful name if it owned anything, and it does not: every object in this schema is owned by `postgres` (migrations run as it), which is also why FORCE RLS is inert in every gate but r10d_attr.sh §4",
   },
   {
+    // Both of these import seed-real's own pool helpers (`seedQuery`,
+    // `withSeedTx`), so they connect exactly as it does — SEED_DATABASE_URL,
+    // the object owner, never db(). Declared separately rather than widening
+    // the prefix above, because "runs on the seed's connection" is a fact about
+    // these two files and not a property anything under scripts/ inherits.
+    //
+    // NEITHER RUNS IN A DEPLOYMENT. seed-demo.ts writes a rule set marked
+    // clinically_adopted against a fixture clinician and refuses to run at all
+    // without DEMO_SEED_I_UNDERSTAND=yes; scan-probe.ts only reads. If either
+    // ever acquires a caller inside the request path, this declaration is the
+    // line that should stop it.
+    prefix: 'chat-pipeline/scripts/seed-demo.ts',
+    role: 'postgres',
+    reason:
+      "HP-CGP-004's demo fixture. Loads scripts/fixtures/draft-rule-set.json into a DEVELOPMENT database as an UNADOPTED rule set, on seed-real's owner connection (withSeedTx). It writes safety.red_flag_rule_set, safety.red_flag_rule and safety.safety_template — hp_app holds INSERT on none of them and must keep holding none",
+  },
+  {
+    prefix: 'chat-pipeline/scripts/scan-probe.ts',
+    role: 'postgres',
+    reason:
+      "Read-only companion to seed-demo.ts: calls safety.adopted_rule_set() on the seed's owner connection and runs the real scanner over the review pack's gold-set cases. It asserts nothing — the labels are the clinical lead's (CL9/AMB-22) — so it is a tool, not a test, and its one SQL literal is the adopted-set lookup",
+  },
+  {
     prefix: 'src/jobs/',
     role: 'dqe_role',
     reason: "src/db/pool.ts is per-role since R10-role-routing: jobPool('dqe') carries DATABASE_URL_DQE, and migration 037 gave dqe_role LOGIN because this became its caller. Until the operator sets that password the pool falls back to DATABASE_URL — recorded by poolRoleBindings(), not silent — so this declaration is the SPECIFICATION the deployment must match, which is exactly what it is for",

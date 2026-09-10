@@ -87,6 +87,34 @@ export async function seedQuery<R extends pg.QueryResultRow = pg.QueryResultRow>
   return rows;
 }
 
+/**
+ * One connection and one transaction, for a caller outside this file.
+ *
+ * `seedQuery` goes through the POOL, so a `BEGIN` sent through it and the
+ * statements after it are not necessarily on the same connection — the
+ * transaction would silently not exist, and a half-finished run would leave a
+ * partial fixture behind. scripts/seed-demo.ts hit exactly that: a template
+ * insert failed on a unique key and the rows before it had already committed
+ * one at a time.
+ *
+ * Same reasoning as seedRealSchema()'s own transaction, which is why this lives
+ * beside it rather than being reinvented there.
+ */
+export async function withSeedTx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+  const c = await seedDb().connect();
+  try {
+    await c.query('BEGIN');
+    const out = await fn(c);
+    await c.query('COMMIT');
+    return out;
+  } catch (err) {
+    await c.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    c.release();
+  }
+}
+
 /** Closes the seed's own pool. The application's pools are not ours to end. */
 export async function endSeedPool(): Promise<void> {
   if (seedPool) {
