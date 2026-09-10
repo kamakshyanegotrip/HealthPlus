@@ -99,6 +99,15 @@ async function lookupDomain(
             c.statement AS text, c.jurisdiction, c.population,
             ag.agg_confidence AS confidence,
             evidence.confidence_band(ag.agg_confidence) AS confidence_band,
+            -- §2.2.5b TRIGGER 5, and it costs NO EXTRA JOIN. aggregate_claim
+            -- has returned these two since migration 024 and this query has
+            -- discarded them ever since: §1.8.3's Tier 1 vs Tier 2 conflict
+            -- detection, its confidence demotion, and the conflict's own id are
+            -- all computed in the database, on this very row, and then dropped
+            -- on the floor. HP-SR-001 recorded trigger 5 as "no conflict
+            -- detection exists" — the detection exists; the READER did not.
+            ag.conflict_id,
+            ag.demotion_required,
             evidence.render_citation(es.id) AS citation
        FROM evidence.claim_search($1, $2::text[], NULL, $4::integer) cs
        JOIN evidence.claim c ON c.id = cs.claim_id
@@ -128,6 +137,13 @@ async function lookupDomain(
     category,
     confidence: Number(r.confidence),
     confidenceBand: r.confidence_band,
+    // §1.8.3. `conflictId` is set whenever this claim is in a Tier 1/Tier 2
+    // conflict that no rule broke — including SURFACED_TO_USER, which is a
+    // decision to SHOW a disagreement rather than a decision about which side
+    // is right. `demotionRequired` is the stronger signal: the aggregate was
+    // actually pulled down to the other side's.
+    conflictId: r.conflict_id ?? undefined,
+    demotionRequired: r.demotion_required === true,
     citation: r.citation, // rendered from the persisted source record, §1.9.5
     text: r.text,
     jurisdiction: r.jurisdiction ?? undefined,

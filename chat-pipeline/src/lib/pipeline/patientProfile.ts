@@ -262,3 +262,73 @@ export function deriveIsMinor(riskFlags: readonly RiskFlagKey[]): boolean | null
 export function minorGateRequiresReview(profile: PatientProfile | null): boolean {
   return profile?.isMinor !== false;
 }
+
+/**
+ * §2.2.5b TRIGGER 1 — "the user carries a flagged high-risk profile (§4.6)".
+ *
+ * HP-SR-001 recorded this as having "no implementation anywhere", and it was
+ * right in effect if not in cause: the flags reach this module and then nine of
+ * the ten are thrown away. `deriveIsMinor` reads AGE_UNDER_18 and AGE_75_PLUS
+ * and the caller uses only the minor gate, so PREGNANCY, IMMUNOSUPPRESSION,
+ * ACTIVE_MALIGNANCY, ANTICOAGULATION, TRANSPLANT_RECIPIENT, POST_OP_UNDER_30D,
+ * DIALYSIS and ANAPHYLAXIS_HISTORY have never influenced anything.
+ *
+ * ANY ACTIVE FLAG EXCEPT THE TWO AGE FLAGS, and the exception is a NARROWING
+ * that had to be argued for rather than assumed. §2.2.5b names no subset and
+ * §3.0.3 makes the absence of a narrowing decision a prohibition on narrowing,
+ * so the literal reading was implemented first — and then disproved by running
+ * it:
+ *
+ *   `deriveIsMinor` returns FALSE only when AGE_75_PLUS is active. It returns
+ *   NULL when neither age flag is present, and §3.0.3 resolves NULL closed.
+ *   So every subject is in exactly one of three states:
+ *
+ *     AGE_UNDER_18 active  -> minor gate fires
+ *     AGE_75_PLUS  active  -> minor gate clears... and trigger 1 fires
+ *     neither active       -> minor gate fires (age unestablished)
+ *
+ *   Under the literal reading NO SUBJECT CAN EVER PUBLISH. Not "few" — none, by
+ *   construction, because the schema has no way to say "age established, and it
+ *   is between 18 and 74". The integration suite proved it in one run: the
+ *   publish branch of the pipeline became unreachable and untestable.
+ *
+ * A review gate that fires on every response is not a stricter gate, it is the
+ * absence of one — the same argument `deriveIsMinor`'s own comment makes about
+ * a null-everywhere isMinor ("a gate that fires on everyone stops
+ * distinguishing anything"), and with no reviewer console (CGP-001 §8.3) a
+ * hundred-percent PENDING queue is a queue nobody triages.
+ *
+ * So the two AGE flags are left to the clause the Charter gives age — §2.4.3,
+ * via `minorGateRequiresReview` above, which already reads exactly those two —
+ * and trigger 1 governs the eight CLINICAL flags. Note also that §4.6.1's own
+ * stated effect is "raises the floor severity by one level for symptom-related
+ * messages", not "forces review": what §2.2.5b trigger 1 inherits from §4.6 is
+ * the flag LIST, and the Charter does not say the age entries carry the same
+ * meaning in both clauses.
+ *
+ * THIS IS RECORDED AS A DECISION, NOT SMUGGLED. Sheet E of the review pack
+ * (HP-CGP-004) asks the clinical lead for each flag's effect, and sheet G now
+ * asks this question directly. The real fix is upstream and is neither
+ * engineering's nor a narrowing: age belongs in a DEMOGRAPHIC attribute
+ * (HP-SR-001 §4), and `deriveIsMinor` reads AGE_75_PLUS as a proxy for "not a
+ * minor" only because nothing else in the schema can say so.
+ *
+ * THE VOLUME CONSEQUENCE IS REAL AND SHOULD NOT BE DISCOVERED IN PRODUCTION.
+ * POST_OP_UNDER_30D describes most of this platform's population by
+ * construction — a medical-travel patient within thirty days of a procedure is
+ * the ordinary case, not the exception — so this trigger will fire on a large
+ * fraction of Decision Support responses. Reviewer capacity is CL8 and is
+ * unmodelled. HP-SR-001's caution about SR-4 applies unchanged: the safe
+ * default is still the right default, and the volume should reach the clinical
+ * lead in the same message rather than after.
+ *
+ * A NULL PROFILE DOES NOT FIRE THIS, deliberately. "No flags are known" is not
+ * "a flag is present", and the unknown case is already forced closed by
+ * `minorGateRequiresReview` above. Keeping the two distinct is what lets the
+ * audit row say WHICH trigger fired instead of only THAT one did.
+ */
+const AGE_FLAGS: readonly RiskFlagKey[] = [UNDER_18, OVER_75];
+
+export function highRiskProfileRequiresReview(profile: PatientProfile | null): boolean {
+  return (profile?.riskFlags ?? []).some((f) => !AGE_FLAGS.includes(f));
+}

@@ -15,6 +15,10 @@ function claim(overrides: Partial<RetrievedClaim> = {}): RetrievedClaim {
     citation: 'ADA 2026 Standards of Care',
     text: 'ADA 2026 guidance recommends HbA1c target below 7% for most non-pregnant adults with type 2 diabetes.',
     population: 'non-pregnant adults with type 2 diabetes',
+    // §1.8.3 — no conflict on the default fixture. Present rather than
+    // optional on RetrievedClaim so that a claim whose conflict state was never
+    // established cannot be silently read as "not in conflict".
+    demotionRequired: false,
     domain: 'GUIDELINE',
     ...overrides,
   };

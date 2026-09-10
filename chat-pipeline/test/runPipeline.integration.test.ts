@@ -481,6 +481,91 @@ describe.skipIf(!RUN)('runPipeline integration (real schema — migrations/ + sc
     );
     expect(requested).toHaveLength(1);
     expect(requested[0].payload.review_required).toBe(true);
+
+    // WHICH triggers, end to end. Before SR-1 closed, the audit row said only
+    // THAT review was required — which reads identically whether five triggers
+    // were evaluated or three were never implemented.
+    const triggers: string[] = requested[0].payload.review_triggers;
+    expect(triggers).toContain('MINOR_GATE');
+
+    // And §2.2.5b trigger 2 is CLEAR here, not merely quiet. The seed adopts
+    // topic 6 with terms this message does not contain, so the topic gate ran
+    // and found nothing — which is the state that CANNOT be reached if the
+    // topic list is unadopted, and is therefore the assertion that proves the
+    // fixture is doing its job.
+    expect(triggers).not.toContain('ELEVATED_TOPIC');
+    expect(triggers).not.toContain('ELEVATED_TOPIC_UNEVALUABLE');
+  });
+
+  it('test_elevated_topic_forces_review: a message on an adopted §2.4.1 topic is held for review (§2.2.5b trigger 2)', async () => {
+    // The third twin of the pair above: same claim, same scenario, same ADULT
+    // subject whose age IS established — so the minor gate does NOT fire and a
+    // review disposition is attributable to the topic gate alone.
+    //
+    // HP-SR-001 recorded this trigger as having "no implementation anywhere:
+    // no topic classifier, no list, no lookup". This is the end-to-end proof
+    // that a message touching one of the Charter's fourteen topics now reaches
+    // the review queue rather than publishing.
+    // THE MESSAGE IS THE TWIN'S, UNCHANGED. Adding a topic word to it was tried
+    // first and is the wrong instrument: `evidence.claim_search` stops matching
+    // the seeded claim, retrieval returns nothing, and the response is held for
+    // review because it is UNCITED — so PENDING would prove nothing about the
+    // topic gate. The fixture moves instead of the message.
+    //
+    // Topic 7 is adopted here rather than in seed-real.ts, with a term this
+    // message contains, and retired again below. Seeding it would make every
+    // other test's topic check MATCHED and destroy the contrast the suite is
+    // built on.
+    await seedQuery(
+      `UPDATE safety.elevated_risk_topic
+          SET terms = ARRAY['walking'], clinically_adopted = true,
+              adopted_by = $1, adopted_at = now()
+        WHERE ordinal = 7 AND language = 'en'`,
+      [SEED.clinician],
+    );
+    const ctx = newCtx('light walking recovery');
+
+    try {
+    const events = await drive(ctx, {
+      intentDomains: ['GUIDELINE'],
+      intentComplexity: 'LOW',
+      category: 'DECISION_SUPPORT',
+      proposedSeverity: 'NORMAL',
+      reasoningText: `Relevant: [[claim:${SEED.guidelineClaim}]] covers early mobilisation after an uncomplicated procedure.`,
+      synthesisText: `Guidance commonly suggests resuming light walking within 24 to 48 hours after an uncomplicated procedure [[claim:${SEED.guidelineClaim}]].`,
+    });
+
+    // Content is unaffected — the gate changes disposition, not what is said.
+    const sentences = events.filter((e) => e.event === 'sentence');
+    expect(sentences.map((x) => (x.data as { text: string }).text).join(' ')).toContain('light walking');
+
+    const audit = await seedQuery(
+      'SELECT review_state FROM obs.response_audit WHERE id = $1',
+      [ctx.auditId],
+    );
+    expect(audit[0].review_state).toBe('PENDING');
+
+    const requested = await seedQuery(
+      `SELECT payload FROM response_audit_event WHERE audit_id = $1 AND kind = 'REVIEW_REQUESTED'`,
+      [ctx.auditId],
+    );
+    expect(requested).toHaveLength(1);
+    const triggers: string[] = requested[0].payload.review_triggers;
+    expect(triggers).toContain('ELEVATED_TOPIC');
+    // NOT the minor gate (this subject's age is established as adult), NOT
+    // uncited (the claim was retrieved), NOT below the floor. Asserted so the
+    // test cannot pass for any reason except the one it is named after — the
+    // twin publishes on these exact inputs.
+    expect(triggers).not.toContain('MINOR_GATE');
+    expect(triggers).not.toContain('UNCITED');
+    expect(triggers).toEqual(['ELEVATED_TOPIC']);
+    } finally {
+      await seedQuery(
+        `UPDATE safety.elevated_risk_topic
+            SET terms = '{}', clinically_adopted = false, adopted_by = NULL, adopted_at = NULL
+          WHERE ordinal = 7 AND language = 'en'`,
+      );
+    }
   });
 
   it('test_session_severity_floor_sticks_across_turns_in_the_same_session (§4.0.8)', async () => {

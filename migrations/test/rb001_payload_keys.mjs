@@ -84,6 +84,17 @@ const ALLOWED = new Set([
   'template_id', 'template_version', 'template_source', 'template_load_failure',
   // publication
   'path', 'review_required', 'agg_confidence', 'blocked_sentence_count', 'uncited',
+  // §2.2.5b — WHICH of the five triggers fired, as a list of enum names from a
+  // closed set: MINOR_GATE, HIGH_RISK_PROFILE, ELEVATED_TOPIC,
+  // ELEVATED_TOPIC_UNEVALUABLE, SEVERITY, CONFIDENCE_BAND, TIER_CONFLICT,
+  // BELOW_FLOOR, UNCITED. Enums, so §3's rule holds — and note what is NOT
+  // here: no matched TERM, no topic text, no flag key. A term is the clinician's
+  // vocabulary rather than the user's, but ELEVATED_TOPIC alone already tells an
+  // auditor which of fourteen topics fired via the ordinal in the review queue,
+  // and putting the matched substring of a person's message on an append-only,
+  // undeletable log is the one direction HP-LB-001's erasure reconciliation
+  // cannot come back from.
+  'review_triggers',
 ]);
 
 // The only module permitted to write the log. Anything else reaching the table

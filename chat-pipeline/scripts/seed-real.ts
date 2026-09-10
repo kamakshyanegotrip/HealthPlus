@@ -338,6 +338,30 @@ async function seedSafety(c: pg.PoolClient, r: SeededRegion) {
     ],
   );
 
+  // §2.2.5b TRIGGER 2's list, adopted so the CLEAR path is the default in CI.
+  //
+  // WHY THIS IS SEEDED AT ALL. Migration 048 ships the Charter's fourteen topics
+  // with EMPTY terms and adopts none of them, so `adopted_topic_list()` returns
+  // nothing and the trigger is UNEVALUABLE — which forces review on EVERY
+  // response. That is the correct production answer and it is useless as a test
+  // fixture: with every response held for review, the pair of tests that proves
+  // the review gate DISTINGUISHES anything collapses into two identical
+  // results.
+  //
+  // So one topic is adopted here, on the same fixture clinician and the same
+  // terms as everything else this file signs. Its terms are chosen NOT to match
+  // any message in the integration suite, so the default path is CLEAR and the
+  // §2.2.5b tests keep measuring what they were written to measure;
+  // test_elevated_topic_forces_review names one deliberately.
+  await q(
+    c,
+    `UPDATE safety.elevated_risk_topic
+        SET terms = ARRAY['pregnant','pregnancy'], clinically_adopted = true,
+            adopted_by = $1, adopted_at = now()
+      WHERE ordinal = 6 AND language = 'en'`,
+    [SEED.clinician],
+  );
+
   // §4.3.3's ladder resolves by (severity, jurisdiction, language). The
   // CRITICAL one is what the emergency short-circuit renders.
   for (const [id, severity, body] of [
