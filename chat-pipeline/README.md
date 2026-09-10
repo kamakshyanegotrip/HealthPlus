@@ -371,8 +371,9 @@ header comment is explicit that this is a narrower role model than HP-SEC-001's
 original (no clinician scope-of-practice matching) and should be reconciled against
 HP-SEC-001's own policy file, not assumed to be the final version.
 
-**A §6.4 eval suite now exists and actually gates.** `eval/run-eval.ts` runs 45 gold
-cases (`eval/gold/*.json`) straight against this repo's real pure functions —
+**A §6.4 eval suite now exists and actually gates.** `eval/run-eval.ts` runs 51 gold
+cases (25 in `eval/gold/*.json`, the rest declared in the runner) straight against
+this repo's real pure functions —
 `classifySentence`, `parseAndResolveCategory`, `clampSeverity`,
 `resolveTemplateRequirement`, `deriveActionTaken`, `applySessionFloor` — and exits
 non-zero on any failure. This isn't just more unit tests: it's a distinct artifact,
