@@ -1,24 +1,6 @@
 {
-  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run. Migration 032 closed the one rule-I finding that was a live boundary defect. Migration 034 closed all five rule-C findings (R13-conn, Option 2: one LOGIN role per worker role). **Migration 044 closed the obs.response_audit half of SEC-2** — the table now carries data_region, has RLS with a region-scoped policy, and its writer refuses a row whose region disagrees with the connection's. The TWO REMAINING rule-I entries are one question, not two bugs, and they are the half 044 deliberately did not take: public.response_audit_event is HP-RB-001's hash-chained immutable log, so adding a column changes what every row_hash covers. That is a chain rewrite, and it needs the C-30 audit-chain question answered first. Neither can leak today — HP-ADR-004 §2 seeds exactly one region — and both become real the day a second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2), which is the last cheap moment to settle them.",
+  "note": "See grant_contract.mjs. Entries may only be REMOVED, never edited to hide a regression. Migration 031 closed 43 of the 47 findings from this file's first run. Migration 032 closed the one rule-I finding that was a live boundary defect. Migration 034 closed all five rule-C findings (R13-conn, Option 2: one LOGIN role per worker role). Migration 044 closed the obs.response_audit half of SEC-2. **Migration 047 closed the other half and with it the whole of SEC-2**: public.response_audit_event now carries data_region, has RLS with a region-scoped SELECT policy and a region-scoped INSERT policy, and its BEFORE INSERT trigger derives the region from the connection and refuses an append that names a different one. THE STATED REASON THIS ENTRY SURVIVED FOR SIX DAYS WAS WRONG. It read 'adding a column changes what every row_hash covers'; audit_event_chain() hashes an ENUMERATED list of six columns, not the row, so a seventh column is invisible to it — measured, three events verifying 3/3 before and after ADD COLUMN. What 047 does the hard way it does for a different reason: once RLS scopes reads by data_region, an unhashed region column is an undetectable DELETE, so the region goes INSIDE the canonical form and the existing rows are recomputed — refused outright if the log has ever been externally anchored (public.audit_anchor), which is the precondition that expires on the first deployment.",
   "entries": [
-    {
-      "key": "I-pseudonym-readable-unbounded|hp_app|public.response_audit_event|can SELECT; RLS is off, so every row is visible",
-      "rule": "I-pseudonym-readable-unbounded",
-      "role": "hp_app",
-      "object": "public.response_audit_event",
-      "detail": "can SELECT; RLS is off, so every row is visible",
-      "why": "public.response_audit_event has no data_region column, for the same reason as obs.response_audit and one more: it is HP-RB-001's hash-chained immutable audit log, so adding a column changes what every row_hash covers. That is a migration with a chain rewrite in it, not a column addition, and it does not belong inside SEC-1. Immutability and the narrow grants (INSERT/SELECT only, no UPDATE/DELETE/TRUNCATE, plus forbid_mutation()) are real controls and are unaffected — what is missing is a REGION boundary, not a write boundary.",
-      "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
-    },
-    {
-      "key": "I-pseudonym-readable-unbounded|hp_reader|public.response_audit_event|can SELECT; RLS is off, so every row is visible",
-      "rule": "I-pseudonym-readable-unbounded",
-      "role": "hp_reader",
-      "object": "public.response_audit_event",
-      "detail": "can SELECT; RLS is off, so every row is visible",
-      "why": "public.response_audit_event has no data_region column, for the same reason as obs.response_audit and one more: it is HP-RB-001's hash-chained immutable audit log, so adding a column changes what every row_hash covers. That is a migration with a chain rewrite in it, not a column addition, and it does not belong inside SEC-1. Immutability and the narrow grants (INSERT/SELECT only, no UPDATE/DELETE/TRUNCATE, plus forbid_mutation()) are real controls and are unaffected — what is missing is a REGION boundary, not a write boundary.",
-      "item": "SEC-2 — the three pseudonym-bearing tables with no data_region column. Settle before the second region is admitted (HP-ADR-004 §3.3, Migration Pack §2.2). The response_audit_event half needs the audit-chain question answered first (HP-RB-001, C-30)."
-    },
     {
       "key": "C-role-reachable|confirmation_ui_role|(role)|NOLOGIN and no members",
       "rule": "C-role-reachable",

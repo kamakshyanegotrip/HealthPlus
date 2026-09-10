@@ -42,6 +42,18 @@ REGION=$(psql -qtAc "SELECT data_region FROM public.residency_admission
                       WHERE admission_state = 'ADMITTED' ORDER BY residency_country LIMIT 1" | tr -d '[:space:]')
 [ -n "$REGION" ] || fail "no ADMITTED residency exists; cannot place this fixture in a region."
 
+# THE REGION GOES ON THE CONNECTION, not into the INSERT. Since migration 047,
+# public.response_audit_event derives data_region from `app.current_region()` in
+# its BEFORE INSERT trigger and REFUSES an append when the GUC is unset — the
+# same rule obs.record_response_audit has carried since 044. §3 below appends to
+# that log, so without this the gate fails at the append with
+# "HP-ADR-004 §2: app.data_region is not set on this connection".
+#
+# Setting it here rather than passing a column is the point: the application
+# never supplies this value either (src/lib/db.ts sets it once per connection),
+# so a fixture that supplied it would be testing a path no deployment takes.
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c app.data_region=$REGION"
+
 # ---------------------------------------------------------------------------
 # 1. THE ROW IS WRITABLE, WITH EXACTLY THE COLUMNS auditLog.ts SUPPLIES.
 #

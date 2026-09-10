@@ -60,6 +60,15 @@ export async function recordAuditEvent(
   // prev_hash/row_hash are computed by the trg_audit_event_chain trigger —
   // the application never supplies them (HP-RB-001 §4: "that is what stops
   // a compromised application from forging a chain").
+  //
+  // Since migration 047, data_region is in that same category: the trigger
+  // reads it from `app.current_region()`, which db.ts puts on the connection
+  // once at connect time, and REFUSES an append that names a different one.
+  // It is not in the column list above and must not be — a region supplied per
+  // insert is a region a request could influence, and HP-ADR-004 §2 makes it a
+  // property of the deployment. It is also inside the row hash, so relabelling
+  // an event's region after the fact breaks the chain rather than quietly
+  // hiding the row from its region's readers.
 }
 
 export interface FinalAuditFields {

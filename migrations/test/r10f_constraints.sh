@@ -70,17 +70,37 @@ read -r RESIDENCY REGION <<<"$(psql -qtA -F' ' -c "
 # find. The fix is not a cleverer cleanup; it is not seeding what nothing reads.
 A=$(count "SELECT gen_random_uuid()")   # an audit id the fixtures hang from
 
+# THE CLEANUP DELETED NOTHING, AND HAD NOT SINCE THIS FILE WAS WRITTEN.
+#
+# It used to run all six DELETEs in ONE `psql -c`, which is one transaction —
+# and the fifth of them, `DELETE FROM public.response_audit_event`, is refused
+# by forbid_mutation() because that log is append-only. The refusal aborted the
+# transaction, so the other five rolled back too, and `2>&1 || true` swallowed
+# the message. Every run of this gate left its whole fixture behind while
+# reporting a clean cleanup.
+#
+# The event row genuinely cannot be deleted — that is the property §5 exists to
+# prove — so it is not attempted. The rest are separate statements, and the one
+# that is expected to be impossible is named rather than hidden in an `|| true`.
 cleanup() {
-  psql -qtA -c "
-    DELETE FROM safety.clinician_alert    WHERE event_id IN (SELECT id FROM safety.red_flag_event WHERE audit_id = '$A');
-    DELETE FROM safety.red_flag_event     WHERE audit_id = '$A';
-    DELETE FROM obs.ai_call               WHERE audit_id = '$A';
-    DELETE FROM public.response_audit_event WHERE audit_id = '$A';
-    DELETE FROM obs.response_content      WHERE audit_id = '$A';
-    DELETE FROM obs.response_audit        WHERE id = '$A';" >/dev/null 2>&1 || true
+  psql -qtA \
+    -c "DELETE FROM safety.clinician_alert WHERE event_id IN (SELECT id FROM safety.red_flag_event WHERE audit_id = '$A');" \
+    -c "DELETE FROM safety.red_flag_event  WHERE audit_id = '$A';" \
+    -c "DELETE FROM obs.ai_call            WHERE audit_id = '$A';" \
+    -c "DELETE FROM obs.response_content   WHERE audit_id = '$A';" \
+    -c "DELETE FROM obs.response_audit     WHERE id = '$A';" >/dev/null 2>&1 || true
+  # public.response_audit_event is deliberately NOT cleaned: it is append-only
+  # and $A is a fresh uuid per run, so the rows are inert rather than in the way.
 }
 trap cleanup EXIT
 cleanup
+
+# THE REGION GOES ON THE CONNECTION. Since migration 047 the append-only log
+# derives data_region from `app.current_region()` and refuses an append when the
+# GUC is unset, exactly as obs.record_response_audit has since 044. §5 appends
+# to it, so without this the gate dies at the fixture rather than at an
+# assertion. $REGION was read above from residency_admission.
+export PGOPTIONS="${PGOPTIONS:+$PGOPTIONS }-c app.data_region=$REGION"
 
 echo "R10f: constraint refusals against the real schema"
 
@@ -156,11 +176,17 @@ must_reject "§4.0.2 a NORMAL-severity red-flag event" "c_event_at_least_monitor
 # projection derived from it (auditLog.ts's header). An UPDATE here is the one
 # operation that would let a response's history be rewritten after the fact.
 #
-# TWO controls, and both are checked, because they fail differently: the GRANT
-# stops the application role, and the trigger stops everyone the grant does not
-# — including the owner, which is who this gate runs as. Checking only the grant
-# would leave the owner path untested, and the owner path is the one a
-# migration or an operator uses.
+# TWO controls, and they fail differently: the GRANT stops the application role,
+# and the trigger stops everyone the grant does not — including the owner, which
+# is who this gate runs as.
+#
+# THIS COMMENT USED TO SAY "and both are checked". Only one was. Everything
+# below §5 ran as the owner, so it exercised the trigger and never the grant,
+# and HP-RB-001 §10's item 10 asks for the other one in as many words: "the test
+# asserting UPDATE/DELETE on response_audit_event fail AS hp_app". §6 is that
+# test. The comment claiming coverage it did not have is this repository's
+# second recurring pattern — a control that reports success it did not achieve —
+# in the one place nobody looks for it, a test's own header.
 # ---------------------------------------------------------------------------
 psql -v ON_ERROR_STOP=1 -q <<SQL
 INSERT INTO obs.response_audit
@@ -187,5 +213,46 @@ CHAINED=$(count "SELECT count(*) FROM public.response_audit_event
                   WHERE audit_id = '$A' AND row_hash IS NOT NULL")
 [ "$CHAINED" = "1" ] || fail "the audit event has no row_hash; trg_audit_event_chain did not fire."
 echo "  ok  HP-RB-001 §4 the row is hash-chained (row_hash present)"
+
+# ---------------------------------------------------------------------------
+# §6. The same two operations AS hp_app — HP-RB-001 §10, item 10.
+#
+# SET SESSION AUTHORIZATION rather than a second connection string, for the
+# reason migrations-ci gives for every gate in this directory: migration 034
+# gives these roles no password ("a password in a migration is a password in
+# git"), so a gate that needed one could not run here at all.
+#
+# The refusal must be `permission denied`, NOT forbid_mutation. If hp_app's
+# UPDATE were refused by the trigger, that would mean the grant had been widened
+# and only the belt was holding — so this checks the braces specifically, and
+# would fail if the two swapped places.
+# ---------------------------------------------------------------------------
+must_reject_as() {  # $1 = role, $2 = human name, $3 = expected text, $4 = SQL
+  local out
+  if out=$(psql -v ON_ERROR_STOP=1 -q -c "BEGIN; SET LOCAL SESSION AUTHORIZATION $1; $4; ROLLBACK;" 2>&1); then
+    fail "$2: ACCEPTED as $1."
+  fi
+  grep -qi "$3" <<<"$out" || fail "$2: refused as $1, but not by '$3' — got: $(head -3 <<<"$out" | tr '\n' ' ')"
+  echo "  ok  $2 (as $1: $3)"
+}
+
+must_reject_as hp_app "HP-RB-001 §10.10 an UPDATE of the log by the application role" \
+  "permission denied" "
+  UPDATE public.response_audit_event SET actor = 'tampered' WHERE audit_id = '$A'"
+
+must_reject_as hp_app "HP-RB-001 §10.10 a DELETE from the log by the application role" \
+  "permission denied" "
+  DELETE FROM public.response_audit_event WHERE audit_id = '$A'"
+
+# And the payload discipline, which is a CHECK and therefore belongs in this
+# file. HP-RB-001 §3 forbids user text on the immutable log; the constraint is
+# the last of the three controls that say so (the others are auditLog.ts's
+# guard and migrations/test/rb001_payload_keys.mjs, which checks the whitelist
+# the other two do not have). Driven to its refusal AS hp_app, because a
+# constraint that only refuses the owner refuses nobody who matters.
+must_reject_as hp_app "HP-RB-001 §3 a payload carrying user text" \
+  "payload_no_pii" "
+  INSERT INTO public.response_audit_event (audit_id, kind, occurred_at, actor, payload)
+  VALUES ('$A', 'PUBLISHED', now(), 'system', '{\"user_text\":\"my chest hurts\"}'::jsonb)"
 
 echo "R10f: all constraint refusals held."

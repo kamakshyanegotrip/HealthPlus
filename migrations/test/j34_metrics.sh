@@ -15,6 +15,18 @@
 #      unmeasured, which is today. The less it knows, the more confident it
 #      would be.
 #
+# RE-RUNNABLE, AND IT WAS NOT. This file had no cleanup and no trap at all, so
+# every run added five more rows to the quiet day and the second run failed with
+#
+#     quiet day: block_rate totals should be COMPUTED 0.000000 over 5,
+#                got 'COMPUTED/0.000000/10'
+#
+# CI never saw it — the service container is a fresh database every time — so a
+# gate that works exactly once looked permanently green, and the first person to
+# run it twice locally debugs the metrics views instead of the fixture. The
+# hand-checked ratios above hid it further by being ratios: 3/10 and 6/20 are
+# the same number, so only the absolute denominator gave it away.
+#
 # Env: standard PG* vars. Run after migrations have been applied.
 # ============================================================================
 set -euo pipefail
@@ -25,6 +37,33 @@ DB_URL="postgresql://${PGUSER:-postgres}:${PGPASSWORD:-postgres}@${PGHOST:-local
 
 fail() { echo "J3-4 FAIL: $*" >&2; exit 1; }
 count () { psql -qtAc "$1" | tr -d '[:space:]'; }
+
+# Deletes only rows this gate created, found through its own markers —
+# 'j34-fixture' in whichever text column each table has spare. Run at START as
+# well as on exit, so a crashed previous run does not poison this one.
+#
+# ONE EXCEPTION, STATED RATHER THAN HIDDEN: obs.abstention_event has no column
+# this fixture is free to mark — every one of its seven is generated or asserted
+# on — so its two rows are found by the fixture's own day window plus their
+# reason, category and null audit_id. In a database where somebody else has
+# written NO_SOURCE abstentions on yesterday's date with no audit_id, this
+# deletes them. That is a test database's bargain and it is the reason the other
+# nine deletes do NOT use a window.
+cleanup() {
+  psql -qtA \
+    -c "DELETE FROM obs.fabrication_block WHERE message_template_id = 'j34-fixture';" \
+    -c "DELETE FROM obs.abstention_event  WHERE audit_id IS NULL AND reason = 'NO_SOURCE' AND category = 'INFORMATIONAL' AND occurred_at >= date_trunc('day', now()) - interval '1 day' AND occurred_at < date_trunc('day', now());" \
+    -c "DELETE FROM obs.review_queue_item WHERE reason = 'j34-fixture';" \
+    -c "DELETE FROM safety.red_flag_log   WHERE scanner_version = 'j34-fixture';" \
+    -c "DELETE FROM safety.clinician_alert WHERE event_id IN (SELECT id FROM safety.red_flag_event WHERE trigger_detail = '{}'::jsonb AND template_id IN (SELECT id FROM safety.safety_template WHERE body = 'J3-4 fixture'));" \
+    -c "DELETE FROM safety.red_flag_event WHERE template_id IN (SELECT id FROM safety.safety_template WHERE body = 'J3-4 fixture');" \
+    -c "DELETE FROM safety.safety_template WHERE body = 'J3-4 fixture';" \
+    -c "DELETE FROM obs.response_audit    WHERE classifier_version = 'j34-fixture';" \
+    -c "DELETE FROM principal.clinician   WHERE full_name = 'J3-4 fixture clinician';" \
+    -c "DELETE FROM principal.app_user    WHERE auth_subject LIKE 'j34-%';" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+cleanup
 
 # ----------------------------------------------------------------------------
 # Fixture. One day's worth of traffic, with numbers chosen so every expected
@@ -98,15 +137,25 @@ BEGIN
 
   -- 3 blocks, all §3.1 -> 3/10
   FOR i IN 1..3 LOOP
+    -- message_template_id is this row's ONLY free text column and it is used
+    -- here as the cleanup's handle. audit_id was tried first and is wrong twice
+    -- over: obs.v_metric_block_rate reads it (block rate moved 0.3 -> 0.9), and
+    -- the application's own writer — migration 039's record_fabrication_block —
+    -- passes NULL for it, so a fixture that set it would not be the shape of the
+    -- row the system actually writes.
     INSERT INTO obs.fabrication_block
       (id, occurred_at, prohibition_class, category, query_hash,
-       retrieved_source_state, data_region)
+       retrieved_source_state, message_template_id, data_region)
     VALUES (gen_random_uuid(), v_day + (i || ' minutes')::interval, '3.1',
-            'INFORMATIONAL', gen_random_bytes(8), '{}'::jsonb, v_region);
+            'INFORMATIONAL', gen_random_bytes(8), '{}'::jsonb, 'j34-fixture', v_region);
   END LOOP;
 
   -- 2 abstentions, reason NO_SOURCE -> 2/10
   FOR i IN 1..2 LOOP
+    -- obs.abstention_event has NO free column: id, occurred_at, audit_id,
+    -- reason, claim_kind, category, data_region, and every one of them is either
+    -- generated or asserted on. It is the one fixture the cleanup has to find by
+    -- its day rather than by a marker; see the note there.
     INSERT INTO obs.abstention_event
       (id, occurred_at, reason, category, data_region)
     VALUES (gen_random_uuid(), v_day + (i || ' minutes')::interval, 'NO_SOURCE',
