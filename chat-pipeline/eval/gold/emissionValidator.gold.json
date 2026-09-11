@@ -36,7 +36,7 @@
       "confidence": 0.75,
       "confidenceBand": "Medium",
       "citation": "Hospital-published package rate, 2026",
-      "text": "Indicative package cost.",
+      "text": "Indicative package cost of \u20b9350000, hospital-published.",
       "domain": "COST"
     }
   },
@@ -49,12 +49,14 @@
     { "id": "ev-06", "description": "An uncited numeric/cost assertion is blocked", "clause": "§3.0.3", "raw": "A hip replacement typically costs ₹350000 in Chennai.", "claims": [], "expect": { "kind": "blocked", "prohibitionClass": "3.0" } },
     { "id": "ev-07", "description": "An uncited 'guideline recommends' assertion is blocked even with no explicit number", "clause": "§3.0.3", "raw": "The guideline recommends a lower target for this group.", "claims": [], "expect": { "kind": "blocked", "prohibitionClass": "3.0" } },
     { "id": "ev-08", "description": "A numeric range/statistic citing a claim with no population is blocked", "clause": "§1.9.7", "raw": "The reference range is below 7%. [[claim:33333333-3333-3333-3333-333333333333]]", "claims": ["guideline-no-population"], "expect": { "kind": "blocked", "prohibitionClass": "1.9.7" } },
-    { "id": "ev-09", "description": "COST-kind claims are exempt from the population check", "clause": "§1.9.7", "raw": "The package costs ₹350000. [[claim:44444444-4444-4444-4444-444444444444]]", "claims": ["cost-no-population"], "expect": { "kind": "sentence", "citedClaimIds": ["44444444-4444-4444-4444-444444444444"] } },
+    { "id": "ev-09", "description": "COST-kind claims are exempt from the population check (fixture text carries its own figure since HP-JOB-011 §3.3.1 — see ev-16)", "clause": "§1.9.7", "raw": "The package costs ₹350000. [[claim:44444444-4444-4444-4444-444444444444]]", "claims": ["cost-no-population"], "expect": { "kind": "sentence", "citedClaimIds": ["44444444-4444-4444-4444-444444444444"] } },
     { "id": "ev-10", "description": "A properly cited numeric claim with a population passes", "clause": "§3.0.3", "raw": "ADA 2026 guidance recommends a target below 7% for this population. [[claim:33333333-3333-3333-3333-333333333333]]", "claims": ["guideline-with-population"], "expect": { "kind": "sentence", "citedClaimIds": ["33333333-3333-3333-3333-333333333333"], "textMustNotContain": "[[claim:" } },
     { "id": "ev-11", "description": "Plain prose with no numeric/guideline claim passes through uncited", "clause": "§3.0.3", "raw": "Here's how these two hospitals compare on the criteria you asked about.", "claims": [], "expect": { "kind": "sentence", "citedClaimIds": [] } },
     { "id": "ev-12", "description": "The citation marker itself never appears in the visible text of a passing sentence", "clause": "§1.9.5", "raw": "Guideline recommends this. [[claim:33333333-3333-3333-3333-333333333333]]", "claims": ["guideline-with-population"], "expect": { "kind": "sentence", "textEquals": "Guideline recommends this." } },
     { "id": "ev-13", "description": "A reassurance phrase wins over a valid citation present in the same sentence — reassurance is a hard block regardless of sourcing", "clause": "§3.10.3", "raw": "This is nothing to worry about, and here's a properly sourced number: 7%. [[claim:33333333-3333-3333-3333-333333333333]]", "claims": ["guideline-with-population"], "expect": { "kind": "blocked", "prohibitionClass": "3.10" } },
     { "id": "ev-14", "description": "An empty/whitespace-only sentence with no claim language passes through (nothing to block)", "clause": "§3.0.3", "raw": "   ", "claims": [], "expect": { "kind": "sentence", "citedClaimIds": [] } },
+    { "id": "ev-16", "description": "A price contradicting the claim it cites is blocked — the hole HP-JOB-011 found: citation integrity checked the ID, nothing checked the NUMBER", "clause": "§3.3.1", "raw": "The package costs ₹99000. [[claim:44444444-4444-4444-4444-444444444444]]", "claims": ["cost-no-population"], "expect": { "kind": "blocked", "prohibitionClass": "3.3" } },
+    { "id": "ev-17", "description": "An uncited figure written without a currency symbol is blocked — NUMERIC_CLAIM_PATTERN needs a symbol adjacent to a digit, so 'USD 4,000' was invisible to every prior check", "clause": "§3.0.1", "raw": "The total usually comes to about USD 4,000.", "claims": [], "expect": { "kind": "blocked", "prohibitionClass": "3.0" } },
     { "id": "ev-15", "description": "Multiple citations in one sentence, all valid and retrieved, all recorded", "clause": "§1.9.5", "raw": "See the guideline [[claim:33333333-3333-3333-3333-333333333333]] and the cost estimate [[claim:44444444-4444-4444-4444-444444444444]] for context.", "claims": ["guideline-with-population", "cost-no-population"], "expect": { "kind": "sentence", "citedClaimIds": ["33333333-3333-3333-3333-333333333333", "44444444-4444-4444-4444-444444444444"] } }
   ]
 }

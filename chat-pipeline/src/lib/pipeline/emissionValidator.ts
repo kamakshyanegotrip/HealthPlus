@@ -136,7 +136,75 @@ export type SentenceVerdict =
  * `test_hp_esc_1_9_7_population_missing_blocked`, etc.). `validateStream`
  * below is the thin, DB-touching wrapper around this.
  */
-export function classifySentence(raw: string, retrievedClaims: Map<string, RetrievedClaim>): SentenceVerdict {
+/**
+ * §3.3.1 — MONETARY FIGURES MUST APPEAR IN A CLAIM THAT THE SENTENCE CITES.
+ *
+ * THE HOLE THIS CLOSES, demonstrated before it was written rather than argued:
+ *
+ *   claim  a1…008  "…indicative total knee replacement package of USD 6,200."
+ *   output "Hospital A publishes an indicative package of $2,900 [[claim:a1…008]]."
+ *   verdict: SENTENCE. Emitted. Shown to the patient.
+ *
+ * Citation integrity checked that the id was retrieved. Nothing checked that the
+ * NUMBER matched the claim the citation points at. §3.3.1 says the system "MUST
+ * NOT output any price, package cost, fee, deposit, or total not drawn from a
+ * persisted, sourced, in-date price record" — and until now that was enforced
+ * only by asking the model nicely, which §3.0.3 explicitly says is not enough:
+ * "Prompt instructions alone are insufficient and MUST NOT be relied upon as
+ * the sole control."
+ *
+ * `NUMERIC_CLAIM_PATTERN` did not cover it either. It matches a currency SYMBOL
+ * followed by a digit, so `$6,200` needs a citation — but `USD 6,200`, which is
+ * how a composer writing for an international audience actually renders it, was
+ * invisible to every check in this file.
+ *
+ * WHY A REGEX OVER CLAIM TEXT RATHER THAN A STORED NUMBER. There is no stored
+ * number. `domain.hospital_cost` carries currency, scope and inclusion flags and
+ * NO amount; `evidence.claim` carries `statement text` and nothing numeric —
+ * every numeric column in the `evidence` schema is a confidence figure. Amounts
+ * live in claim prose by Annex A.4's design ("Layer 2 references claims, never
+ * stores facts"). A structured `evidence.claim_cost` is the better control and
+ * is a §6.3 schema decision, recorded as J11-2. §6.3 permits engineering to ADD
+ * a §3 prohibition at any time, so this ships now and that supersedes it later.
+ *
+ * `permittedFigures` exists because not every figure in a good answer comes from
+ * a claim. The patient's own stated budget ceiling is the standing case: "above
+ * your stated USD 9,000 ceiling" is their number, not a sourced one, and
+ * blocking it would punish the composer for obeying §3.3.3's instruction to name
+ * an over-budget option rather than drop it.
+ */
+const CURRENCY_SYMBOL: Record<string, string> = { $: 'USD', '₹': 'INR', '€': 'EUR', '£': 'GBP' };
+const FIGURE_SYMBOL_FIRST = /([$₹€£])\s?([\d][\d,]*(?:\.\d+)?)/g;
+const FIGURE_CODE_FIRST = /\b(USD|INR|EUR|GBP|AED|SGD|THB|TRY)\s?([\d][\d,]*(?:\.\d+)?)/gi;
+const FIGURE_CODE_LAST = /([\d][\d,]*(?:\.\d+)?)\s?\b(USD|INR|EUR|GBP|AED|SGD|THB|TRY)\b/gi;
+
+/** Normalised `CUR:amount` tokens, so `$6,200`, `USD 6,200` and `6200 USD` compare equal. */
+export function extractMonetaryFigures(text: string): string[] {
+  const out = new Set<string>();
+  const add = (cur: string, num: string) => {
+    const n = Number(num.replace(/,/g, ''));
+    if (Number.isFinite(n)) out.add(`${cur.toUpperCase()}:${n}`);
+  };
+  for (const m of text.matchAll(FIGURE_SYMBOL_FIRST)) add(CURRENCY_SYMBOL[m[1]!] ?? m[1]!, m[2]!);
+  for (const m of text.matchAll(FIGURE_CODE_FIRST)) add(m[1]!, m[2]!);
+  for (const m of text.matchAll(FIGURE_CODE_LAST)) add(m[2]!, m[1]!);
+  return [...out];
+}
+
+export interface ClassifyOptions {
+  /**
+   * Figures legitimately present without a claim behind them — in practice the
+   * patient's own stated budget ceiling, threaded from the constraint ladder.
+   * Format matches `extractMonetaryFigures`: `USD:9000`.
+   */
+  permittedFigures?: readonly string[];
+}
+
+export function classifySentence(
+  raw: string,
+  retrievedClaims: Map<string, RetrievedClaim>,
+  opts: ClassifyOptions = {},
+): SentenceVerdict {
   const rawMarkerContents = Array.from(raw.matchAll(MARKER)).map((m) => m[1] ?? '');
   const citedIds = rawMarkerContents.filter((id) => STRICT_ID.test(id));
   const malformedMarkerCount = rawMarkerContents.length - citedIds.length;
@@ -177,6 +245,35 @@ export function classifySentence(raw: string, retrievedClaims: Map<string, Retri
   // sure that instruction actually held).
   if (citedIds.length === 0 && (NUMERIC_CLAIM_PATTERN.test(visible) || /\bguideline(s)? (says?|recommends?|states?)\b/i.test(visible))) {
     return { kind: 'blocked', text: visible, prohibitionClass: '3.0', claimKind: null, tier: null, messageTemplateId: 'SENTENCE_OMITTED_UNSOURCED' };
+  }
+
+  // §3.3.1 — every monetary figure must appear in a claim this sentence cites,
+  // or be one the patient themselves stated. See the header above for the
+  // demonstrated hole this closes and why it is a regex rather than a lookup.
+  const sentenceFigures = extractMonetaryFigures(visible);
+  if (sentenceFigures.length > 0) {
+    const allowed = new Set<string>(opts.permittedFigures ?? []);
+    for (const id of citedIds) {
+      const claim = retrievedClaims.get(id);
+      if (claim) for (const f of extractMonetaryFigures(claim.text)) allowed.add(f);
+    }
+    const unsupported = sentenceFigures.filter((f) => !allowed.has(f));
+    if (unsupported.length > 0) {
+      // Two classes, because the failures are different acts. With a citation
+      // present the model contradicted the source it pointed at (§3.3.1 — a
+      // figure not drawn from the record). With none, it produced a price from
+      // nowhere (§3.0.1). The audit should be able to tell them apart.
+      const cited = citedIds.length > 0;
+      const claim = cited ? retrievedClaims.get(citedIds[0]!) : undefined;
+      return {
+        kind: 'blocked',
+        text: visible,
+        prohibitionClass: cited ? '3.3' : '3.0',
+        claimKind: claim?.kind ?? null,
+        tier: claim?.tier ?? null,
+        messageTemplateId: cited ? 'SENTENCE_OMITTED_FIGURE_NOT_IN_CITED_CLAIM' : 'SENTENCE_OMITTED_UNSOURCED_FIGURE',
+      };
+    }
   }
 
   // §1.9.7 — a claim citing a population-dependent range/statistic with a
@@ -256,12 +353,13 @@ export async function* validateStream(
   category: ResponseCategory,
   retrievedClaims: Map<string, RetrievedClaim>,
   textDeltas: AsyncIterable<string>,
+  opts: ClassifyOptions = {},
 ): AsyncGenerator<ValidatedChunk> {
   let buffer = '';
   const retrievedIds = Array.from(retrievedClaims.keys());
 
   async function processSentence(raw: string): Promise<ValidatedChunk> {
-    const verdict = classifySentence(raw, retrievedClaims);
+    const verdict = classifySentence(raw, retrievedClaims, opts);
     if (verdict.kind === 'blocked') {
       await logFabricationBlock({
         ctx,

@@ -72,7 +72,14 @@ describe('emissionValidator.classifySentence', () => {
   });
 
   it('test_hp_esc_1_9_7_cost_kind_is_exempt_from_the_population_check', () => {
-    const claims = new Map([[CLAIM_ID, claim({ population: undefined, kind: 'COST', text: 'Indicative package cost.' })]]);
+    // FIXTURE REVISED, HP-JOB-011 §3.3.1 — and the revision is the finding.
+    // The claim text was 'Indicative package cost.' — a COST claim whose
+    // statement contained no cost. That was never realistic; it only survived
+    // because nothing checked whether a sentence's figure appeared in the claim
+    // it cited. The new §3.3.1 rule blocks ₹350000 against a claim holding no
+    // figure, correctly, so the fixture now carries its own number and the case
+    // goes back to isolating what it was written for: the §1.9.7 exemption.
+    const claims = new Map([[CLAIM_ID, claim({ population: undefined, kind: 'COST', text: 'Indicative package cost of ₹350000, hospital-published.' })]]);
     const v = classifySentence(`The package costs ₹350000. [[claim:${CLAIM_ID}]]`, claims);
     expect(v.kind).toBe('sentence');
   });

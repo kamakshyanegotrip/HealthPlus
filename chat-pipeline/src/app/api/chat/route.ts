@@ -660,7 +660,16 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   const citedClaimIds = new Set<string>();
   let fullVisibleText = '';
 
-  for await (const chunk of validateStream(ctx, category, claimsById, textDeltas())) {
+  // §3.3.1 — the patient's own stated budget ceiling is a figure that may
+  // legitimately appear without a claim behind it. §3.3.3 tells the composer to
+  // NAME an over-budget option rather than drop it, so blocking that number
+  // would punish the composer for obeying the Charter. Threaded from the same
+  // ladder the composer saw, so the two cannot disagree about what was stated.
+  const permittedFigures = constraints.constraints
+    .filter((c) => c.ceilingAmount !== undefined && c.ceilingCurrency)
+    .map((c) => `${c.ceilingCurrency}:${c.ceilingAmount}`);
+
+  for await (const chunk of validateStream(ctx, category, claimsById, textDeltas(), { permittedFigures })) {
     if (chunk.kind === 'sentence') {
       visibleSentenceCount++;
       fullVisibleText += (fullVisibleText ? ' ' : '') + chunk.text;
