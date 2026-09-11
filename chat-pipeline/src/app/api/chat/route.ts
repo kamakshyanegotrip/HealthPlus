@@ -732,13 +732,32 @@ export async function runPipeline(ctx: PipelineContext, send: (event: string, da
   // Before this, no surface rendered either disclaimer. Every response this
   // pipeline has produced shipped without one.
   //
-  // `firstContact: true` unconditionally, and that is a decision rather than an
-  // oversight: §3.11.4 requires the automated-system notice "on request and at
-  // first contact in every session", the pipeline holds no per-session turn
-  // counter, and showing it every turn over-satisfies the clause at the cost of
-  // one line of chrome. Narrowing it needs either a client-side session memory
-  // or a turn count on the session row — a product decision, not something to
-  // approximate from an audit query here.
+  // `firstContact: true` unconditionally. J11-6, and CLOSED as a decision rather
+  // than left as a gap — the server-side narrowing was costed and rejected.
+  //
+  // §3.11.4 wants the automated-system notice "on request and at first contact
+  // in every session". Deriving "first contact" here would mean asking whether
+  // this session has an earlier audit row, and that query is unavailable twice
+  // over, both checked against the live schema rather than assumed:
+  //
+  //   * obs.response_audit has ONE index, on (id). No session_id index, so the
+  //     check is a sequential scan of an append-only, hash-chained table that
+  //     only ever grows — on the request path §6.5 measures latency along.
+  //   * hp_app holds no SELECT on obs.response_audit at all
+  //     (has_table_privilege -> false). That is deliberate: the app writes
+  //     through obs.record_* and cannot read the audit log back. HP-RB-001
+  //     locked this table down on purpose.
+  //
+  // So the "cheap" fix is a migration adding an index AND a grant to the one
+  // table the immutability run-book most wants untouched, to remove a single
+  // true sentence from a chrome block. Not proportionate.
+  //
+  // Showing it every turn OVER-satisfies §3.11.4 — the notice is accurate on
+  // every turn, and the clause's floor is "at first contact", not "only at
+  // first contact". If the repetition ever grates, the surface that knows
+  // whether it is rendering a session's first turn is the CLIENT, and it can
+  // suppress a repeat without the server growing a read path into the audit
+  // log. Recorded as a product choice; no longer an engineering item.
   send('disclosure', disclosureFor(persistedCategory, { firstContact: true }));
 
   const minConfidenceFloor = persistedCategory === 'INFORMATIONAL' ? 0.65 : 0.7; // Annex A.5 c_min_conf
