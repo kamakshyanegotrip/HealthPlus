@@ -75,14 +75,29 @@ intent + complexity (Haiku)
         This wins over EVERYTHING, including a CLINICAL_DECISION refusal —
         an emergency inside a clinical-decision-shaped message still needs
         the emergency banner.
-  -> category == CLINICAL_DECISION? short-circuit to the §2.3.6 refusal.
-     Not a fallback — DR-001 §1 and the DB constraint
-     `c_category_c_disabled_v1` make this the only legal outcome for that
-     category in v1. No patient lookup, no retrieval, no generation spent
-     on a response that can't ship.
+  -> category == CLINICAL_DECISION? does the message ALSO ask for something
+     we are permitted to answer? (HP-JOB-011)
+     -> NO  — short-circuit to the static §2.3.6 refusal, here, before any
+              patient lookup or retrieval. Nothing is spent on a response
+              that can't ship. `c_category_c_disabled_v1` makes this the
+              only legal outcome for a pure Category C turn.
+     -> YES — publish under DECISION_SUPPORT with the Category C dimensions
+              deferred in §2.3.6(c) form. Category C itself is never
+              published; see "Mixed turns" below.
   -> patient profile lookup (direct DB read)
-  -> knowledge lookup layer, parallel, direct SQL, no LLM — skipped entirely
-     if category is CLINICAL_DECISION (see above)
+  -> knowledge lookup layer, parallel, direct SQL, no LLM — ALWAYS gated on
+     the PUBLISHED category, never on CLINICAL_DECISION, so `policy_for`
+     evaluates at DECISION_SUPPORT: strictly narrower, never wider
+  -> constraint ladder + coverage plan (HP-JOB-011, no LLM)
+     — constraintSet.ts resolves the patient's STATED PREFERENCE attributes
+       into a precedence ladder (safety > dietary > activity-precaution >
+       budget > mobility > preference) whose verbs act on the CLAIM SET,
+       never on the patient
+     — coveragePlan.ts decides which dimensions the answer must address,
+       which carry a deferred Category C component, and which pairs must be
+       cross-referenced for the result to read as one answer
+     -> plan has nothing answerable after retrieval? fall back to the same
+        static §2.3.6 refusal
   -> §2.0.2 monotonic-upward re-check now that retrieval has actually run
      (a TEST_INTERPRETATION-kind claim surfacing mid-retrieval can only push
      the category UP, never down — re-triggers the §2.3.6 short-circuit)
@@ -92,8 +107,12 @@ intent + complexity (Haiku)
      clinicalReasoning.ts header comment — this is what keeps "personalized"
      meaning logistics/preferences, not a clinical determination, real
      rather than aspirational)
-  -> personalized recommendation synthesis (Opus by default, streamed)
+  -> personalized recommendation synthesis (Opus by default, streamed) —
+     handed the coverage plan, the ladder and the required cross-references
+     as structure, not asked for coherence as an adjective
   -> response emission validator, sentence by sentence, §3.0.3
+  -> §2.1.5 / §2.2.4 disclaimer, emitted as chrome on its own `disclosure`
+     SSE event once the persisted category settles (HP-JOB-011)
   -> audit persistence (response_audit_event append-only log +
      response_audit projection + encrypted response_content)
   -> side-effect dispatcher, fired but NOT awaited
@@ -101,11 +120,39 @@ intent + complexity (Haiku)
 
 The spec's literal order puts the safety engine after the category classifier and
 before everything else — this implementation keeps that, but adds the emergency
-short-circuit and the CLINICAL_DECISION short-circuit as explicit branches, because
-running knowledge lookup and two more LLM calls for a request that's structurally
-guaranteed to end in a static refusal wastes latency and money on every single
+short-circuit and the CLINICAL_DECISION branches as explicit exits, because running
+knowledge lookup and two more LLM calls for a request that's structurally guaranteed
+to end in a static refusal wastes latency and money on every pure
 CLINICAL_DECISION-classified turn (and per DR-001 that's expected to be common —
 Telemedicine Practice Guidelines §5.4 is the whole reason Category C is off).
+
+### Mixed turns, and why they are not a Category C loophole (HP-JOB-011)
+
+A message can ask for four things we may not determine and six we may. Blueprint §42's
+worked example is exactly that shape. Before HP-JOB-011, §2.0.2's monotonic-upward rule
+took all ten down with the four, and the patient got one paragraph of refusal — no
+hospitals, no costs, no visa, no recovery timeline. §2.3.6(c) ("offer the adjacent
+permitted help — reproducing published criteria with citation, or preparing a question
+list for the user's clinician") had no implementation anywhere in the repository.
+
+Such a turn now publishes under DECISION_SUPPORT, taking DECISION_SUPPORT's safeguards
+**in full** — §2.2.4's disclaimer, §2.2.3's options-not-recommendation and criteria
+disclosure, every §2.2.5b review trigger. The Category C dimensions are rendered in
+§2.3.6 form: we cannot determine it, here is who can, here are the published criteria
+with citation, here is the question to ask them.
+
+The precedent predates HP-JOB-011: the old refusal branch already wrote its audit row as
+`category: 'INFORMATIONAL'`, commented *"the refusal message itself is informational,
+not a clinical decision."* Same reasoning, one step further.
+
+Four walls, written so a reviewer can check rather than trust:
+
+1. Retrieval is always gated on the **published** category, never CLINICAL_DECISION.
+2. No TEST_INTERPRETATION claim can reach the composer — both walls in
+   `test_2_0_2_post_retrieval_reconciliation_is_unreachable` stand untouched.
+3. `c_category_c_disabled_v1` is untouched; nothing writes a CLINICAL_DECISION row.
+4. A turn with nothing answerable takes the **old** flat refusal on the **old** path —
+   `test_branch_2c` is the deliberate twin of `test_branch_2b` and asserts exactly that.
 
 ## What changed since the first delivery
 
@@ -207,12 +254,17 @@ code rather than re-reading it found a real, ship-blocking bug.
 `route.ts` (it was module-private) specifically so `test/runPipeline.integration.test.ts`
 can drive it directly against a real local Postgres, with `src/lib/anthropic.ts`'s
 `__setAnthropicClientForTesting` swapping in a scripted mock for the four LLM-facing
-calls (no live Anthropic call is made). Four tests, one per branch: the §4.0.5
+calls (no live Anthropic call is made). One test per branch: the §4.0.5
 emergency short-circuit (a model-raised severity reaching CRITICAL), the §2.3.6
 CLINICAL_DECISION short-circuit, the §2.0.2 post-retrieval reconciliation (a retrieved
 TEST_INTERPRETATION claim upgrading DECISION_SUPPORT mid-pipeline — this specific branch
 had never been exercised by anything before), and the normal completion path (a cited
 GUIDELINE claim streaming through, getting validated, and landing in every audit table).
+HP-JOB-011 added two more as a deliberate PAIR — `test_branch_2b` (a mixed
+CLINICAL_DECISION turn publishing as DECISION_SUPPORT with its Category C dimensions
+deferred) and `test_branch_2c` (its twin with the answerable dimension removed, still
+taking the flat refusal). Same classifier verdict, one word of difference in the
+message, so a divergence is attributable to §2.3.6(c) and nothing else.
 Run with `npm run test:integration` (needs the same local Postgres as `test:db`).
 
 **This caught a real, ship-blocking bug on the first run**: `response_content.audit_id`
@@ -371,12 +423,18 @@ header comment is explicit that this is a narrower role model than HP-SEC-001's
 original (no clinician scope-of-practice matching) and should be reconciled against
 HP-SEC-001's own policy file, not assumed to be the final version.
 
-**A §6.4 eval suite now exists and actually gates.** `eval/run-eval.ts` runs 51 gold
+**A §6.4 eval suite now exists and actually gates.** `eval/run-eval.ts` runs 61 gold
 cases (25 in `eval/gold/*.json`, the rest declared in the runner) straight against
 this repo's real pure functions —
 `classifySentence`, `parseAndResolveCategory`, `clampSeverity`,
-`resolveTemplateRequirement`, `deriveActionTaken`, `applySessionFloor` — and exits
-non-zero on any failure. This isn't just more unit tests: it's a distinct artifact,
+`resolveTemplateRequirement`, `deriveActionTaken`, `applySessionFloor`, and (HP-JOB-011)
+`planCoverage` / `resolveConstraints` / `applyConstraints` — and exits
+non-zero on any failure. The composition suite is there because §6.4 gates *prompts*,
+`RESPONSE_COMPOSER` is now one, and what a prompt change can silently break is not the
+prose but **which dimensions get deferred** — a composer that stops deferring travel
+fitness is a §3.2.3 violation that reads perfectly well. Verified to catch a regression
+rather than pass by construction: removed `TRAVEL_FITNESS` from the deferral map,
+watched `cmp-02` fail the gate (60/61), restored it, re-verified clean. This isn't just more unit tests: it's a distinct artifact,
 runnable in CI as a release gate the way §6.4 asks for ("prompts, classifiers and
 retrieval config are versioned artefacts with an eval suite gating release"), separate
 from `npm test`'s developer-facing suite. Confirmed it actually catches a regression,
@@ -570,6 +628,15 @@ Run the unit tests (no DB or network needed):
 
 ```bash
 npm test
+```
+
+Run the live composer eval (needs `ANTHROPIC_API_KEY`; the only thing in this repo that
+makes a real Anthropic call, and the §6.4 gate to run before changing the composer
+prompt or the model version — the deterministic suites cannot tell you whether Opus
+still weaves, only whether it was given what it needs to). **Not yet run.**
+
+```bash
+npm run eval:composer
 ```
 
 Run the §6.4 eval suite (no DB or network needed — gates prompt/classifier/retrieval

@@ -51,7 +51,11 @@ import {
   NoApprovedTemplateError,
   type SafetyTemplateRow,
 } from '../src/lib/pipeline/templateResolution';
-import type { RetrievedClaim, ResponseCategory, RedFlagSeverity } from '../src/lib/types';
+// HP-JOB-011 — the composition layer the RESPONSE_COMPOSER prompt sits on.
+import { resolveConstraints, applyConstraints } from '../src/lib/pipeline/constraintSet';
+import { planCoverage, type DimensionKey } from '../src/lib/pipeline/coveragePlan';
+import { loadPrompt } from '../src/lib/prompts/registry';
+import type { RetrievedClaim, ResponseCategory, RedFlagSeverity, PatientProfile, KnowledgeDomain } from '../src/lib/types';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLD_DIR = join(HERE, 'gold');
@@ -180,6 +184,86 @@ async function runRedFlagCompositionSuite() {
   }
 }
 
+// ---- suite 4: composition — coverage plan and constraint ladder (HP-JOB-011)
+/**
+ * §6.4 gates "prompts, classifiers and retrieval config". `RESPONSE_COMPOSER`
+ * is now one of those prompts, and the thing a prompt change can silently break
+ * is not the prose — it is WHICH DIMENSIONS GET DEFERRED. A composer that stops
+ * deferring travel fitness is a §3.2.3 violation that reads perfectly well.
+ *
+ * So what is gated here is the deterministic layer the composer prompt sits on
+ * top of: the deferral map, the publishable/refuse decision, and the two ladder
+ * behaviours a reviewer would most plausibly "simplify" — that a budget bound
+ * marks rather than drops (§3.3.3), and that a stated condition never becomes a
+ * constraint (§3.8.2).
+ *
+ * Same honest scope note as the suites above: this is the code around the model
+ * call, not the model's judgement. Whether Opus actually weaves needs a live
+ * key — `npm run eval:composer`, marked unrun.
+ */
+function runCompositionSuite() {
+  const suite = 'composition (coveragePlan + constraintSet, HP-JOB-011)';
+  const fx = JSON.parse(readFileSync(join(GOLD_DIR, 'section42.gold.json'), 'utf8')) as {
+    message: string;
+    intent: { requiresKnowledgeDomains: KnowledgeDomain[] };
+    preferences: Record<string, unknown>;
+    expectedDimensions: DimensionKey[];
+    expectedDeferred: DimensionKey[];
+    claims: RetrievedClaim[];
+  };
+
+  const profile = {
+    userId: 'eval', dataRegion: 'IN', residencyCountry: 'NG', riskFlags: [],
+    statedConditions: [{ label: 'type 2 diabetes', provenance: 'stated' as const }],
+    preferences: fx.preferences, isMinor: null,
+  } as PatientProfile;
+
+  const ladder = resolveConstraints(profile, { redFlagSeverityAtLeastWarning: false });
+  const applied = applyConstraints(ladder, fx.claims);
+  const plan = planCoverage({
+    message: fx.message,
+    intentDomains: fx.intent.requiresKnowledgeDomains,
+    admittedClaims: applied.admitted,
+    categoryWasClinicalDecision: true,
+  });
+
+  const eq = (a: readonly string[], b: readonly string[]) => [...a].sort().join(',') === [...b].sort().join(',');
+
+  record(suite, 'cmp-01', '§42 plans all ten dimensions',
+    eq(plan.dimensions.map((d) => d.key), fx.expectedDimensions),
+    `got ${plan.dimensions.map((d) => d.key).join(',')}`);
+
+  record(suite, 'cmp-02', '§42 defers exactly the four Category C dimensions (§2.4.1a)',
+    eq(plan.deferredDimensions, fx.expectedDeferred),
+    `got ${plan.deferredDimensions.join(',')}`);
+
+  record(suite, 'cmp-03', 'a mixed turn is publishable rather than refused (§2.3.6(c))',
+    plan.publishable === true);
+
+  record(suite, 'cmp-04', 'every deferral carries its clause and a question for the clinician',
+    plan.dimensions.filter((d) => d.deferral).every((d) => Boolean(d.deferral?.clause) && Boolean(d.deferral?.clinicianQuestion)));
+
+  const pure = planCoverage({ message: 'Am I fit to fly?', intentDomains: [], admittedClaims: [], categoryWasClinicalDecision: true });
+  record(suite, 'cmp-05', 'a pure Category C turn is NOT publishable — the flat refusal stands',
+    pure.publishable === false);
+
+  const ordinary = planCoverage({ message: fx.message, intentDomains: fx.intent.requiresKnowledgeDomains, admittedClaims: applied.admitted, categoryWasClinicalDecision: false });
+  record(suite, 'cmp-06', 'no deferral machinery runs on an ordinary Decision Support turn',
+    ordinary.deferredDimensions.length === 0);
+
+  record(suite, 'cmp-07', 'a stated dietary exclusion suppresses the conflicting pattern and says why',
+    applied.suppressed.length > 0 && applied.suppressed.every((s) => /vegetarian/i.test(s.statement)));
+
+  record(suite, 'cmp-08', 'an over-budget cost claim is MARKED, never dropped (§3.3.3)',
+    applied.bounded.length > 0 && applied.bounded.every((b) => applied.admitted.some((c) => c.claimId === b.claim.claimId)));
+
+  record(suite, 'cmp-09', 'a stated CONDITION never becomes a constraint (§3.8.2 / §2.3.1)',
+    !/diabet/i.test(JSON.stringify(ladder)));
+
+  record(suite, 'cmp-10', 'the composer prompt is registry-versioned (§6.4)',
+    loadPrompt('RESPONSE_COMPOSER').version.length > 0);
+}
+
 // ---- run + report -----------------------------------------------------------
 // NOTE (R2): the template-ladder suite is async, and this package is CommonJS
 // (no `"type": "module"` in package.json), so tsx transforms this file to CJS
@@ -225,6 +309,7 @@ function report(): void {
 
 runEmissionValidatorSuite();
 runCategoryClassifierSuite();
+runCompositionSuite();
 runRedFlagCompositionSuite().then(report, (err: unknown) => {
   console.error('\nEVAL GATE FAILED — the red-flag composition suite threw before it could report:', err);
   process.exit(1);
