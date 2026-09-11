@@ -507,6 +507,19 @@ describe.skipIf(!RUN_LIVE)('§42 worked example — live composer eval', () => {
     console.log(JSON.stringify({ addressed, connectionsMade: made.length, of: plan.crossReferences.length, chars: text.length }, null, 2));
 
     expect(addressed.sort()).toEqual([...FIXTURE.expectedDimensions].sort());
+
+    // OBSERVED RANGE, AND THIS THRESHOLD HAS NO HEADROOM. Two real runs against
+    // Opus 5 on 11 September 2026: 10/11 (8,391 chars) and 6/11 (5,846 chars).
+    // The bar is ceil(11 * 0.5) = 6, so the second run passed exactly on the
+    // line. Left at 0.5 deliberately rather than lowered: the gate exists to
+    // catch a composer that has STOPPED weaving, and even the weaker sample is
+    // far above the concatenated exemplar's <= 1. Lowering it to buy comfort
+    // would admit real degradation.
+    //
+    // The consequence is that a failure of one or two below the line is a
+    // sample, not a verdict. Re-run before believing it, and only treat it as a
+    // regression if it repeats. Recorded as HP-JOB-011 J11-8 rather than left
+    // for whoever hits it at 2am.
     expect(made.length).toBeGreaterThanOrEqual(Math.ceil(plan.crossReferences.length * 0.5));
 
     // The deferrals must be VISIBLE as deferrals, not quietly answered.
