@@ -9,9 +9,9 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:integration": "RUN_PIPELINE_INTEGRATION=1 vitest run test/runPipeline.integration.test.ts test/patientProfile.db.test.ts",
+    "test:integration": "vitest run -c vitest.integration.config.ts test/runPipeline.integration.test.ts test/patientProfile.db.test.ts",
     "eval": "tsx eval/run-eval.ts",
-    "eval:composer": "RUN_LIVE_COMPOSER_EVAL=1 vitest run test/section42.composition.test.ts",
+    "eval:composer": "vitest run -c vitest.live.config.ts test/section42.composition.test.ts",
     "smoke:live": "tsx scripts/live-anthropic-smoke.ts",
     "db:seed": "tsx scripts/seed-real.ts"
   },

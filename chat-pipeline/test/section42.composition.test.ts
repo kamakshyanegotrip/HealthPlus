@@ -168,17 +168,32 @@ function dimensionsAddressed(text: string): DimensionKey[] {
 const DEFERRAL_REFUSAL =
   /(can(?:'|’)?t|cannot|can not|unable to|not able to|not something (?:i|we) can)\s+(?:\w+\s+){0,4}?(tell|determine|say|assess|judge|interpret|decide)/i;
 
-/** The §2.3.6(c) clinician questions, as exact strings from the plan. */
+/**
+ * The §2.3.6(c) clinician questions, as strings from the plan.
+ *
+ * CASE-INSENSITIVE, and that was not the original — the real-output fixture
+ * caught it. The plan stores "Ask your treating doctor: **a**gainst the
+ * pre-operative criteria…"; strip the framing and the question starts lowercase,
+ * but a composer quoting it as a sentence capitalises: "**A**gainst the
+ * pre-operative criteria…". A case-sensitive `includes` scored the first real
+ * passing answer at ZERO of four, on an answer that had reproduced every
+ * question faithfully.
+ *
+ * The live run happened not to hit it — which is the point. A paid,
+ * non-deterministic, opt-in test is the worst possible place to discover a
+ * fragility like this, and `section42.live-run-1.txt` found it for free.
+ */
 function clinicianQuestionsPresent(text: string): number {
   const { plan } = build();
+  const haystack = text.toLowerCase();
   const questions = plan.dimensions
     .map((d) => d.deferral?.clinicianQuestion)
     .filter((q): q is string => Boolean(q))
     // The plan prefixes each with "Ask your treating doctor: ..."; a composer
     // legitimately re-attributes that ("ask a physiotherapist"), so match on the
     // question itself rather than the framing.
-    .map((q) => q.replace(/^Ask [^:]+:\s*/i, ''));
-  return questions.filter((q) => text.includes(q)).length;
+    .map((q) => q.replace(/^Ask [^:]+:\s*/i, '').toLowerCase());
+  return questions.filter((q) => haystack.includes(q)).length;
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +473,45 @@ describe('§42 worked example — the composed answer', () => {
     for (const s of determinations) expect(DEFERRAL_REFUSAL.test(s), s).toBe(false);
   });
 
+  /**
+   * J11-8 — the coherence checker, pinned against REAL model prose.
+   *
+   * `eval/gold/section42.live-run-1.txt` is the actual output of the first
+   * passing composer run (11 Sep 2026, Opus 5), captured verbatim. It is
+   * TRUNCATED — it is what the failing assertion printed before vitest cut the
+   * message off mid-sentence in the travel-fitness paragraph — so it is a floor
+   * rather than the full answer, and the assertions below are floors too.
+   *
+   * Why this matters more than another synthetic exemplar: WOVEN and
+   * CONCATENATED above are both written by me, so they test the checker against
+   * my idea of good and bad prose. This one tests it against what the model
+   * actually produced when it did the job properly. A checker that scores real
+   * passing output poorly is a broken checker, and that is the failure mode
+   * J11-8 is about.
+   */
+  it('test_the_coherence_checker_scores_real_passing_output_well', () => {
+    const real = readFileSync(join(__dirname, '../eval/gold/section42.live-run-1.txt'), 'utf8');
+    const { plan } = build();
+    const made = connectionsMade(real, plan.crossReferences);
+    const missed = plan.crossReferences.filter((x) => !made.includes(x)).map((x) => `${x.from}<->${x.to}`);
+    // Floor, not the observed value: the capture is truncated, and the live
+    // tier's own bar is 6. If a change to MARKERS or CONNECTIVE drops real
+    // passing output below the bar the live gate uses, that is the checker
+    // breaking, and it should fail here — deterministically, free, in CI —
+    // rather than as a paid live-run flake.
+    expect(made.length, `missed: ${missed.join(', ')}`).toBeGreaterThanOrEqual(6);
+  });
+
+  it('test_real_passing_output_also_satisfies_the_other_live_assertions', () => {
+    // The same capture, run through every check the live tier applies, so the
+    // whole live assertion set is exercised in CI against genuine prose.
+    const real = readFileSync(join(__dirname, '../eval/gold/section42.live-run-1.txt'), 'utf8');
+    expect(dimensionsAddressed(real).sort()).toEqual([...FIXTURE.expectedDimensions].sort());
+    expect(real).toMatch(DEFERRAL_REFUSAL);
+    expect(clinicianQuestionsPresent(real)).toBeGreaterThanOrEqual(2);
+    expect(real).not.toMatch(/your (HbA1c|blood sugar|reading) (is|of)[^.]*\b(high|low|above|below|poor|uncontrolled|well[- ]controlled)\b/i);
+  });
+
   it('test_clinician_questions_are_detectable_in_a_composed_answer', () => {
     // The §2.3.6(c) check the live tier leans on, verified against the plan's
     // own strings so a wording change in coveragePlan.ts cannot silently make
@@ -504,7 +558,20 @@ describe.skipIf(!RUN_LIVE)('§42 worked example — live composer eval', () => {
 
     const addressed = dimensionsAddressed(text);
     const made = connectionsMade(text, plan.crossReferences);
-    console.log(JSON.stringify({ addressed, connectionsMade: made.length, of: plan.crossReferences.length, chars: text.length }, null, 2));
+    // J11-8: log WHICH pairs were missed, not just how many. The threshold has
+    // no headroom (10/11 then 6/11 against a bar of 6), and the right response
+    // to that is to instrument before tuning — a measure adjusted from two
+    // aggregate numbers is a measure adjusted by guesswork. These names are what
+    // will show whether the variance is real prose variation or the checker
+    // failing to see a connection that is plainly there (headings, tables).
+    const missed = plan.crossReferences.filter((x) => !made.includes(x)).map((x) => `${x.from}<->${x.to}`);
+    console.log(
+      JSON.stringify(
+        { addressed, connectionsMade: made.length, of: plan.crossReferences.length, missed, chars: text.length },
+        null,
+        2,
+      ),
+    );
 
     expect(addressed.sort()).toEqual([...FIXTURE.expectedDimensions].sort());
 
