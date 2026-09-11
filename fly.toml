@@ -13,15 +13,28 @@ primary_region = "bom"
 [processes]
   worker = "npm run start"
 
-# This is a background worker with no inbound HTTP traffic — it holds a
-# long-lived connection to Postgres and to pg-boss's polling loop, not a web
-# server. No [http_service] block: exposing an HTTP port here would be
-# incorrect for this process and would just sit unused.
+# CHANGED (migration 050 / HP-RECON-007): this process now also runs a small
+# HTTP listener (src/lib/webhookServer.ts) for the Supabase Storage webhook
+# that triggers extractPatientUploadAttributes — see that file's header for
+# why. Everything CPU/latency-heavy (Storage download, the Claude vision
+# call) still happens asynchronously in the pg-boss job, never in this
+# request handler, so this does not reopen ADR-001's "never Vercel
+# Functions" reasoning; the webhook receiver's own work is one INSERT and
+# one enqueue.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1
 
 [[vm]]
   size = "shared-cpu-1x"
   memory = "512mb"
 
-# Secrets (DATABASE_URL, ANTHROPIC_API_KEY) are NOT set here — never commit
-# them to this file or to git. Set them with `fly secrets set` from your own
-# terminal after `fly launch` creates the app; see DEPLOY.md.
+# Secrets (DATABASE_URL, DATABASE_URL_DQE, DATABASE_URL_PATIENT_UPLOAD,
+# ANTHROPIC_API_KEY, SUBJECT_KEY_WRAPPING_KEY, SUPABASE_URL,
+# SUPABASE_SERVICE_ROLE_KEY, SUPABASE_STORAGE_WEBHOOK_SECRET) are NOT set
+# here — never commit them to this file or to git. Set them with
+# `fly secrets set` from your own terminal after `fly launch` creates the
+# app; see DEPLOY.md.

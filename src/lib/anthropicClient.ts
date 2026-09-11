@@ -33,3 +33,23 @@ export const anthropic = new Anthropic({
  */
 export const ANTHROPIC_MODEL_CLAIM_EXTRACTION =
   process.env.ANTHROPIC_MODEL_CLAIM_EXTRACTION ?? 'claude-opus-4-5';
+
+/**
+ * NEW (migration 050 / HP-RECON-007) — vision extraction from a patient's
+ * uploaded lab report, scan, or photo.
+ *
+ * Sonnet tier, per the original request for this job. NOT reconciled against
+ * ADR-001 §3.6's tiering table, which assigns Opus to "offline claim
+ * extraction and conflict resolution" generally — this is offline too, but
+ * a distinct job with a vision-input, single-document shape rather than
+ * batch text extraction, and the request specified Sonnet explicitly. That
+ * is a real gap in ADR-001 (no line covers this job) rather than a silent
+ * override of its tiering rule; worth a formal ADR update rather than
+ * resolving unilaterally here.
+ *
+ * Same freshness caveat as ANTHROPIC_MODEL_CLAIM_EXTRACTION: confirm the
+ * current Sonnet model string against Anthropic's model list before
+ * deploying, and prefer the env override.
+ */
+export const ANTHROPIC_MODEL_PATIENT_UPLOAD_EXTRACTION =
+  process.env.ANTHROPIC_MODEL_PATIENT_UPLOAD_EXTRACTION ?? 'claude-sonnet-4-5';

@@ -128,6 +128,40 @@ const ENTRY_POINTS = [
       "Read-only companion to seed-demo.ts: calls safety.adopted_rule_set() on the seed's owner connection and runs the real scanner over the review pack's gold-set cases. It asserts nothing — the labels are the clinical lead's (CL9/AMB-22) — so it is a tool, not a test, and its one SQL literal is the adopted-set lookup",
   },
   {
+    // Declared BEFORE the general 'src/jobs/' entry below — `.find` takes the
+    // first match, and this file is the one file under src/jobs/ that is NOT
+    // dqe_role. FOUND BY RUNNING THIS GATE (migration 050 / HP-JOB-010), not
+    // by reading it: the general prefix would otherwise have silently
+    // declared extractPatientUploadAttributes.ts as dqe_role, which is not
+    // just imprecise but backwards — dqe_role has no reach into principal
+    // at all (migration 037 §4), and this file's whole purpose is writing
+    // principal.patient_attribute. A gate that exists to catch "which role
+    // does this really connect as" would have reported the wrong role with
+    // full confidence.
+    prefix: 'src/jobs/extractPatientUploadAttributes.ts',
+    role: 'patient_upload_role',
+    reason: "jobPool('patientUpload') carries DATABASE_URL_PATIENT_UPLOAD (src/db/pool.ts), and migration 050 gave patient_upload_role LOGIN because this file is its caller — the same R10-role-routing convention dqe_role's declaration below documents, applied to the one job that is not dqe_role",
+  },
+  {
+    // FOUND THE SAME WAY as the entry above, by running this gate rather than
+    // reading it: this file has SQL (the webhook receiver's INSERT into
+    // principal.patient_upload_document) but sits under src/lib/, which no
+    // other ENTRY_POINTS prefix reaches, so it failed hard with "no db()
+    // call and no ENTRY_POINTS declaration" until this was added.
+    prefix: 'src/lib/webhookServer.ts',
+    role: 'patient_upload_role',
+    reason: "same jobPool('patientUpload') connection as extractPatientUploadAttributes.ts — the webhook receiver's INSERT into principal.patient_upload_document and its transactional boss.send() run on this process's own pool, not a separate one",
+  },
+  {
+    // Same lesson as the two entries above, applied before writing this one
+    // rather than found by running the gate afterward this time: a general
+    // 'src/jobs/' -> dqe_role prefix rule below would have misclassified
+    // this file exactly the way it once did extractPatientUploadAttributes.ts.
+    prefix: 'src/jobs/drainStorageErasure.ts',
+    role: 'storage_erasure_role',
+    reason: "jobPool('storageErasure') carries DATABASE_URL_STORAGE_ERASURE (src/db/pool.ts), and migration 051 gave storage_erasure_role LOGIN because this file is its caller — same R10-role-routing convention, same reason patient_upload_role got its own entry rather than falling through to dqe_role below",
+  },
+  {
     prefix: 'src/jobs/',
     role: 'dqe_role',
     reason: "src/db/pool.ts is per-role since R10-role-routing: jobPool('dqe') carries DATABASE_URL_DQE, and migration 037 gave dqe_role LOGIN because this became its caller. Until the operator sets that password the pool falls back to DATABASE_URL — recorded by poolRoleBindings(), not silent — so this declaration is the SPECIFICATION the deployment must match, which is exactly what it is for",

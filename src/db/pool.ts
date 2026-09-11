@@ -25,6 +25,18 @@
  * no LOGIN until migration 037, on the principle migration 034 §1 set — a role
  * gets LOGIN in the migration that builds its caller. This file is that caller.
  *
+ * NEW (migration 050): `patient_upload_role`, the caller for
+ * extractPatientUploadAttributes. Deliberately NOT dqe_role — dqe_role "gets
+ * no reach into app_user, patient_profile, patient_attribute or subject_key"
+ * (migration 037 §4) and this job's whole purpose is writing
+ * patient_attribute, so it needs its own lane with the opposite reach:
+ * principal and nothing evidence/domain owns.
+ *
+ * `DATABASE_URL` here is `queue_role` (see migration 046 and DEPLOY.md Step
+ * 5) — pg-boss's own `pgboss` schema needs CREATE on the database, which no
+ * application role holds by design, so the shared `boss` instance below
+ * connects with the plain `connectionString`, never through `jobPool()`.
+ *
  * THE FALLBACK IS DELIBERATE AND IT IS RECORDED. When a role has no connection
  * string of its own, its pool falls back to DATABASE_URL rather than refusing to
  * start, because the operator step that sets these passwords has not run and
@@ -52,11 +64,17 @@ if (!/^[A-Z]{2}$/.test(DATA_REGION)) {
   throw new Error(`DATA_REGION must be two uppercase letters, got ${JSON.stringify(DATA_REGION)}`);
 }
 
-export type JobRole = 'dqe' | 'app';
+export type JobRole = 'dqe' | 'patientUpload' | 'storageErasure' | 'app';
 
 const ROLE_CONFIG: Record<JobRole, { env: string; max: number }> = {
   // Ingestion: claim extraction, provider submissions, data-quality flags.
   dqe: { env: 'DATABASE_URL_DQE', max: 3 },
+  // NEW (migration 050): patient upload extraction — principal.patient_attribute
+  // and principal.patient_upload_document only, never evidence/domain.
+  patientUpload: { env: 'DATABASE_URL_PATIENT_UPLOAD', max: 3 },
+  // NEW (migration 051): drains principal.storage_erasure_queue — nothing but
+  // the three claim/mark verbs on that one table (src/jobs/drainStorageErasure.ts).
+  storageErasure: { env: 'DATABASE_URL_STORAGE_ERASURE', max: 2 },
   // Everything not yet routed to a role of its own. Named rather than implicit,
   // so `poolRoleBindings()` can report it and R13-roleci can score it.
   app: { env: 'DATABASE_URL', max: 4 },
@@ -99,6 +117,14 @@ export function poolRoleBindings(): { role: JobRole; separate: boolean }[] {
  */
 export const pgPool = jobPool('dqe');
 
+/**
+ * pg-boss's OWN control connection. Connects as `queue_role` in production
+ * (DATABASE_URL — see this file's header and DEPLOY.md Step 5), which holds
+ * CREATE on the database and USAGE on none of principal/safety/obs/evidence/
+ * domain. This must stay on the plain `connectionString`, never on a
+ * `jobPool()` role pool — pg-boss issues its own `CREATE SCHEMA IF NOT
+ * EXISTS pgboss` on start, which every application role deliberately lacks.
+ */
 export const boss = new PgBoss({ connectionString });
 
 let started = false;

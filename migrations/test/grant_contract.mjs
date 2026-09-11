@@ -81,7 +81,8 @@ const DATABASE_URL =
 // everything and bypasses RLS, which is exactly why running tests as the
 // owner proves nothing about any of these rules.
 const APP_ROLES = `('hp_app','hp_reader','redflag_role','alert_role','metrics_role',
-                    'dqe_role','erasure_role','reasoner_role','confirmation_ui_role')`;
+                    'dqe_role','erasure_role','reasoner_role','confirmation_ui_role',
+                    'patient_upload_role','storage_erasure_role')`;
 
 /** The same list as an ARRAY literal, for rules that need `unnest` rather than `IN`. */
 const APP_ROLES_ARRAY = `ARRAY${APP_ROLES.replace('(', '[').replace(/\)$/, ']')}`;
