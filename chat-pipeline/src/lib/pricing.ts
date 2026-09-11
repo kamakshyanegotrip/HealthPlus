@@ -64,6 +64,45 @@ export const MODELS = {
   OPUS: 'claude-opus-5',
 } as const;
 
+/**
+ * MODELS THAT REJECT `temperature`, and the defect that found them.
+ *
+ * The Anthropic API returns `400 invalid_request_error: "temperature is
+ * deprecated for this model."` for the newer models. Sending it is not ignored
+ * and not warned about — the whole request is refused.
+ *
+ * `anthropic.ts` sent `temperature` on EVERY call (`?? 0` for callClaude,
+ * `?? 0.3` for streamClaude). Against the tiering HP-ADR-001 §3.6 sets, that
+ * means the composer could not make a single successful call: every COMPOSE
+ * request to Opus 5 died with a 400 before a token was generated. So did the
+ * reasoning brief whenever `intentComplexity` said HIGH, or whenever
+ * ALLOW_OPUS_ON_LIVE_PATH was false and it ran on Sonnet 5.
+ *
+ * NOTHING IN THE REPOSITORY COULD HAVE CAUGHT THIS. Every test stubs the
+ * Anthropic client through `__setAnthropicClientForTesting`, and a stub accepts
+ * any arguments it is handed. The §6.4 eval gate is pure functions. The
+ * integration suite drives real Postgres but a mocked model. The defect lives
+ * exactly in the gap the live composer eval was written to cover, and that eval
+ * is what surfaced it, on its first genuine run (11 Sep 2026, on the founder's
+ * machine — the first real Anthropic call this pipeline has ever made).
+ *
+ * DENY-LIST RATHER THAN OMIT-ALWAYS, deliberately. `temperature: 0` is worth
+ * keeping where it is still accepted: the category classifier and the red-flag
+ * propose channel are safety-adjacent, and determinism in their sampling is a
+ * property worth having rather than surrendering for tidiness. Haiku 4.5 still
+ * accepts it and is what both of those run on.
+ *
+ * WHEN THIS LIST IS WRONG: a 400 naming `temperature` means the model in the
+ * error belongs here. Add it. Do not "fix" it by deleting the parameter
+ * everywhere — that silently drops determinism from the classifiers, which is
+ * a safety property, to work around a billing-tier API change.
+ */
+const TEMPERATURE_REJECTED_BY: readonly string[] = [MODELS.SONNET, MODELS.OPUS];
+
+export function supportsTemperature(model: string): boolean {
+  return !TEMPERATURE_REJECTED_BY.includes(model);
+}
+
 export function purposeDefaultModel(purpose: AiCallPurpose): string {
   switch (purpose) {
     case 'CATEGORY_CLASSIFY':

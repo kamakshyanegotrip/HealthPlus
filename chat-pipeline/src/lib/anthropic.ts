@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { db, DATA_REGION } from './db';
-import { estimateCostUsd } from './pricing';
+import { estimateCostUsd, supportsTemperature } from './pricing';
 import type { AiCallOutcome, AiCallPurpose, PipelineContext, RedFlagSeverity } from './types';
 
 // The subset of the Anthropic SDK surface this module actually calls —
@@ -124,7 +124,12 @@ export async function callClaude(opts: {
     const resp = await getClient().messages.create({
       model: opts.meta.model,
       max_tokens: opts.maxTokens,
-      temperature: opts.temperature ?? 0,
+      // §HP-JOB-011.6 — the KEY must be ABSENT, not undefined, for a model that
+      // rejects it. `temperature: undefined` still serialises out of the SDK's
+      // request body on some paths, and the API refuses the request outright
+      // rather than ignoring the field. See supportsTemperature() in pricing.ts
+      // for which models and how this was found.
+      ...(supportsTemperature(opts.meta.model) ? { temperature: opts.temperature ?? 0 } : {}),
       system: opts.system,
       messages: opts.messages,
     });
@@ -157,7 +162,10 @@ export function streamClaude(opts: {
   const stream = getClient().messages.stream({
     model: opts.meta.model,
     max_tokens: opts.maxTokens,
-    temperature: opts.temperature ?? 0.3,
+    // Same as callClaude above. This is the path the composer takes, and it is
+    // the one that was 400ing on every single request — Opus 5 is the default
+    // composer model, and it rejects `temperature`.
+    ...(supportsTemperature(opts.meta.model) ? { temperature: opts.temperature ?? 0.3 } : {}),
     system: opts.system,
     messages: opts.messages,
   });
