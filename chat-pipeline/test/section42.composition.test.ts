@@ -575,18 +575,29 @@ describe.skipIf(!RUN_LIVE)('§42 worked example — live composer eval', () => {
 
     expect(addressed.sort()).toEqual([...FIXTURE.expectedDimensions].sort());
 
-    // OBSERVED RANGE, AND THIS THRESHOLD HAS NO HEADROOM. Two real runs against
-    // Opus 5 on 11 September 2026: 10/11 (8,391 chars) and 6/11 (5,846 chars).
-    // The bar is ceil(11 * 0.5) = 6, so the second run passed exactly on the
-    // line. Left at 0.5 deliberately rather than lowered: the gate exists to
-    // catch a composer that has STOPPED weaving, and even the weaker sample is
-    // far above the concatenated exemplar's <= 1. Lowering it to buy comfort
-    // would admit real degradation.
+    // OBSERVED RANGE — four real Opus 5 runs, 11 September 2026:
     //
-    // The consequence is that a failure of one or two below the line is a
-    // sample, not a verdict. Re-run before believing it, and only treat it as a
-    // regression if it repeats. Recorded as HP-JOB-011 J11-8 rather than left
-    // for whoever hits it at 2am.
+    //   10/11   8,391 chars
+    //    6/11   5,846 chars   <- the outlier, and the shortest answer
+    //   11/11   8,205 chars   missed: []
+    //   11/11   8,965 chars   missed: []
+    //
+    // The bar is ceil(11 * 0.5) = 6. After two samples this looked like a gate
+    // with no headroom; after four it looks like one comfortable sample low.
+    // TWO SAMPLES WERE NOT ENOUGH TO CHARACTERISE IT, which is worth more than
+    // the number itself — the first instinct was to retune the measure, and
+    // that would have been tuning on noise.
+    //
+    // Note the correlation with length: the 6/11 run produced 5,846 characters
+    // against 8,205-8,965 for the 11/11 runs. The weak sample is a SHORTER
+    // answer, not a differently-organised one, so the lever if this ever needs
+    // one is probably output budget rather than the coherence measure.
+    //
+    // Left at 0.5. The gate exists to catch a composer that has STOPPED
+    // weaving, and even the outlier sits far above the concatenated exemplar's
+    // <= 1. A failure one or two below the line is still a sample rather than a
+    // verdict: re-run before calling it a regression. `missed` is logged so the
+    // next investigation starts from data. HP-JOB-011 J11-8.
     expect(made.length).toBeGreaterThanOrEqual(Math.ceil(plan.crossReferences.length * 0.5));
 
     // The deferrals must be VISIBLE as deferrals, not quietly answered.
